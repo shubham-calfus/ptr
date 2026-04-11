@@ -1,0 +1,6 @@
+{
+  "name": "playwright_test_runner Activities",
+  "version": "0.0.2",
+  "description": "Tool activities for playwright_test_runner.",
+  "component": "activity"
+}

@@ -1,0 +1,44 @@
+{
+  "name": "playwright_test_runner",
+  "version": "0.0.3",
+  "description": "Executes Playwright-generated Python scripts as a test suite and returns an HTML report.",
+  "component": "agent",
+  "config": {
+    "has_test_suite": true,
+    "triggers": [
+      {
+        "name": "test_suite_tasks",
+        "type": "select",
+        "required": true,
+        "description": "A test-suite driven trigger that supplies test_suite_id and the ordered recording files to execute.",
+        "friendly_name": "Test Suite Tasks",
+        "children": [
+          {
+            "name": "test_suite_name",
+            "type": "string",
+            "description": "Provide test suite name.",
+            "friendly_name": "Test suite name",
+            "required": true
+          },
+          {
+            "name": "select_recordings",
+            "type": "select",
+            "is_multiple": true,
+            "required": true,
+            "description": "Select recording scripts to include in the test suite.",
+            "friendly_name": "Select recordings"
+          },
+          {
+            "name": "files",
+            "type": "file",
+            "required": false,
+            "description": "Optional replacement Playwright script files.",
+            "friendly_name": "Upload Script Files",
+            "accepts": ".py"
+          }
+        ]
+      }
+    ],
+    "list_agent": true
+  }
+}

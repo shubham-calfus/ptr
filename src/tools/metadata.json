@@ -1,0 +1,6 @@
+{
+  "name": "playwright_test_runner Tools",
+  "version": "0.0.22",
+  "description": "Tool activities for playwright_test_runner.",
+  "component": "tool"
+}
