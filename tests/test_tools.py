@@ -1,7 +1,13 @@
 from src.tools.tools import (
+    _derive_parameters_file_candidates,
+    _expand_recordings_for_parameter_rows_data,
     _inject_network_idle_waits,
     _inject_runtime_helpers,
+    _parse_excel_parameter_sets,
+    _parse_excel_parameters,
     _parameterise_script,
+    _parameters_to_json_object,
+    _rewrite_post_login_goto_calls,
     _rewrite_adf_menu_panel_selection_calls,
     _rewrite_combobox_click_calls,
     _rewrite_combobox_selection_calls,
@@ -12,6 +18,7 @@ from src.tools.tools import (
     _rewrite_search_popup_selection_calls,
     _rewrite_textbox_click_calls,
     _rewrite_textbox_fill_calls,
+    _split_storage_object_ref,
     _strip_redundant_textbox_focus_clicks,
 )
 
@@ -65,6 +72,10 @@ with sync_playwright() as playwright:
     assert "PTR_BROWSER_PROVIDER" in instrumented
     assert "PTR_WINDOW_WIDTH" in instrumented
     assert "PTR_WINDOW_HEIGHT" in instrumented
+    assert "PTR_VIEWPORT_WIDTH_MARGIN" in instrumented
+    assert "PTR_VIEWPORT_HEIGHT_MARGIN" in instrumented
+    assert "def _ptr_window_dimensions()" in instrumented
+    assert "def _ptr_target_viewport()" in instrumented
     assert "PTR_CAPTURE_STEPS" in instrumented
     assert "PTR_RECORD_VIDEO" in instrumented
     assert "PTR_STEP_SCREENSHOT_FULL_PAGE" in instrumented
@@ -75,6 +86,15 @@ with sync_playwright() as playwright:
     assert "PTR_STEEL_SESSION_TIMEOUT_MS" in instrumented
     assert "PTR_GOTO_RETRIES" in instrumented
     assert "ERR_NAME_NOT_RESOLVED" in instrumented
+    assert "ERR_ABORTED" in instrumented
+    assert "_ptr_is_recoverable_aborted_navigation" in instrumented
+    assert "_ptr_wait_for_post_login_redirect" in instrumented
+    assert "PTR_LOGIN_REDIRECT_WAIT_MS" in instrumented
+    assert "_ptr_same_origin" in instrumented
+    assert "urlparse" in instrumented
+    assert "--start-maximized" in instrumented
+    assert "--start-fullscreen" in instrumented
+    assert 'kwargs["viewport"] = {' in instrumented
     assert "Unsupported PTR_BROWSER_PROVIDER" in instrumented
 
 
@@ -106,7 +126,7 @@ page.get_by_role("textbox", name="Optional", exact=False).click()
 
     rewritten = _rewrite_textbox_click_calls(script)
 
-    assert '_ptr_click_textbox(page, "Notes")' in rewritten
+    assert '_ptr_click_textbox(page.get_by_role("textbox", name="Notes"), page, "Notes")' in rewritten
     assert 'page.get_by_role("textbox", name="Optional", exact=False).click()' in rewritten
 
 
@@ -119,8 +139,8 @@ page.get_by_role("textbox", name="Username").press("Tab")
 
     rewritten = _rewrite_textbox_fill_calls(script)
 
-    assert '_ptr_fill_textbox(page, "Salary Amount EUR Annually", "47,575")' in rewritten
-    assert '_ptr_fill_textbox(page, "Notes", "done")' in rewritten
+    assert '_ptr_fill_textbox(page.get_by_role("textbox", name="Salary Amount EUR Annually"), page, "Salary Amount EUR Annually", "47,575")' in rewritten
+    assert '_ptr_fill_textbox(page.get_by_role("textbox", name="Notes"), page, "Notes", "done")' in rewritten
     assert 'page.get_by_role("textbox", name="Username").press("Tab")' in rewritten
 
 
@@ -174,9 +194,18 @@ page.get_by_role("cell", name="YEU Prepayment").first.click()
 
     rewritten = _rewrite_search_popup_selection_calls(script)
 
-    assert '_ptr_select_search_popup_option(page, "Search: Receipt Method", "MMA Account Receipt.")' in rewritten
-    assert '_ptr_select_search_popup_option(page, "Search: Site", "No.5 Circuit Street Light")' in rewritten
-    assert '_ptr_select_search_popup_option(page, "Search: Transaction Type", "YEU Prepayment")' in rewritten
+    assert (
+        '_ptr_select_search_trigger_option(page, "Search: Receipt Method", "MMA Account Receipt.", '
+        'option_kind="text", option_exact=False)'
+    ) in rewritten
+    assert (
+        '_ptr_select_search_trigger_option(page, "Search: Site", "No.5 Circuit Street Light", '
+        'option_kind="text", option_exact=False)'
+    ) in rewritten
+    assert (
+        '_ptr_select_search_trigger_option(page, "Search: Transaction Type", "YEU Prepayment", '
+        'option_kind="cell", option_exact=False)'
+    ) in rewritten
     assert 'page.get_by_text("MMA Account Receipt.").click()' not in rewritten
     assert 'page.get_by_text("No.5 Circuit Street Light").click()' not in rewritten
     assert 'page.get_by_role("cell", name="YEU Prepayment").first.click()' not in rewritten
@@ -186,6 +215,8 @@ def test_rewrite_adf_menu_panel_selection_calls_wraps_title_and_link_trigger_pai
     script = """
 page.get_by_title("Complete and Create Another").click()
 page.get_by_text("Complete and Review").click()
+page.get_by_title("Submit and Create Another").click()
+page.get_by_text("Submit", exact=True).click()
 page.get_by_role("link", name="Actions", exact=True).click()
 page.get_by_text("Post to Ledger").click()
 page.get_by_title("Search: Transaction Type").click()
@@ -198,6 +229,10 @@ page.get_by_text("15").click()
 
     assert (
         '_ptr_select_adf_menu_panel_option(page, "Complete and Create Another", "Complete and Review", trigger_kind="title")'
+        in rewritten
+    )
+    assert (
+        '_ptr_select_adf_menu_panel_option(page, "Submit and Create Another", "Submit", trigger_kind="title")'
         in rewritten
     )
     assert (
@@ -307,6 +342,20 @@ page.get_by_role("button", name="Go back").click()
     assert '_ptr_click_navigation_button(page, "Go back")' in rewritten
 
 
+def test_rewrite_post_login_goto_calls_replaces_redundant_goto_after_password_submit() -> None:
+    script = """
+page.get_by_role("textbox", name="Password").press("Enter")
+page.goto("https://iamoqy-test.fa.ocs.oraclecloud.com/")
+page.get_by_role("link", name="Home", exact=True).click()
+"""
+
+    rewritten = _rewrite_post_login_goto_calls(script)
+
+    assert 'page.get_by_role("textbox", name="Password").press("Enter")' in rewritten
+    assert '_ptr_wait_for_post_login_redirect(page, "https://iamoqy-test.fa.ocs.oraclecloud.com/")' in rewritten
+    assert 'page.goto("https://iamoqy-test.fa.ocs.oraclecloud.com/")' not in rewritten
+
+
 def test_parameterise_script_does_not_reuse_stale_textbox_context_for_calendar_gridcell() -> None:
     script = """
 page.get_by_role("textbox", name="Password").fill("1234567890")
@@ -340,6 +389,264 @@ page.get_by_role("gridcell", name="Temporary Assignment").click()
     )
 
 
+def test_parameterise_script_does_not_treat_existing_placeholders_as_defaults() -> None:
+    script = """
+page.goto("{{url}}")
+page.get_by_role("textbox", name="Username").fill("{{username}}")
+"""
+
+    parameterised_script, default_params = _parameterise_script(script)
+
+    assert 'page.goto("{{url}}")' in parameterised_script
+    assert 'page.get_by_role("textbox", name="Username").fill("{{username}}")' in parameterised_script
+    assert default_params == {}
+
+
+def test_parse_excel_parameters_supports_headerless_sheet() -> None:
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["url", "https://example.com/login"])
+    ws.append(["username", "demo@example.com"])
+    ws.append(["click_save", "ignored"])
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    wb.close()
+
+    params = _parse_excel_parameters(buffer.getvalue())
+
+    assert params == {
+        "url": "https://example.com/login",
+        "username": "demo@example.com",
+    }
+
+
+def test_parse_excel_parameters_supports_horizontal_header_value_sheet() -> None:
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(
+        [
+            "startUrl",
+            "Username",
+            "Password",
+            "Business Unit",
+            "Receipt Number",
+        ]
+    )
+    ws.append(
+        [
+            "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+            "svc",
+            "Calfus@123",
+            "Test Solutions",
+            "RN-465346",
+        ]
+    )
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    wb.close()
+
+    params = _parse_excel_parameters(buffer.getvalue())
+
+    assert params == {
+        "url": "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+        "username": "svc",
+        "password": "Calfus@123",
+        "business_unit": "Test Solutions",
+        "receipt_number": "RN-465346",
+    }
+
+
+def test_parse_excel_parameter_sets_supports_multiple_horizontal_data_rows() -> None:
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(
+        [
+            "startUrl",
+            "Username",
+            "Password",
+            "Receipt Number",
+            "Entered Amount",
+        ]
+    )
+    ws.append(
+        [
+            "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+            "svc",
+            "Calfus@123",
+            "RN-46534434",
+            "55",
+        ]
+    )
+    ws.append(
+        [
+            "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+            "svc",
+            "Calfus@124",
+            "RN-46534734",
+            "56",
+        ]
+    )
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    wb.close()
+
+    parameter_sets = _parse_excel_parameter_sets(buffer.getvalue())
+
+    assert parameter_sets == [
+        {
+            "row_index": 2,
+            "values": {
+                "url": "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+                "username": "svc",
+                "password": "Calfus@123",
+                "receipt_number": "RN-46534434",
+                "entered_amount": "55",
+            },
+        },
+        {
+            "row_index": 3,
+            "values": {
+                "url": "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+                "username": "svc",
+                "password": "Calfus@124",
+                "receipt_number": "RN-46534734",
+                "entered_amount": "56",
+            },
+        },
+    ]
+
+
+def test_expand_recordings_for_parameter_rows_data_fans_out_multiple_excel_rows(monkeypatch) -> None:
+    def _fake_load_recording_parameter_sets(recording, file_key):
+        assert recording["file"] == "recordings/demo.py"
+        assert file_key == "recordings/demo.py"
+        return (
+            [
+                {
+                    "row_index": 2,
+                    "values": {
+                        "username": "svc",
+                        "password": "Calfus@123",
+                        "receipt_number": "RN-46534434",
+                    },
+                },
+                {
+                    "row_index": 3,
+                    "values": {
+                        "username": "svc",
+                        "password": "Calfus@124",
+                        "receipt_number": "RN-46534734",
+                    },
+                },
+            ],
+            "recordings/demo_params.xlsx",
+        )
+
+    monkeypatch.setattr(
+        "src.tools.tools._load_recording_parameter_sets",
+        _fake_load_recording_parameter_sets,
+    )
+
+    expanded = _expand_recordings_for_parameter_rows_data(
+        [
+            {
+                "id": "rec-1",
+                "name": "fake_2",
+                "file": "recordings/demo.py",
+                "parameters": {
+                    "entered_amount": "55",
+                },
+            }
+        ]
+    )
+
+    assert len(expanded) == 2
+    assert expanded[0]["id"] == "rec-1-row-2"
+    assert expanded[0]["name"] == "fake_2 [row 2]"
+    assert expanded[0]["parameters"] == {
+        "username": "svc",
+        "password": "Calfus@123",
+        "receipt_number": "RN-46534434",
+        "entered_amount": "55",
+    }
+    assert expanded[0]["parameters_file_key"] == "recordings/demo_params.xlsx"
+    assert expanded[0]["parameter_set_index"] == 1
+    assert expanded[0]["parameter_row_index"] == 2
+    assert expanded[0]["skip_parameters_file_load"] is True
+
+    assert expanded[1]["id"] == "rec-1-row-3"
+    assert expanded[1]["name"] == "fake_2 [row 3]"
+    assert expanded[1]["parameters"] == {
+        "username": "svc",
+        "password": "Calfus@124",
+        "receipt_number": "RN-46534734",
+        "entered_amount": "55",
+    }
+    assert expanded[1]["parameters_file_key"] == "recordings/demo_params.xlsx"
+    assert expanded[1]["parameter_set_index"] == 2
+    assert expanded[1]["parameter_row_index"] == 3
+    assert expanded[1]["skip_parameters_file_load"] is True
+
+
+def test_parameters_to_json_object_normalizes_inline_parameter_keys() -> None:
+    params = _parameters_to_json_object(
+        {
+            "startUrl": "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+            "Username": "svc",
+            "Receipt Number": "RN-465346",
+            "ignored_blank": "   ",
+            "none_value": None,
+        }
+    )
+
+    assert params == {
+        "url": "https://iamoqy-test.fa.ocs.oraclecloud.com/",
+        "username": "svc",
+        "receipt_number": "RN-465346",
+    }
+
+
+def test_split_storage_object_ref_strips_current_bucket_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("STORAGE_ACTIVITIES_BUCKET", "local-dev-bucket")
+
+    bucket_name, object_key = _split_storage_object_ref(
+        "local-dev-bucket/recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2_params.xlsx"
+    )
+
+    assert bucket_name == "local-dev-bucket"
+    assert object_key == "recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2_params.xlsx"
+
+
+def test_derive_parameters_file_candidates_uses_sibling_params_file(monkeypatch) -> None:
+    monkeypatch.setenv("STORAGE_ACTIVITIES_BUCKET", "local-dev-bucket")
+
+    candidates = _derive_parameters_file_candidates(
+        "local-dev-bucket/recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2.py"
+    )
+
+    assert candidates == [
+        "local-dev-bucket/recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2_params.xlsx",
+        "recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2_params.xlsx",
+        "local-dev-bucket/recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2_params.csv",
+        "recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2_params.csv",
+    ]
+
+
 def test_inject_network_idle_waits_adds_pause_after_navigation_buttons() -> None:
     script = """
 page.get_by_role("button", name="Continue").click()
@@ -371,6 +678,8 @@ with sync_playwright() as playwright:
     instrumented = _inject_runtime_helpers(script)
 
     assert "PTR_TEXT_ENTRY_TIMEOUT_MS" in instrumented
+    assert "PTR_PRIMARY_TEXT_ENTRY_TIMEOUT_MS" in instrumented
+    assert "def _ptr_fill_textbox(primary_locator, page, label: str, value, **kwargs):" in instrumented
     assert 'get_by_role("spinbutton", name=label)' in instrumented
     assert 'get_by_role("combobox", name=label)' in instrumented
     assert 'get_by_label(label, exact=True)' in instrumented
@@ -405,6 +714,8 @@ with sync_playwright() as playwright:
     instrumented = _inject_runtime_helpers(script)
 
     assert "PTR_TEXT_CLICK_TIMEOUT_MS" in instrumented
+    assert "PTR_PRIMARY_TEXT_CLICK_TIMEOUT_MS" in instrumented
+    assert "def _ptr_click_textbox(primary_locator, page, label: str, **kwargs):" in instrumented
     assert 'get_by_text(label, exact=True)' in instrumented
     assert 'get_by_role("tab", name=label, exact=True)' in instrumented
     assert 'get_by_role("button", name=label, exact=False)' in instrumented
@@ -483,6 +794,35 @@ with sync_playwright() as playwright:
     compile(instrumented, "<instrumented>", "exec")
 
 
+def test_inject_runtime_helpers_adf_menu_panel_helper_tries_codegen_trigger_first() -> None:
+    script = """
+from playwright.sync_api import sync_playwright
+
+
+def run(playwright):
+    page = None
+    browser = playwright.chromium.launch(headless=False)
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
+"""
+
+    instrumented = _inject_runtime_helpers(script)
+
+    assert "PTR_PRIMARY_ADF_MENU_PANEL_TIMEOUT_MS" in instrumented
+    assert "PTR_ADF_SPLIT_BUTTON_POST_OPEN_WAIT_MS" in instrumented
+    assert 'get_by_title(trigger_label, exact=True).first' in instrumented
+    assert 'get_by_role("link", name=trigger_label, exact=True).first' in instrumented
+    assert 'Submit and Create Another' in instrumented
+    assert 'normalize-space()="Submit"' in instrumented
+    assert 'newTrx::popEl' in instrumented
+    assert '_ptr_try_hardcoded_split_button_option' in instrumented
+    assert '_ptr_select_adf_menu_panel_option' in instrumented
+    compile(instrumented, "<instrumented>", "exec")
+
+
 def test_inject_runtime_helpers_date_picker_helper_targets_oj_input_date() -> None:
     script = """
 from playwright.sync_api import sync_playwright
@@ -534,7 +874,7 @@ with sync_playwright() as playwright:
     instrumented = _inject_runtime_helpers(script)
 
     assert '_ptr_click_navigation_button' in instrumented
-    assert '_ptr_select_search_popup_option' in instrumented
+    assert '_ptr_select_search_trigger_option' in instrumented
     assert 'PTR_NAV_ADVANCE_TIMEOUT_MS' in instrumented
     assert 'PTR_NAV_STEP_STABLE_MS' in instrumented
     assert 'PTR_NAV_BUSY_EXTRA_TIMEOUT_MS' in instrumented

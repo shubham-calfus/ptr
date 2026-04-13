@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from aetherion_sdk import tool
@@ -27,6 +28,7 @@ _MAX_AI_LOG_CHARS = 3_000
 _MAX_AI_IMAGE_BYTES = 700_000
 _MAX_AI_STEP_IMAGES = 2
 _MAX_OPENAI_ERROR_CHARS = 1_600
+_PLACEHOLDER_TOKEN_RE = re.compile(r"^\{\{\w+\}\}$")
 
 
 def _get_bucket_name() -> str:
@@ -41,13 +43,36 @@ def _safe_segment(value: str) -> str:
     return cleaned.strip("._") or "unknown"
 
 
+def _split_storage_object_ref(object_ref: str) -> tuple[str, str]:
+    raw = str(object_ref or "").strip()
+    if not raw:
+        raise ValueError("Storage object key is required.")
+
+    if raw.lower().startswith("s3://"):
+        parsed = urlparse(raw)
+        bucket_name = parsed.netloc.strip()
+        object_key = parsed.path.lstrip("/")
+        if not bucket_name or not object_key:
+            raise ValueError(f"Invalid S3 object reference: {object_ref}")
+        return bucket_name, object_key
+
+    bucket_name = _get_bucket_name()
+    bucket_prefix = f"{bucket_name}/"
+    object_key = raw[len(bucket_prefix) :] if raw.startswith(bucket_prefix) else raw
+    object_key = object_key.lstrip("/")
+    if not object_key:
+        raise ValueError("Storage object key is required.")
+    return bucket_name, object_key
+
+
 def _storage_get_bytes(object_key: str) -> bytes:
     storage.init_client()
+    bucket_name, normalized_key = _split_storage_object_ref(object_key)
 
     if hasattr(storage, "retrieve"):
         data = storage.retrieve(
-            bucket_name=_get_bucket_name(),
-            object_key=object_key,
+            bucket_name=bucket_name,
+            object_key=normalized_key,
             retrieval_mode=RetrievalMode.FULL_OBJECT,
         )
         if isinstance(data, bytes):
@@ -57,7 +82,7 @@ def _storage_get_bytes(object_key: str) -> bytes:
     if client is None:
         raise RuntimeError("Storage client is not initialized.")
 
-    response = client.get_object(Bucket=_get_bucket_name(), Key=object_key)
+    response = client.get_object(Bucket=bucket_name, Key=normalized_key)
     return response["Body"].read()
 
 
@@ -114,9 +139,10 @@ def _parameterise_script(script_text: str) -> tuple[str, dict[str, str]]:
     seen:   set[str]       = set()
 
     def _register(param: str, value: str) -> None:
-        if param not in seen and value:
-            params[param] = value
-            seen.add(param)
+        if param in seen or not value or _PLACEHOLDER_TOKEN_RE.fullmatch(value.strip()):
+            return
+        params[param] = value
+        seen.add(param)
 
     pending_gridcell_context: str | None = None
     last_search:   str | None = None
@@ -195,54 +221,284 @@ def _parameterise_script(script_text: str) -> tuple[str, dict[str, str]]:
 
 def _normalize_param_name(name: str) -> str:
     """Convert 'Receipt Number' → 'receipt_number', 'url' → 'url', etc."""
-    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    aliases = {
+        "starturl": "url",
+        "start_url": "url",
+    }
+    return aliases.get(normalized, normalized)
 
 
-def _parse_excel_parameters(raw_bytes: bytes) -> dict[str, str]:
+def _extract_table_parameter_sets(rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    normalized_rows: list[tuple[int, tuple[str, ...]]] = []
+    for row_index, row in enumerate(rows, start=1):
+        values = tuple(str(value if value is not None else "").strip() for value in row)
+        if any(values):
+            normalized_rows.append((row_index, values))
+
+    if not normalized_rows:
+        return []
+
+    first_row_index, first_row = normalized_rows[0]
+    if len(normalized_rows) >= 2 and sum(1 for cell in first_row if cell) > 2:
+        parameter_sets: list[dict[str, Any]] = []
+        for source_row_index, data_row in normalized_rows[1:]:
+            horizontal_params: dict[str, str] = {}
+            for idx, header in enumerate(first_row):
+                if not header or idx >= len(data_row):
+                    continue
+                value = data_row[idx]
+                if not value:
+                    continue
+                normalized_header = _normalize_param_name(header)
+                if normalized_header.startswith("click_"):
+                    continue
+                horizontal_params[normalized_header] = value
+            if horizontal_params:
+                parameter_sets.append(
+                    {
+                        "row_index": source_row_index,
+                        "values": horizontal_params,
+                    }
+                )
+        if parameter_sets:
+            return parameter_sets
+
+    header_aliases = {
+        "parameter",
+        "parameter name",
+        "param",
+        "name",
+        "field",
+    }
+    value_aliases = {
+        "value",
+        "parameter value",
+        "default",
+        "default value",
+    }
+
+    def _header_index(cells: tuple[str, ...], aliases: set[str]) -> int | None:
+        for idx, cell in enumerate(cells):
+            normalized = re.sub(r"\s+", " ", cell.lower()).strip()
+            if normalized in aliases:
+                return idx
+        return None
+
+    param_idx = _header_index(first_row, header_aliases)
+    value_idx = _header_index(first_row, value_aliases)
+    start_row = 1 if param_idx is not None and value_idx is not None else 0
+    if param_idx is None:
+        param_idx = 0
+    if value_idx is None:
+        value_idx = 1
+
+    params: dict[str, str] = {}
+    first_data_row_index = first_row_index
+    for source_row_index, row in normalized_rows[start_row:]:
+        if param_idx >= len(row) or value_idx >= len(row):
+            continue
+        param_name = row[param_idx]
+        param_value = row[value_idx]
+        # Skip action rows (click_*), header-like rows, and rows with no value
+        if not param_name or param_name.lower().startswith("click_") or not param_value:
+            continue
+        if not params:
+            first_data_row_index = source_row_index
+        params[_normalize_param_name(param_name)] = param_value
+    if not params:
+        return []
+    return [
+        {
+            "row_index": first_data_row_index,
+            "values": params,
+        }
+    ]
+
+
+def _extract_table_parameters(rows: list[tuple[Any, ...]]) -> dict[str, str]:
+    parameter_sets = _extract_table_parameter_sets(rows)
+    if not parameter_sets:
+        return {}
+    return dict(parameter_sets[0].get("values") or {})
+
+
+def _parse_excel_parameter_sets(raw_bytes: bytes) -> list[dict[str, Any]]:
     import io
     import openpyxl  # lazy import — only needed when a parameters file is provided
 
     wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
     ws = wb.active
-    params: dict[str, str] = {}
-    header_skipped = False
-    for row in ws.iter_rows(values_only=True):
-        if not header_skipped:
-            header_skipped = True
-            continue
-        param_name = str(row[0] or "").strip()
-        param_value = str(row[1] if row[1] is not None else "").strip()
-        # Skip action rows (click_*), header-like rows, and rows with no value
-        if not param_name or param_name.lower().startswith("click_") or not param_value:
-            continue
-        params[_normalize_param_name(param_name)] = param_value
+    parameter_sets = _extract_table_parameter_sets(list(ws.iter_rows(values_only=True)))
     wb.close()
-    return params
+    return parameter_sets
 
 
-def _parse_csv_parameters(raw_bytes: bytes) -> dict[str, str]:
+def _parse_excel_parameters(raw_bytes: bytes) -> dict[str, str]:
+    parameter_sets = _parse_excel_parameter_sets(raw_bytes)
+    if not parameter_sets:
+        return {}
+    return dict(parameter_sets[0].get("values") or {})
+
+
+def _parse_csv_parameter_sets(raw_bytes: bytes) -> list[dict[str, Any]]:
     import csv
     import io
 
-    reader = csv.DictReader(io.StringIO(raw_bytes.decode("utf-8-sig")))
-    params: dict[str, str] = {}
-    for row in reader:
-        param_name = str(row.get("Parameter") or "").strip()
-        param_value = str(row.get("Value") or "").strip()
-        if not param_name or param_name.lower().startswith("click_") or not param_value:
-            continue
-        params[_normalize_param_name(param_name)] = param_value
-    return params
+    reader = csv.reader(io.StringIO(raw_bytes.decode("utf-8-sig")))
+    return _extract_table_parameter_sets([tuple(row) for row in reader])
 
 
-def _load_parameters_from_file(file_key: str) -> dict[str, str]:
+def _parse_csv_parameters(raw_bytes: bytes) -> dict[str, str]:
+    parameter_sets = _parse_csv_parameter_sets(raw_bytes)
+    if not parameter_sets:
+        return {}
+    return dict(parameter_sets[0].get("values") or {})
+
+
+def _load_parameter_sets_from_file(file_key: str) -> list[dict[str, Any]]:
     raw_bytes = _storage_get_bytes(file_key)
     lower = file_key.lower()
     if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        return _parse_excel_parameters(raw_bytes)
+        return _parse_excel_parameter_sets(raw_bytes)
     if lower.endswith(".csv"):
-        return _parse_csv_parameters(raw_bytes)
+        return _parse_csv_parameter_sets(raw_bytes)
     raise ValueError(f"Unsupported parameters file format: {file_key}. Use .xlsx or .csv.")
+
+
+def _load_parameters_from_file(file_key: str) -> dict[str, str]:
+    parameter_sets = _load_parameter_sets_from_file(file_key)
+    if not parameter_sets:
+        return {}
+    return dict(parameter_sets[0].get("values") or {})
+
+
+def _derive_parameters_file_candidates(file_key: str) -> list[str]:
+    raw = str(file_key or "").strip()
+    if not raw:
+        return []
+
+    bucket_name, normalized_key = _split_storage_object_ref(raw)
+    script_path = Path(normalized_key)
+    if script_path.suffix.lower() != ".py":
+        return []
+
+    sibling_keys = [
+        str(script_path.with_name(f"{script_path.stem}_params.xlsx")),
+        str(script_path.with_name(f"{script_path.stem}_params.csv")),
+    ]
+    candidates: list[str] = []
+    raw_uses_s3_uri = raw.lower().startswith("s3://")
+    raw_uses_bucket_prefix = raw.startswith(f"{bucket_name}/")
+    for key in sibling_keys:
+        if raw_uses_s3_uri:
+            candidates.append(f"s3://{bucket_name}/{key}")
+        elif raw_uses_bucket_prefix:
+            candidates.append(f"{bucket_name}/{key}")
+        candidates.append(key)
+    return list(dict.fromkeys(candidates))
+
+
+def _load_recording_parameters(
+    recording: dict[str, Any],
+    file_key: str,
+) -> tuple[dict[str, str], str | None]:
+    parameter_sets, loaded_from = _load_recording_parameter_sets(recording, file_key)
+    if not parameter_sets:
+        return {}, loaded_from
+    return dict(parameter_sets[0].get("values") or {}), loaded_from
+
+
+def _load_recording_parameter_sets(
+    recording: dict[str, Any],
+    file_key: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    explicit_file = str(recording.get("parameters_file") or "").strip()
+    candidates = []
+    if explicit_file:
+        candidates.append(explicit_file)
+    candidates.extend(_derive_parameters_file_candidates(file_key))
+
+    seen: set[str] = set()
+    errors: list[tuple[str, Exception]] = []
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            return _load_parameter_sets_from_file(candidate), candidate
+        except Exception as exc:
+            errors.append((candidate, exc))
+
+    if explicit_file:
+        details = "; ".join(f"{candidate}: {exc}" for candidate, exc in errors)
+        raise RuntimeError(f"Failed to load parameters file. {details}")
+
+    return [], None
+
+
+def _expand_recordings_for_parameter_rows_data(
+    recordings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    expanded_recordings: list[dict[str, Any]] = []
+
+    for recording in recordings:
+        if recording.get("skip_parameters_file_load"):
+            expanded_recordings.append(recording)
+            continue
+
+        file_key = str(recording.get("file") or recording.get("recording_name") or "").strip()
+        if not file_key:
+            expanded_recordings.append(recording)
+            continue
+
+        try:
+            parameter_sets, loaded_from = _load_recording_parameter_sets(recording, file_key)
+        except Exception as exc:
+            logger.warning("Failed to pre-expand parameters for %s: %s", file_key, exc)
+            expanded_recordings.append(recording)
+            continue
+
+        if len(parameter_sets) <= 1:
+            expanded_recordings.append(recording)
+            continue
+
+        base_name = str(recording.get("name") or file_key or "recording").strip() or "recording"
+        base_parameters = recording.get("parameters") if isinstance(recording.get("parameters"), dict) else {}
+
+        for set_index, parameter_set in enumerate(parameter_sets, start=1):
+            row_index = int(parameter_set.get("row_index") or set_index)
+            row_values = dict(parameter_set.get("values") or {})
+            merged_parameters = dict(row_values)
+            merged_parameters.update(base_parameters)
+
+            expanded_recording = dict(recording)
+            expanded_recording["id"] = f'{recording.get("id") or "recording"}-row-{row_index}'
+            expanded_recording["name"] = f"{base_name} [row {row_index}]"
+            expanded_recording["parameters"] = merged_parameters
+            expanded_recording["parameters_file_key"] = loaded_from
+            expanded_recording["parameter_set_index"] = set_index
+            expanded_recording["parameter_row_index"] = row_index
+            expanded_recording["skip_parameters_file_load"] = True
+            expanded_recordings.append(expanded_recording)
+
+    return expanded_recordings
+
+
+def _normalize_parameter_values(parameters: dict[str, Any] | None) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in (parameters or {}).items():
+        param_name = _normalize_param_name(str(raw_key or ""))
+        param_value = str(raw_value).strip() if raw_value is not None else ""
+        if not param_name or not param_value:
+            continue
+        normalized[param_name] = param_value
+    return normalized
+
+
+def _parameters_to_json_object(parameters: dict[str, Any] | None) -> dict[str, str]:
+    normalized = _normalize_parameter_values(parameters)
+    return json.loads(json.dumps(normalized, sort_keys=True))
 
 
 def _truncate_text(value: Any, *, max_chars: int) -> str:
@@ -573,6 +829,7 @@ def _inject_runtime_helpers(script_text: str) -> str:
         import re
         import time
         from pathlib import Path
+        from urllib.parse import urlparse
 
         from playwright.sync_api import Browser, BrowserContext, Locator, Page
 
@@ -596,6 +853,29 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 return max(0, int(os.getenv(env_name, str(default))))
             except Exception:
                 return default
+
+
+        def _ptr_int_env(name: str, default: int) -> int:
+            try:
+                return int(os.getenv(name, str(default)))
+            except Exception:
+                return default
+
+
+        def _ptr_window_dimensions() -> tuple[int, int]:
+            width = max(960, _ptr_int_env("PTR_WINDOW_WIDTH", 1440))
+            height = max(700, _ptr_int_env("PTR_WINDOW_HEIGHT", 900))
+            return width, height
+
+
+        def _ptr_target_viewport() -> dict[str, int]:
+            window_width, window_height = _ptr_window_dimensions()
+            width_margin = max(0, _ptr_int_env("PTR_VIEWPORT_WIDTH_MARGIN", 80))
+            height_margin = max(0, _ptr_int_env("PTR_VIEWPORT_HEIGHT_MARGIN", 140))
+            return {
+                "width": max(800, window_width - width_margin),
+                "height": max(600, window_height - height_margin),
+            }
 
 
         _PTR_CAPTURE_STEPS = _ptr_env_flag("PTR_CAPTURE_STEPS", "true")
@@ -727,7 +1007,7 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 pass
 
 
-        def _ptr_fill_textbox(page, label: str, value, **kwargs):
+        def _ptr_fill_textbox(primary_locator, page, label: str, value, **kwargs):
             def _ptr_normalize(value) -> str:
                 return " ".join(str(value or "").lower().split())
 
@@ -771,8 +1051,8 @@ def _inject_runtime_helpers(script_text: str) -> str:
                     return False
                 return normalized_expected in _ptr_normalize(current_value)
 
-            def _ptr_fill_locator(current_page, locator):
-                locator.fill(value, **fill_kwargs)
+            def _ptr_fill_locator(current_page, locator, locator_fill_kwargs=None):
+                locator.fill(value, **(locator_fill_kwargs or fill_kwargs))
                 if _ptr_is_rich_text_locator(locator):
                     if _ptr_commit_rich_text(current_page, locator, value):
                         return
@@ -890,6 +1170,13 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 )
             except Exception:
                 match_timeout_ms = 5000
+            try:
+                direct_timeout_ms = max(
+                    250,
+                    min(match_timeout_ms, int(os.getenv("PTR_PRIMARY_TEXT_ENTRY_TIMEOUT_MS", "1200"))),
+                )
+            except Exception:
+                direct_timeout_ms = min(match_timeout_ms, 1200)
 
             fill_kwargs = dict(kwargs)
             fill_kwargs.setdefault("timeout", match_timeout_ms)
@@ -897,6 +1184,17 @@ def _inject_runtime_helpers(script_text: str) -> str:
             last_exc = None
             for _ptr_page_attempt in range(2):
                 current_page = _ptr_resolve_active_page(page)
+                if primary_locator is not None:
+                    direct_fill_kwargs = dict(fill_kwargs)
+                    direct_fill_kwargs["timeout"] = min(
+                        int(direct_fill_kwargs.get("timeout", match_timeout_ms)),
+                        direct_timeout_ms,
+                    )
+                    try:
+                        _ptr_fill_locator(current_page, primary_locator, direct_fill_kwargs)
+                        return
+                    except Exception as exc:
+                        last_exc = exc
                 candidates = [
                     (
                         "rich_text_aria_label",
@@ -983,7 +1281,7 @@ def _inject_runtime_helpers(script_text: str) -> str:
             ) from last_exc
 
 
-        def _ptr_click_textbox(page, label: str, **kwargs):
+        def _ptr_click_textbox(primary_locator, page, label: str, **kwargs):
             try:
                 match_timeout_ms = max(
                     1000,
@@ -991,6 +1289,13 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 )
             except Exception:
                 match_timeout_ms = 8000
+            try:
+                direct_timeout_ms = max(
+                    250,
+                    min(match_timeout_ms, int(os.getenv("PTR_PRIMARY_TEXT_CLICK_TIMEOUT_MS", "1000"))),
+                )
+            except Exception:
+                direct_timeout_ms = min(match_timeout_ms, 1000)
 
             click_kwargs = dict(kwargs)
             click_kwargs.setdefault("timeout", match_timeout_ms)
@@ -998,6 +1303,21 @@ def _inject_runtime_helpers(script_text: str) -> str:
             last_exc = None
             for _ptr_page_attempt in range(2):
                 current_page = _ptr_resolve_active_page(page)
+                if primary_locator is not None:
+                    direct_click_kwargs = dict(click_kwargs)
+                    direct_click_kwargs["timeout"] = min(
+                        int(direct_click_kwargs.get("timeout", match_timeout_ms)),
+                        direct_timeout_ms,
+                    )
+                    try:
+                        primary_locator.scroll_into_view_if_needed(timeout=direct_timeout_ms)
+                    except Exception:
+                        pass
+                    try:
+                        primary_locator.click(**direct_click_kwargs)
+                        return
+                    except Exception as exc:
+                        last_exc = exc
                 candidates = [
                     (
                         "rich_text_aria_label",
@@ -1346,7 +1666,14 @@ def _inject_runtime_helpers(script_text: str) -> str:
             ) from last_exc
 
 
-        def _ptr_select_search_popup_option(page, title: str, option_label: str, **kwargs):
+        def _ptr_select_search_trigger_option(
+            page,
+            title: str,
+            option_label: str,
+            option_kind: str = "text",
+            option_exact: bool = False,
+            **kwargs,
+        ):
             def _ptr_locator_is_interactable(locator) -> bool:
                 try:
                     return bool(
@@ -1382,19 +1709,52 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 except Exception:
                     return False
 
-            def _ptr_find_visible_option_locator(current_page):
-                option_candidates = [
-                    lambda: current_page.get_by_text(option_label, exact=True),
-                    lambda: current_page.get_by_role("option", name=option_label, exact=True),
-                    lambda: current_page.get_by_role("cell", name=option_label, exact=True),
-                    lambda: current_page.get_by_role("gridcell", name=option_label, exact=True),
-                    lambda: current_page.get_by_text(option_label, exact=False),
-                    lambda: current_page.get_by_role("option", name=option_label, exact=False),
-                    lambda: current_page.get_by_role("cell", name=option_label, exact=False),
-                    lambda: current_page.get_by_role("gridcell", name=option_label, exact=False),
-                ]
+            def _ptr_option_candidates(current_page, preferred_only: bool = False):
+                factories = []
+                seen: set[tuple[str, bool]] = set()
 
-                for factory in option_candidates:
+                def _append(kind: str, exact: bool) -> None:
+                    key = (kind, exact)
+                    if key in seen:
+                        return
+                    seen.add(key)
+                    if kind == "text":
+                        factories.append(
+                            (
+                                f"text_{'exact' if exact else 'partial'}",
+                                lambda kind=kind, exact=exact: current_page.get_by_text(
+                                    option_label, exact=exact
+                                ),
+                            )
+                        )
+                        return
+                    if kind in {"option", "cell", "gridcell"}:
+                        factories.append(
+                            (
+                                f"{kind}_{'exact' if exact else 'partial'}",
+                                lambda kind=kind, exact=exact: current_page.get_by_role(
+                                    kind, name=option_label, exact=exact
+                                ),
+                            )
+                        )
+
+                preferred_kind = option_kind if option_kind in {"text", "option", "cell", "gridcell"} else "text"
+                _append(preferred_kind, bool(option_exact))
+                _append(preferred_kind, not bool(option_exact))
+
+                if preferred_only:
+                    return factories
+
+                for kind in ("text", "option", "cell", "gridcell"):
+                    _append(kind, True)
+                for kind in ("text", "option", "cell", "gridcell"):
+                    _append(kind, False)
+                return factories
+
+            def _ptr_find_visible_option_locator(current_page, preferred_only: bool = False):
+                option_candidates = _ptr_option_candidates(current_page, preferred_only=preferred_only)
+
+                for _ptr_strategy, factory in option_candidates:
                     try:
                         locator = factory()
                         count = min(locator.count(), 20)
@@ -1406,6 +1766,37 @@ def _inject_runtime_helpers(script_text: str) -> str:
                             return candidate
                 return None
 
+            def _ptr_click_search_trigger(current_page, timeout_ms: int):
+                trigger_candidates = [
+                    current_page.get_by_title(title, exact=True).first,
+                    current_page.get_by_title(title, exact=False).first,
+                    current_page.locator(f'a[title="{title}"]').first,
+                    current_page.locator(f'[title="{title}"]').first,
+                ]
+                click_error = None
+                for trigger_locator in trigger_candidates:
+                    try:
+                        trigger_locator.scroll_into_view_if_needed(timeout=timeout_ms)
+                    except Exception:
+                        pass
+                    if not _ptr_locator_is_interactable(trigger_locator):
+                        continue
+                    try:
+                        trigger_locator.click(timeout=timeout_ms)
+                        return True
+                    except Exception as exc:
+                        click_error = exc
+                if click_error is not None:
+                    raise click_error
+                return False
+
+            try:
+                primary_timeout_ms = max(
+                    400,
+                    int(os.getenv("PTR_PRIMARY_SEARCH_TRIGGER_TIMEOUT_MS", "1200")),
+                )
+            except Exception:
+                primary_timeout_ms = 1200
             try:
                 match_timeout_ms = max(
                     1000,
@@ -1413,7 +1804,9 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 )
             except Exception:
                 match_timeout_ms = 10000
+            primary_timeout_ms = min(primary_timeout_ms, match_timeout_ms)
             post_open_wait_ms = _ptr_wait_ms("PTR_SEARCH_POPUP_POST_OPEN_WAIT_MS", 700)
+            fast_poll_wait_ms = _ptr_wait_ms("PTR_PRIMARY_SEARCH_TRIGGER_POLL_MS", 150)
 
             click_kwargs = dict(kwargs)
             click_kwargs.setdefault("timeout", match_timeout_ms)
@@ -1421,14 +1814,50 @@ def _inject_runtime_helpers(script_text: str) -> str:
             last_exc = None
             for _ptr_page_attempt in range(2):
                 current_page = _ptr_resolve_active_page(page)
-                icon_candidates = [
-                    current_page.get_by_title(title, exact=True).first,
-                    current_page.get_by_title(title, exact=False).first,
-                    current_page.locator(f'a[title="{title}"]').first,
-                    current_page.locator(f'[title="{title}"]').first,
-                ]
+
+                option_locator = _ptr_find_visible_option_locator(current_page, preferred_only=True)
+                if option_locator is not None:
+                    try:
+                        option_locator.scroll_into_view_if_needed(timeout=primary_timeout_ms)
+                    except Exception:
+                        pass
+                    try:
+                        option_locator.click(timeout=primary_timeout_ms)
+                        return
+                    except Exception as exc:
+                        last_exc = exc
+
+                opened = False
+                try:
+                    opened = _ptr_click_search_trigger(current_page, primary_timeout_ms)
+                except Exception as exc:
+                    last_exc = exc
+
+                if opened:
+                    try:
+                        current_page.wait_for_timeout(min(post_open_wait_ms, primary_timeout_ms))
+                    except Exception:
+                        pass
+                    fast_deadline = time.time() + (primary_timeout_ms / 1000.0)
+                    while time.time() < fast_deadline:
+                        option_locator = _ptr_find_visible_option_locator(current_page, preferred_only=True)
+                        if option_locator is not None:
+                            try:
+                                option_locator.scroll_into_view_if_needed(timeout=primary_timeout_ms)
+                            except Exception:
+                                pass
+                            try:
+                                option_locator.click(timeout=primary_timeout_ms)
+                                return
+                            except Exception as exc:
+                                last_exc = exc
+                        try:
+                            current_page.wait_for_timeout(fast_poll_wait_ms)
+                        except Exception:
+                            pass
 
                 deadline = time.time() + (match_timeout_ms / 1000.0)
+                last_open_attempt = time.time() if opened else 0.0
                 while time.time() < deadline:
                     option_locator = _ptr_find_visible_option_locator(current_page)
                     if option_locator is not None:
@@ -1440,17 +1869,11 @@ def _inject_runtime_helpers(script_text: str) -> str:
                         return
 
                     clicked = False
-                    for icon_locator in icon_candidates:
+                    if time.time() - last_open_attempt >= 0.8:
                         try:
-                            icon_locator.scroll_into_view_if_needed(timeout=match_timeout_ms)
-                        except Exception:
-                            pass
-                        if not _ptr_locator_is_interactable(icon_locator):
-                            continue
-                        try:
-                            icon_locator.click(**click_kwargs)
-                            clicked = True
-                            break
+                            clicked = _ptr_click_search_trigger(current_page, match_timeout_ms)
+                            if clicked:
+                                last_open_attempt = time.time()
                         except Exception as exc:
                             last_exc = exc
 
@@ -1470,8 +1893,12 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 break
 
             raise RuntimeError(
-                f'Unable to select "{option_label}" from search popup "{title}".'
+                f'Unable to select "{option_label}" from search trigger "{title}".'
             ) from last_exc
+
+
+        def _ptr_select_search_popup_option(page, title: str, option_label: str, **kwargs):
+            return _ptr_select_search_trigger_option(page, title, option_label, **kwargs)
 
 
         def _ptr_select_adf_menu_panel_option(page, trigger_label: str, option_label: str, trigger_kind: str = "title", **kwargs):
@@ -1520,11 +1947,15 @@ def _inject_runtime_helpers(script_text: str) -> str:
             def _ptr_get_trigger_candidates(current_page):
                 if trigger_kind == "title":
                     hardcoded_title_arrow_candidates = []
-                    if trigger_label == "Complete and Create Another":
+                    if trigger_label in {"Complete and Create Another", "Submit and Create Another"}:
                         hardcoded_title_arrow_candidates.extend(
                             [
-                                current_page.locator('a[id$="newTrx::popEl"][title="Complete and Create Another"]').first,
-                                current_page.locator('[id$="newTrx::popEl"][title="Complete and Create Another"]').first,
+                                current_page.locator(
+                                    f'a[id$="newTrx::popEl"][title="{trigger_label}"]'
+                                ).first,
+                                current_page.locator(
+                                    f'[id$="newTrx::popEl"][title="{trigger_label}"]'
+                                ).first,
                             ]
                         )
                     elif trigger_label == "Save":
@@ -1556,6 +1987,25 @@ def _inject_runtime_helpers(script_text: str) -> str:
                         current_page.locator(f'[role="menuitem"][aria-label="{trigger_label}"]').first,
                         current_page.get_by_role("link", name=trigger_label, exact=True).first,
                         current_page.get_by_role("link", name=trigger_label, exact=False).first,
+                    ]
+                return [
+                    current_page.get_by_role("button", name=trigger_label, exact=True).first,
+                    current_page.get_by_role("button", name=trigger_label, exact=False).first,
+                ]
+
+            def _ptr_get_primary_trigger_candidates(current_page):
+                if trigger_kind == "title":
+                    return [
+                        current_page.get_by_title(trigger_label, exact=True).first,
+                        current_page.get_by_title(trigger_label, exact=False).first,
+                        current_page.locator(f'a[title="{trigger_label}"]').first,
+                        current_page.locator(f'[title="{trigger_label}"]').first,
+                    ]
+                if trigger_kind == "link":
+                    return [
+                        current_page.get_by_role("link", name=trigger_label, exact=True).first,
+                        current_page.get_by_role("link", name=trigger_label, exact=False).first,
+                        current_page.locator(f'[role="menuitem"][aria-label="{trigger_label}"]').first,
                     ]
                 return [
                     current_page.get_by_role("button", name=trigger_label, exact=True).first,
@@ -1849,6 +2299,205 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 except Exception:
                     return False
 
+            def _ptr_try_hardcoded_split_button_option(current_page, before_signature) -> bool:
+                if trigger_kind != "title":
+                    return False
+                fast_paths = {
+                    ("Submit and Create Another", "Submit"): {
+                        "trigger": 'a[id$="::popEl"][title="Submit and Create Another"], [id$="::popEl"][title="Submit and Create Another"]',
+                        "options": [
+                            'xpath=//tr[@role="menuitem"][.//td[contains(@class,"xo2") and normalize-space()="Submit"]]',
+                            'xpath=//td[contains(@class,"xo2") and normalize-space()="Submit"]',
+                        ],
+                    },
+                }
+                fast_path = fast_paths.get((trigger_label, option_label))
+                if fast_path is None:
+                    return False
+
+                def _ptr_dom_click_trigger() -> bool:
+                    try:
+                        return bool(
+                            current_page.evaluate(
+                                """(selector) => {
+                                    const isVisible = (node) => {
+                                        if (!node) return false;
+                                        const style = window.getComputedStyle(node);
+                                        if (style.display === "none" || style.visibility === "hidden") return false;
+                                        if (node.getAttribute && node.getAttribute("aria-hidden") === "true") return false;
+                                        return !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+                                    };
+                                    const fire = (target, type, extra = {}) =>
+                                        target.dispatchEvent(
+                                            new MouseEvent(type, {
+                                                bubbles: true,
+                                                cancelable: true,
+                                                view: window,
+                                                ...extra,
+                                            })
+                                        );
+                                    const trigger = Array.from(document.querySelectorAll(selector)).find(isVisible);
+                                    if (!trigger) return false;
+                                    try { trigger.focus?.(); } catch {}
+                                    try { fire(trigger, "mouseover"); } catch {}
+                                    try { fire(trigger, "mousedown", { buttons: 1 }); } catch {}
+                                    try { fire(trigger, "mouseup", { buttons: 1 }); } catch {}
+                                    try { trigger.click?.(); } catch {}
+                                    return true;
+                                }""",
+                                fast_path["trigger"],
+                            )
+                        )
+                    except Exception:
+                        return False
+
+                def _ptr_dom_click_option() -> bool:
+                    try:
+                        return bool(
+                            current_page.evaluate(
+                                """(optionLabel) => {
+                                    const normalize = (value) =>
+                                        String(value || "").replace(/\\s+/g, " ").trim().toLowerCase();
+                                    const isVisible = (node) => {
+                                        if (!node) return false;
+                                        const style = window.getComputedStyle(node);
+                                        if (style.display === "none" || style.visibility === "hidden") return false;
+                                        if (node.getAttribute && node.getAttribute("aria-hidden") === "true") return false;
+                                        return !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+                                    };
+                                    const fire = (target, type, extra = {}) =>
+                                        target.dispatchEvent(
+                                            new MouseEvent(type, {
+                                                bubbles: true,
+                                                cancelable: true,
+                                                view: window,
+                                                ...extra,
+                                            })
+                                        );
+                                    const wanted = normalize(optionLabel);
+                                    const rows = Array.from(
+                                        document.querySelectorAll('tr[role="menuitem"], [role="menuitem"], td.xo2')
+                                    );
+                                    for (const node of rows) {
+                                        if (!isVisible(node)) continue;
+                                        const text = normalize(node.innerText || node.textContent || "");
+                                        if (!text) continue;
+                                        if (text !== wanted && !text.includes(wanted)) continue;
+                                        const row =
+                                            node.closest?.('tr[role="menuitem"]') ||
+                                            node.closest?.('[role="menuitem"]') ||
+                                            node;
+                                        const cell = row.querySelector?.("td.xo2") || node;
+                                        const target = isVisible(cell) ? cell : row;
+                                        try { row.focus?.(); } catch {}
+                                        try { fire(target, "mouseover"); } catch {}
+                                        try { fire(target, "mousedown", { buttons: 1 }); } catch {}
+                                        try { fire(target, "mouseup", { buttons: 1 }); } catch {}
+                                        try { target.click?.(); } catch {}
+                                        try {
+                                            row.dispatchEvent(
+                                                new KeyboardEvent("keydown", {
+                                                    key: "Enter",
+                                                    code: "Enter",
+                                                    bubbles: true,
+                                                    cancelable: true,
+                                                })
+                                            );
+                                        } catch {}
+                                        try {
+                                            row.dispatchEvent(
+                                                new KeyboardEvent("keyup", {
+                                                    key: "Enter",
+                                                    code: "Enter",
+                                                    bubbles: true,
+                                                    cancelable: true,
+                                                })
+                                            );
+                                        } catch {}
+                                        return true;
+                                    }
+                                    return false;
+                                }""",
+                                option_label,
+                            )
+                        )
+                    except Exception:
+                        return False
+
+                option_locator = None
+                for option_selector in fast_path["options"]:
+                    candidate = current_page.locator(option_selector).first
+                    if _ptr_locator_is_interactable(candidate):
+                        option_locator = candidate
+                        break
+
+                trigger_locator = current_page.locator(fast_path["trigger"]).first
+                if option_locator is None:
+                    if _ptr_dom_click_trigger():
+                        try:
+                            current_page.wait_for_timeout(
+                                min(
+                                    _ptr_wait_ms("PTR_ADF_SPLIT_BUTTON_POST_OPEN_WAIT_MS", 120),
+                                    primary_timeout_ms,
+                                )
+                            )
+                        except Exception:
+                            pass
+                        for option_selector in fast_path["options"]:
+                            candidate = current_page.locator(option_selector).first
+                            if _ptr_locator_is_interactable(candidate):
+                                option_locator = candidate
+                                break
+
+                    if option_locator is None:
+                        try:
+                            trigger_locator.scroll_into_view_if_needed(timeout=primary_timeout_ms)
+                        except Exception:
+                            pass
+
+                        open_attempted = False
+                        for force_click in (False, True):
+                            try:
+                                trigger_locator.click(timeout=primary_timeout_ms, force=force_click)
+                                open_attempted = True
+                                break
+                            except Exception:
+                                continue
+
+                        if not open_attempted:
+                            return False
+
+                        try:
+                            current_page.wait_for_timeout(
+                                min(
+                                    _ptr_wait_ms("PTR_ADF_SPLIT_BUTTON_POST_OPEN_WAIT_MS", 120),
+                                    primary_timeout_ms,
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                        for option_selector in fast_path["options"]:
+                            candidate = current_page.locator(option_selector).first
+                            if _ptr_locator_is_interactable(candidate):
+                                option_locator = candidate
+                                break
+
+                        if option_locator is None:
+                            return False
+
+                if not _ptr_dom_click_option() and not _ptr_click_menu_option_locator(current_page, option_locator, primary_timeout_ms):
+                    return False
+
+                if _ptr_wait_for_menu_action_effect(current_page, before_signature, trigger_locator):
+                    return True
+
+                try:
+                    option_still_visible = _ptr_find_visible_option_locator(current_page, trigger_locator) is not None
+                except Exception:
+                    option_still_visible = False
+                return not option_still_visible
+
             def _ptr_click_hardcoded_adf_option_dom(current_page):
                 if option_label not in _ptr_hardcoded_options:
                     return False
@@ -2057,12 +2706,20 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 return False
 
             try:
+                primary_timeout_ms = max(
+                    400,
+                    int(os.getenv("PTR_PRIMARY_ADF_MENU_PANEL_TIMEOUT_MS", "1200")),
+                )
+            except Exception:
+                primary_timeout_ms = 1200
+            try:
                 match_timeout_ms = max(
                     1000,
                     int(os.getenv("PTR_ADF_MENU_PANEL_TIMEOUT_MS", "10000")),
                 )
             except Exception:
                 match_timeout_ms = 10000
+            primary_timeout_ms = min(primary_timeout_ms, match_timeout_ms)
 
             click_kwargs = dict(kwargs)
             click_kwargs.setdefault("timeout", match_timeout_ms)
@@ -2071,70 +2728,109 @@ def _inject_runtime_helpers(script_text: str) -> str:
             for _ptr_page_attempt in range(2):
                 current_page = _ptr_resolve_active_page(page)
                 before_signature = _ptr_get_menu_action_signature(current_page)
+                primary_trigger_candidates = _ptr_get_primary_trigger_candidates(current_page)
                 trigger_candidates = _ptr_get_trigger_candidates(current_page)
                 deadline = time.time() + (match_timeout_ms / 1000.0)
                 active_trigger_locator = None
+                tried_primary_codegen_click = False
+
+                if _ptr_try_hardcoded_split_button_option(current_page, before_signature):
+                    return
 
                 while time.time() < deadline:
                     option_locator = _ptr_find_visible_option_locator(current_page, active_trigger_locator)
                     if option_locator is None:
+                        if not tried_primary_codegen_click:
+                            tried_primary_codegen_click = True
+                            primary_click_kwargs = dict(click_kwargs)
+                            primary_click_kwargs["timeout"] = min(
+                                int(primary_click_kwargs.get("timeout", match_timeout_ms)),
+                                primary_timeout_ms,
+                            )
+                            for trigger_locator in primary_trigger_candidates:
+                                try:
+                                    trigger_locator.scroll_into_view_if_needed(timeout=primary_timeout_ms)
+                                except Exception:
+                                    pass
+                                if not _ptr_locator_is_interactable(trigger_locator):
+                                    continue
+                                try:
+                                    trigger_locator.click(**primary_click_kwargs)
+                                except Exception as exc:
+                                    last_exc = exc
+                                    continue
+                                try:
+                                    current_page.wait_for_timeout(
+                                        min(
+                                            _ptr_wait_ms("PTR_ADF_MENU_PANEL_POST_OPEN_WAIT_MS", 250),
+                                            primary_timeout_ms,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                                option_locator = _ptr_find_visible_option_locator(current_page, trigger_locator)
+                                if option_locator is not None:
+                                    active_trigger_locator = trigger_locator
+                                    break
+
                         opened = False
-                        for trigger_locator in trigger_candidates:
-                            try:
-                                trigger_locator.scroll_into_view_if_needed(timeout=match_timeout_ms)
-                            except Exception:
-                                pass
-                            # ADF ::popEl elements are often zero-dimensional anchors;
-                            # skip the interactability gate for them and rely on force click.
-                            is_pop_el = False
-                            try:
-                                el_id = trigger_locator.get_attribute("id", timeout=1000) or ""
-                                is_pop_el = el_id.endswith("::popEl")
-                            except Exception:
-                                pass
-                            if not is_pop_el and not _ptr_locator_is_interactable(trigger_locator):
-                                continue
-                            try:
-                                force_kwargs = dict(click_kwargs)
-                                if is_pop_el:
-                                    force_kwargs["force"] = True
-                                trigger_locator.click(**force_kwargs)
-                                opened = True
-                                active_trigger_locator = trigger_locator
-                            except Exception as exc:
-                                last_exc = exc
-                                # Retry with force=True to bypass actionability checks
+                        if option_locator is None:
+                            for trigger_locator in trigger_candidates:
+                                try:
+                                    trigger_locator.scroll_into_view_if_needed(timeout=match_timeout_ms)
+                                except Exception:
+                                    pass
+                                # ADF ::popEl elements are often zero-dimensional anchors;
+                                # skip the interactability gate for them and rely on force click.
+                                is_pop_el = False
+                                try:
+                                    el_id = trigger_locator.get_attribute("id", timeout=1000) or ""
+                                    is_pop_el = el_id.endswith("::popEl")
+                                except Exception:
+                                    pass
+                                if not is_pop_el and not _ptr_locator_is_interactable(trigger_locator):
+                                    continue
                                 try:
                                     force_kwargs = dict(click_kwargs)
-                                    force_kwargs["force"] = True
+                                    if is_pop_el:
+                                        force_kwargs["force"] = True
                                     trigger_locator.click(**force_kwargs)
                                     opened = True
                                     active_trigger_locator = trigger_locator
-                                except Exception:
+                                except Exception as exc:
+                                    last_exc = exc
+                                    # Retry with force=True to bypass actionability checks
                                     try:
-                                        trigger_locator.focus(timeout=match_timeout_ms)
+                                        force_kwargs = dict(click_kwargs)
+                                        force_kwargs["force"] = True
+                                        trigger_locator.click(**force_kwargs)
+                                        opened = True
+                                        active_trigger_locator = trigger_locator
                                     except Exception:
-                                        continue
-                                    for key in ("ArrowDown", "Enter"):
                                         try:
-                                            current_page.keyboard.press(key)
-                                            opened = True
-                                            active_trigger_locator = trigger_locator
-                                            break
-                                        except Exception as keyboard_exc:
-                                            last_exc = keyboard_exc
-                                    if not opened:
-                                        continue
+                                            trigger_locator.focus(timeout=match_timeout_ms)
+                                        except Exception:
+                                            continue
+                                        for key in ("ArrowDown", "Enter"):
+                                            try:
+                                                current_page.keyboard.press(key)
+                                                opened = True
+                                                active_trigger_locator = trigger_locator
+                                                break
+                                            except Exception as keyboard_exc:
+                                                last_exc = keyboard_exc
+                                        if not opened:
+                                            continue
 
-                            try:
-                                current_page.wait_for_timeout(_ptr_wait_ms("PTR_ADF_MENU_PANEL_POST_OPEN_WAIT_MS", 250))
-                            except Exception:
-                                pass
+                                try:
+                                    current_page.wait_for_timeout(_ptr_wait_ms("PTR_ADF_MENU_PANEL_POST_OPEN_WAIT_MS", 250))
+                                except Exception:
+                                    pass
 
-                            option_locator = _ptr_find_visible_option_locator(current_page, trigger_locator)
-                            if option_locator is not None:
-                                active_trigger_locator = trigger_locator
-                                break
+                                option_locator = _ptr_find_visible_option_locator(current_page, trigger_locator)
+                                if option_locator is not None:
+                                    active_trigger_locator = trigger_locator
+                                    break
 
                         # JS-based fallback: target the ADF split-button arrow only.
                         # Do not click the main button text for title-triggered menus.
@@ -3522,6 +4218,73 @@ def _inject_runtime_helpers(script_text: str) -> str:
             return any(marker in message for marker in transient_markers)
 
 
+        def _ptr_get_requested_url(args, kwargs) -> str:
+            if args:
+                return str(args[0] or "").strip()
+            return str(kwargs.get("url") or "").strip()
+
+
+        def _ptr_same_origin(first_url: str, second_url: str) -> bool:
+            try:
+                first = urlparse(str(first_url or ""))
+                second = urlparse(str(second_url or ""))
+            except Exception:
+                return False
+            if not first.scheme or not first.netloc or not second.scheme or not second.netloc:
+                return False
+            return (first.scheme, first.netloc) == (second.scheme, second.netloc)
+
+
+        def _ptr_is_recoverable_aborted_navigation(page, requested_url: str, exc: Exception) -> bool:
+            if "ERR_ABORTED" not in str(exc):
+                return False
+            try:
+                current_url = str(page.url or "").strip()
+            except Exception:
+                return False
+            if not current_url or current_url == "about:blank":
+                return False
+            if requested_url and (current_url == requested_url or _ptr_same_origin(current_url, requested_url)):
+                return True
+            return False
+
+
+        def _ptr_wait_for_post_login_redirect(page, expected_url: str = "") -> None:
+            wait_timeout_ms = _ptr_wait_ms("PTR_LOGIN_REDIRECT_WAIT_MS", 12000)
+            deadline = time.time() + (wait_timeout_ms / 1000.0)
+            last_url = ""
+
+            while time.time() < deadline:
+                current_page = _ptr_resolve_active_page(page)
+                try:
+                    current_url = str(current_page.url or "").strip()
+                except Exception:
+                    current_url = ""
+
+                if current_url and current_url != "about:blank":
+                    last_url = current_url
+                    if (
+                        not expected_url
+                        or current_url == expected_url
+                        or _ptr_same_origin(current_url, expected_url)
+                    ):
+                        try:
+                            current_page.wait_for_load_state("domcontentloaded", timeout=1500)
+                        except Exception:
+                            pass
+                        return
+
+                try:
+                    current_page.wait_for_timeout(250)
+                except Exception:
+                    pass
+
+            if expected_url:
+                raise RuntimeError(
+                    f'Post-login redirect did not settle for "{expected_url}". Last URL: "{last_url or "unknown"}".'
+                )
+
+
         def _ptr_release_steel_session(session_id: str) -> None:
             if not session_id or session_id not in _PTR_STEEL_RELEASE_SESSION_IDS:
                 return
@@ -3645,14 +4408,14 @@ def _inject_runtime_helpers(script_text: str) -> str:
                 "--allow-running-insecure-content",
                 "--ignore-certificate-errors",
             ]
-            existing_args = list(kwargs.get("args") or [])
-            window_width = str(os.getenv("PTR_WINDOW_WIDTH", "")).strip()
-            window_height = str(os.getenv("PTR_WINDOW_HEIGHT", "")).strip()
-            if (
-                window_width
-                and window_height
-                and not any(str(arg).startswith("--window-size=") for arg in existing_args)
-            ):
+            blocked_launch_args = {"--start-maximized", "--start-fullscreen"}
+            existing_args = [
+                str(arg)
+                for arg in list(kwargs.get("args") or [])
+                if str(arg) not in blocked_launch_args
+            ]
+            window_width, window_height = _ptr_window_dimensions()
+            if not any(str(arg).startswith("--window-size=") for arg in existing_args):
                 existing_args.append(f"--window-size={window_width},{window_height}")
             for _a in _stealth_args:
                 if _a not in existing_args:
@@ -3698,6 +4461,24 @@ def _inject_runtime_helpers(script_text: str) -> str:
             if _PTR_RECORD_VIDEO and _PTR_VIDEO_DIR:
                 Path(_PTR_VIDEO_DIR).mkdir(parents=True, exist_ok=True)
                 kwargs.setdefault("record_video_dir", _PTR_VIDEO_DIR)
+            if not kwargs.get("no_viewport"):
+                target_viewport = _ptr_target_viewport()
+                viewport = kwargs.get("viewport")
+                if isinstance(viewport, dict):
+                    try:
+                        viewport_width = int(viewport.get("width", target_viewport["width"]))
+                    except Exception:
+                        viewport_width = target_viewport["width"]
+                    try:
+                        viewport_height = int(viewport.get("height", target_viewport["height"]))
+                    except Exception:
+                        viewport_height = target_viewport["height"]
+                    kwargs["viewport"] = {
+                        "width": max(800, min(viewport_width, target_viewport["width"])),
+                        "height": max(600, min(viewport_height, target_viewport["height"])),
+                    }
+                elif viewport is None:
+                    kwargs.setdefault("viewport", target_viewport)
             # Spoof a real Chrome user agent to bypass Akamai bot detection
             kwargs.setdefault(
                 "user_agent",
@@ -3727,6 +4508,7 @@ def _inject_runtime_helpers(script_text: str) -> str:
         def _ptr_page_goto(self, *args, **kwargs):
             _ptr_register_page(self)
             goto_retries = _ptr_get_retry_count("PTR_GOTO_RETRIES", 1)
+            requested_url = _ptr_get_requested_url(args, kwargs)
             last_exc = None
             for attempt in range(goto_retries + 1):
                 try:
@@ -3734,6 +4516,15 @@ def _inject_runtime_helpers(script_text: str) -> str:
                     break
                 except Exception as exc:
                     last_exc = exc
+                    if "ERR_ABORTED" in str(exc):
+                        self.wait_for_timeout(min(1000 * (attempt + 1), 3000))
+                        if _ptr_is_recoverable_aborted_navigation(self, requested_url, exc):
+                            try:
+                                self.wait_for_load_state("domcontentloaded", timeout=10000)
+                            except Exception:
+                                pass
+                            _ptr_capture_step("goto")
+                            return None
                     if not _ptr_is_transient_navigation_error(exc) or attempt >= goto_retries:
                         raise
                     self.wait_for_timeout(min(1000 * (attempt + 1), 3000))
@@ -3974,10 +4765,11 @@ def _strip_redundant_textbox_focus_clicks(script_text: str) -> str:
 
 def _rewrite_textbox_click_calls(script_text: str) -> str:
     _TEXTBOX_CLICK_RE = re.compile(
-        r'(?P<page>\b\w+\b)\.get_by_role\("textbox",\s*name="(?P<label>[^"\\]+)"(?:,\s*exact\s*=\s*(?P<exact>True|False))?\)\.click\((?P<args>.*?)\)'
+        r'(?P<locator>(?P<page>\b\w+\b)\.get_by_role\("textbox",\s*name="(?P<label>[^"\\]+)"(?:,\s*exact\s*=\s*(?P<exact>True|False))?\))\.click\((?P<args>.*?)\)'
     )
 
     def _repl(match: re.Match[str]) -> str:
+        locator_expr = match.group("locator")
         page_var = match.group("page")
         label = match.group("label")
         exact_value = match.group("exact")
@@ -3985,8 +4777,8 @@ def _rewrite_textbox_click_calls(script_text: str) -> str:
             return match.group(0)
         args_expr = (match.group("args") or "").strip()
         if args_expr:
-            return f'_ptr_click_textbox({page_var}, "{label}", {args_expr})'
-        return f'_ptr_click_textbox({page_var}, "{label}")'
+            return f'_ptr_click_textbox({locator_expr}, {page_var}, "{label}", {args_expr})'
+        return f'_ptr_click_textbox({locator_expr}, {page_var}, "{label}")'
 
     rewritten_lines = []
     for line in script_text.splitlines(keepends=True):
@@ -4021,14 +4813,15 @@ def _substitute_parameters(script_text: str, parameters: dict[str, Any]) -> str:
 
 def _rewrite_textbox_fill_calls(script_text: str) -> str:
     _TEXTBOX_FILL_RE = re.compile(
-        r'(?P<page>\b\w+\b)\.get_by_role\("textbox",\s*name="(?P<label>[^"\\]+)"\)\.fill\((?P<value>.+?)\)'
+        r'(?P<locator>(?P<page>\b\w+\b)\.get_by_role\("textbox",\s*name="(?P<label>[^"\\]+)"\))\.fill\((?P<value>.+?)\)'
     )
 
     def _repl(match: re.Match[str]) -> str:
+        locator_expr = match.group("locator")
         page_var = match.group("page")
         label = match.group("label")
         value_expr = match.group("value")
-        return f'_ptr_fill_textbox({page_var}, "{label}", {value_expr})'
+        return f'_ptr_fill_textbox({locator_expr}, {page_var}, "{label}", {value_expr})'
 
     rewritten_lines = []
     for line in script_text.splitlines(keepends=True):
@@ -4125,7 +4918,11 @@ def _rewrite_search_popup_selection_calls(script_text: str) -> str:
             page_var = icon_match.group("page")
             title = icon_match.group("title")
             option = option_match.group("option")
-            out.append(f'{indent}_ptr_select_search_popup_option({page_var}, "{title}", "{option}")\n')
+            option_exact = "True" if option_match.group("exact") == "True" else "False"
+            out.append(
+                f'{indent}_ptr_select_search_trigger_option({page_var}, "{title}", "{option}", '
+                f'option_kind="text", option_exact={option_exact})\n'
+            )
             i = j + 1
             continue
         if (
@@ -4137,7 +4934,12 @@ def _rewrite_search_popup_selection_calls(script_text: str) -> str:
             page_var = icon_match.group("page")
             title = icon_match.group("title")
             option = role_option_match.group("option")
-            out.append(f'{indent}_ptr_select_search_popup_option({page_var}, "{title}", "{option}")\n')
+            option_role = role_option_match.group("role")
+            option_exact = "True" if role_option_match.group("exact") == "True" else "False"
+            out.append(
+                f'{indent}_ptr_select_search_trigger_option({page_var}, "{title}", "{option}", '
+                f'option_kind="{option_role}", option_exact={option_exact})\n'
+            )
             i = j + 1
             continue
 
@@ -4354,6 +5156,49 @@ def _rewrite_navigation_button_click_calls(script_text: str) -> str:
     return "".join(rewritten_lines)
 
 
+def _rewrite_post_login_goto_calls(script_text: str) -> str:
+    _PASSWORD_ENTER_RE = re.compile(
+        r'^(?P<indent>[ \t]*)(?P<page>\b\w+\b)\.get_by_role\("textbox",\s*name="Password"\)\.press\("Enter"\)\s*$'
+    )
+    _GOTO_RE = re.compile(
+        r'^(?P<indent>[ \t]*)(?P<page>\b\w+\b)\.goto\("(?P<url>[^"\\]+)"(?:,\s*.*)?\)\s*$'
+    )
+
+    lines = script_text.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        password_enter_m = _PASSWORD_ENTER_RE.match(line)
+        if not password_enter_m:
+            out.append(line)
+            i += 1
+            continue
+
+        out.append(line)
+        j = i + 1
+        skipped_lines: list[str] = []
+        while j < len(lines) and (not lines[j].strip() or lines[j].lstrip().startswith("#")):
+            skipped_lines.append(lines[j])
+            j += 1
+
+        if j < len(lines):
+            goto_m = _GOTO_RE.match(lines[j])
+            if goto_m and goto_m.group("page") == password_enter_m.group("page"):
+                indent = goto_m.group("indent")
+                page_var = goto_m.group("page")
+                url = goto_m.group("url")
+                out.extend(skipped_lines)
+                out.append(f'{indent}_ptr_wait_for_post_login_redirect({page_var}, "{url}")\n')
+                i = j + 1
+                continue
+
+        out.extend(skipped_lines)
+        i += 1
+
+    return "".join(out)
+
+
 def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] | None = None) -> str:
     _validate_python_playwright_script(script_text)
     if parameters:
@@ -4368,6 +5213,7 @@ def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] |
     script_text = _rewrite_combobox_click_calls(script_text)
     script_text = _rewrite_date_picker_click_calls(script_text)
     script_text = _rewrite_navigation_button_click_calls(script_text)
+    script_text = _rewrite_post_login_goto_calls(script_text)
     script_text = _rewrite_exact_button_click_calls(script_text)
     script_text = _inject_network_idle_waits(script_text)
     return _inject_runtime_helpers(script_text)
@@ -4404,6 +5250,11 @@ def _run_python_script(
 
 
 @tool()
+async def expand_recordings_for_parameter_rows(recordings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_expand_recordings_for_parameter_rows_data, recordings)
+
+
+@tool()
 async def execute_recording_script(
     recording: dict[str, Any],
     test_suite_id: str,
@@ -4411,11 +5262,18 @@ async def execute_recording_script(
 ) -> dict[str, Any]:
     recording_id = str(recording.get("id") or "unknown")
     file_key = str(recording.get("file") or recording.get("recording_name") or "").strip()
-    recording_name = file_key or recording_id
+    recording_name = str(recording.get("name") or "").strip() or file_key or recording_id
+    parameter_row_index = recording.get("parameter_row_index")
+    parameter_set_index = recording.get("parameter_set_index")
+    artifact_identity = file_key or recording_name or recording_id
+    if parameter_row_index not in (None, ""):
+        artifact_identity = f"{artifact_identity}__row_{parameter_row_index}"
+    elif parameter_set_index not in (None, ""):
+        artifact_identity = f"{artifact_identity}__set_{parameter_set_index}"
 
     artifact_prefix = (
         f"playwright-test-results/{_safe_segment(test_suite_id)}/{_safe_segment(parent_run_id)}"
-        f"/{_safe_segment(file_key)}"
+        f"/{_safe_segment(artifact_identity)}"
     )
     manifest_key = f"{artifact_prefix}/manifest.json"
 
@@ -4423,6 +5281,8 @@ async def execute_recording_script(
         "recording_id": recording_id,
         "recording_name": recording_name,
         "file_key": file_key,
+        "parameter_row_index": parameter_row_index,
+        "parameter_set_index": parameter_set_index,
         "status": "failed",
         "exit_code": -1,
         "duration_seconds": 0,
@@ -4436,6 +5296,9 @@ async def execute_recording_script(
         "video_s3_keys": [],
         "step_artifacts": [],
         "ai_failure_summary": None,
+        "parameters_file_key": None,
+        "resolved_parameter_count": 0,
+        "resolved_parameter_keys": [],
     }
 
     start_time = time.time()
@@ -4459,20 +5322,41 @@ async def execute_recording_script(
         parameterised_script, default_params = _parameterise_script(raw_script_bytes.decode("utf-8"))
         logger.info("Auto-extracted %d default parameter(s) from script", len(default_params))
 
-        # Merge order: script defaults → Excel file overrides → inline overrides
-        parameters: dict[str, str] = dict(default_params)
-        parameters_file = str(recording.get("parameters_file") or "").strip()
-        if parameters_file:
+        # Merge order: script defaults → Excel file overrides → inline overrides.
+        # Before execution we normalize the merged values into a JSON object and
+        # substitute placeholders from that JSON payload.
+        parameters: dict[str, str] = _normalize_parameter_values(default_params)
+        parameters_file_key = str(recording.get("parameters_file_key") or "").strip() or None
+        if not bool(recording.get("skip_parameters_file_load")):
             try:
-                file_params = await asyncio.to_thread(_load_parameters_from_file, parameters_file)
-                parameters.update(file_params)
-                logger.info("Loaded %d parameter(s) from %s", len(file_params), parameters_file)
+                file_params, loaded_from = await asyncio.to_thread(_load_recording_parameters, recording, file_key)
+                if file_params:
+                    parameters.update(_normalize_parameter_values(file_params))
+                    parameters_file_key = loaded_from
+                    logger.info("Loaded %d parameter(s) from %s", len(file_params), loaded_from)
+                elif loaded_from:
+                    parameters_file_key = loaded_from
             except Exception as exc:
-                logger.warning("Failed to load parameters file %s: %s", parameters_file, exc)
-        inline = {k: str(v) for k, v in (recording.get("parameters") or {}).items() if v is not None}
+                parameters_file = str(recording.get("parameters_file") or "").strip()
+                logger.warning("Failed to load parameters file %s: %s", parameters_file or file_key, exc)
+        inline = _normalize_parameter_values(recording.get("parameters") or {})
         parameters.update(inline)
 
-        prepared_script = _prepare_script_for_execution(parameterised_script, parameters or None)
+        execution_parameters = _parameters_to_json_object(parameters)
+        result["parameters_file_key"] = parameters_file_key
+        result["resolved_parameter_count"] = len(execution_parameters)
+        result["resolved_parameter_keys"] = sorted(execution_parameters)
+        logger.info(
+            "Resolved %d execution parameter(s) for %s: %s",
+            len(execution_parameters),
+            file_key,
+            ", ".join(sorted(execution_parameters)),
+        )
+
+        prepared_script = _prepare_script_for_execution(
+            parameterised_script,
+            execution_parameters or None,
+        )
     except Exception as exc:
         logger.exception("Failed to download or prepare recording script for %s", file_key)
         result["error"] = f"Failed to download or prepare recording script: {exc}"

@@ -90,8 +90,8 @@ def _lightbox_button(
 
 def _display_recording_name(result: dict[str, Any]) -> str:
     preferred = [
-        str(result.get("file_key") or "").strip(),
         str(result.get("recording_name") or "").strip(),
+        str(result.get("file_key") or "").strip(),
         str(result.get("recording_id") or "").strip(),
     ]
     raw_name = next((value for value in preferred if value), "Unnamed recording")

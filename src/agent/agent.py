@@ -43,6 +43,25 @@ def _extract_trigger_payload(payload: dict[str, Any]) -> tuple[str, list[dict[st
     return test_suite_id, recordings, execution_mode
 
 
+async def _expand_recordings_for_parameter_rows(
+    recordings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    try:
+        expanded_recordings = await toolExecutor.execute(
+            "expand_recordings_for_parameter_rows",
+            recordings,
+            start_to_close_timeout=timedelta(minutes=5),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+    except Exception as exc:  # pragma: no cover - runtime path
+        logger.warning("Failed to expand recordings for parameter rows: %s", exc)
+        return recordings
+
+    if not isinstance(expanded_recordings, list) or not expanded_recordings:
+        return recordings
+    return expanded_recordings
+
+
 @agent(name="PlaywrightTestRunnerChild")
 async def PlaywrightTestRunnerChild(payload: dict[str, Any]) -> dict[str, Any]:
     recording = payload.get("recording") or {}
@@ -75,7 +94,8 @@ async def PlaywrightTestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, A
     if not isinstance(recordings, list) or not recordings:
         return [{"type": "error", "message": "At least one recording is required."}]
 
-    ordered_recordings = [recording for recording in recordings if recording.get("file")]
+    candidate_recordings = [recording for recording in recordings if recording.get("file")]
+    ordered_recordings = await _expand_recordings_for_parameter_rows(candidate_recordings)
     if not ordered_recordings:
         return [{"type": "error", "message": "No valid recording files were provided."}]
 
