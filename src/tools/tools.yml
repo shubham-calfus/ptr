@@ -1,3 +1,3 @@
 scraper:
   type: playwright
-  headless: "true"
+  headless: "false"

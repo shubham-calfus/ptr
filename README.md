@@ -44,4 +44,13 @@ Environment variables:
 - `OPENAI_FAILURE_SUMMARY_MODEL` optionally overrides the default model.
 - `OPENAI_FAILURE_SUMMARY_ENABLED=false` disables the feature without removing the key.
 - `OPENAI_BASE_URL` optionally points to a compatible Responses API base URL.
+
+## Design docs
+
+- [`RUNNER_EXPERIENCE_SYSTEM.md`](/Users/shubhammore/Documents/act-v2/playwright_test_runner/RUNNER_EXPERIENCE_SYSTEM.md)
+  defines the planned experience-driven recovery system for the Oracle-focused
+  runner.
+- [`CODEX_CUSTOM_INSTRUCTIONS.md`](/Users/shubhammore/Documents/act-v2/playwright_test_runner/CODEX_CUSTOM_INSTRUCTIONS.md)
+  contains a paste-ready Codex custom-instructions block aligned with the new
+  runner direction.
 # ptr

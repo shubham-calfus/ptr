@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from typing import Any
 
@@ -105,10 +106,21 @@ def _humanize_action(action: str) -> str:
     mapping = {
         "goto": "Navigate to page",
         "click": "Click element",
+        "click_textbox": "Click text field",
+        "click_text_target": "Click text target",
+        "click_button_target": "Click button target",
+        "click_combobox": "Open combobox",
+        "click_numeric_button": "Click numeric button",
         "fill": "Enter text",
+        "fill_textbox": "Fill text field",
         "press": "Press key",
         "reload": "Reload page",
         "select_option": "Select option",
+        "select_combobox": "Select combobox option",
+        "search_and_select": "Search and select",
+        "submit_textbox_enter": "Submit text field",
+        "navigation_button": "Click navigation button",
+        "date_pick": "Pick date",
         "check": "Check option",
         "uncheck": "Uncheck option",
         "hover": "Hover element",
@@ -139,6 +151,819 @@ def _format_duration_minutes(duration_seconds: Any) -> str:
     return f"{value} {unit}"
 
 
+def _pluralize(value: int, singular: str, plural: str | None = None) -> str:
+    if value == 1:
+        return f"{value} {singular}"
+    return f"{value} {plural or singular + 's'}"
+
+
+def _format_action_duration(duration_ms: Any) -> str:
+    try:
+        total_ms = max(0, int(duration_ms or 0))
+    except Exception:
+        total_ms = 0
+
+    if total_ms <= 0:
+        return "0:00"
+    if total_ms < 1000:
+        return "<0:01"
+
+    rounded_seconds = int(round(total_ms / 1000.0))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        candidate = str(value or "").strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    return deduped
+
+
+def _action_ai_interactions(action: dict[str, Any]) -> list[dict[str, Any]]:
+    interactions: list[dict[str, Any]] = []
+    for item in action.get("ai_interactions") or []:
+        if isinstance(item, dict) and item:
+            interactions.append(item)
+    return interactions
+
+
+def _action_experience_interactions(action: dict[str, Any]) -> list[dict[str, Any]]:
+    interactions: list[dict[str, Any]] = []
+    for item in action.get("experience_interactions") or []:
+        if isinstance(item, dict) and item:
+            interactions.append(item)
+    return interactions
+
+
+def _action_failure_context(action: dict[str, Any]) -> dict[str, Any]:
+    context = action.get("failure_context")
+    if isinstance(context, dict) and context:
+        return context
+    return {}
+
+
+def _stringify_trace_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple, set)) and not value:
+        return ""
+    if isinstance(value, dict) and not value:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(value).strip()
+
+
+def _build_trace_ai_detail(title: str, value: Any) -> str:
+    text = _stringify_trace_value(value)
+    if not text:
+        return ""
+    return "".join(
+        [
+            '<details class="trace-ai-detail">',
+            f'<summary>{escape(title)}</summary>',
+            f'<pre>{escape(text)}</pre>',
+            '</details>',
+        ]
+    )
+
+
+def _ai_interaction_status_chip(interaction: dict[str, Any]) -> tuple[str, str]:
+    repair_outcome = str(interaction.get("repair_outcome") or "").strip().lower()
+    if repair_outcome == "validated":
+        return "Success", "trace-chip-success"
+    if repair_outcome in {"execution_failed", "no_usable_locator"}:
+        return "Failed", "trace-chip-failed"
+
+    status = str(interaction.get("status") or "unknown").strip().lower()
+    if status == "success":
+        return "Suggestions Found", ""
+    if status in {"request_error", "parse_error", "invalid_response"} or "error" in status:
+        return "Failed", "trace-chip-failed"
+
+    mapping = {
+        "empty": "No Suggestions",
+        "skipped_no_candidates": "No Candidates",
+        "disabled": "Disabled",
+        "requested": "Requested",
+    }
+    return mapping.get(status, status.replace("_", " ").title() if status else "Unknown"), ""
+
+
+def _humanize_strategy(strategy: str) -> str:
+    normalized = str(strategy or "").strip()
+    if not normalized:
+        return "Recorded target"
+
+    lowered = normalized.lower()
+    exact_mapping = {
+        "direct": "Recorded target",
+        "experience_lookup": "Learned recovery lookup",
+        "ai_self_repair_lookup": "AI repair lookup",
+        "oracle_quick_actions_expand": "Oracle quick-action expansion",
+        "oracle_home_search": "Oracle home search",
+        "label_exact": "Exact label match",
+        "label_partial": "Partial label match",
+        "placeholder": "Placeholder match",
+        "aria_label": "ARIA label match",
+        "title": "Title match",
+        "metadata_match": "Metadata match",
+        "primary_trigger": "Primary trigger",
+        "adf_listbox_drop": "ADF listbox",
+        "adf_drop_toggle": "ADF dropdown toggle",
+        "adf_select_one_choice": "ADF select one choice",
+        "oj_has_text_wrapper": "Oracle text wrapper",
+        "oj_label_hint_input": "Oracle label hint input",
+        "oracle_rich_text": "Oracle rich text",
+        "rich_text_aria_label": "Rich text ARIA label",
+    }
+    if lowered in exact_mapping:
+        return exact_mapping[lowered]
+
+    if lowered.startswith("ai_"):
+        kind = lowered.split("_", 2)[1] if "_" in lowered else "locator"
+        kind_mapping = {
+            "css": "AI repaired CSS locator",
+            "xpath": "AI repaired XPath locator",
+            "role": "AI repaired role locator",
+            "text": "AI repaired text locator",
+            "label": "AI repaired label locator",
+            "placeholder": "AI repaired placeholder locator",
+        }
+        return kind_mapping.get(kind, "AI repaired locator")
+
+    if lowered.startswith("experience_"):
+        kind = lowered.split("_", 2)[1] if "_" in lowered else "locator"
+        kind_mapping = {
+            "css": "Learned CSS locator",
+            "xpath": "Learned XPath locator",
+            "role": "Learned role locator",
+            "text": "Learned text locator",
+            "label": "Learned label locator",
+            "placeholder": "Learned placeholder locator",
+        }
+        return kind_mapping.get(kind, "Learned recovery locator")
+
+    if lowered.startswith("oracle_"):
+        return f"Oracle {lowered.removeprefix('oracle_').replace('_', ' ')}".title()
+
+    if lowered.startswith("oj_"):
+        return f"Oracle {lowered.removeprefix('oj_').replace('_', ' ')}".title()
+
+    if lowered.startswith("role_"):
+        role_parts = lowered.split("_")
+        if len(role_parts) >= 3:
+            return f"{role_parts[1].title()} role ({role_parts[2]})"
+        return lowered.replace("_", " ").title()
+
+    if lowered.startswith("text_"):
+        return f"Visible text ({lowered.removeprefix('text_')})"
+
+    return lowered.replace("_", " ").title()
+
+
+def _display_action_strategy(strategy: str) -> str:
+    return _humanize_strategy(strategy)
+
+
+def _describe_recovery(recovery: dict[str, Any]) -> str:
+    source = str(recovery.get("source") or "").strip().lower()
+    kind = str(recovery.get("kind") or "").strip().lower()
+    details = recovery.get("details")
+    if not isinstance(details, dict):
+        details = {}
+
+    if source in {"", "strict"} or kind == "direct":
+        return "the recorded target"
+    if source == "oracle_handler" and kind == "quick_action_expand":
+        return "Oracle quick-action expansion"
+    if source == "oracle_handler" and kind == "home_search":
+        return "Oracle home search"
+    if source == "experience_reuse":
+        score = details.get("retrieval_score")
+        if score not in (None, ""):
+            return f"a learned recovery from an earlier successful run (score {score})"
+        return "a learned recovery from an earlier successful run"
+    if source == "ai_validated":
+        strategy_name = str(details.get("strategy_name") or "").strip()
+        if strategy_name:
+            return f"an AI-suggested locator that passed validation ({_humanize_strategy(strategy_name)})"
+        return "an AI-suggested locator that passed validation"
+    if kind:
+        return _humanize_strategy(kind)
+    return _humanize_strategy(str(recovery.get("handler_name") or "recovery"))
+
+
+def _build_action_recovery_block(action: dict[str, Any], stats: dict[str, Any]) -> str:
+    recovery = action.get("recovery")
+    if not isinstance(recovery, dict):
+        recovery = {}
+    experience_interactions = _action_experience_interactions(action)
+    attempt_count = int(stats.get("attempt_count") or 0)
+    if attempt_count <= 0 and not recovery and not experience_interactions:
+        return ""
+
+    copy_parts: list[str] = []
+    if attempt_count > 0:
+        copy_parts.append(
+            f"The runner tried {_pluralize(attempt_count, 'recovery attempt')} across "
+            f"{_pluralize(int(stats.get('unique_count') or 0), 'strategy', 'strategies')}."
+        )
+    if recovery:
+        copy_parts.append(f"Final resolution: {_describe_recovery(recovery)}.")
+    elif experience_interactions:
+        copy_parts.append("No reusable learned recovery matched this step.")
+
+    strategy_chips = "".join(
+        f'<span class="strategy-chip" title="{escape(strategy)}">{escape(_humanize_strategy(strategy))}</span>'
+        for strategy in stats.get("unique_attempts") or []
+    )
+    debug_blocks = "".join(
+        block
+        for block in [
+            _build_trace_ai_detail("Successful Recovery Record", recovery),
+            _build_trace_ai_detail("Learned Recovery Lookups", experience_interactions),
+            _build_trace_ai_detail("Internal Strategy Keys", stats.get("unique_attempts") or []),
+        ]
+        if block
+    )
+    debug_block = ""
+    if debug_blocks:
+        debug_block = "".join(
+            [
+                '<details class="trace-debug-details">',
+                '<summary>Recovery Debug Data</summary>',
+                debug_blocks,
+                '</details>',
+            ]
+        )
+
+    return "".join(
+        [
+            '<section class="trace-detail-card">',
+            '<div class="trace-section-title">Recovery Details</div>',
+            f'<div class="trace-detail-copy">{escape(" ".join(copy_parts).strip() or "Recovery details were captured for this step.")}</div>',
+            f'<div class="trace-strategies">{strategy_chips}</div>' if strategy_chips else "",
+            debug_block,
+            '</section>',
+        ]
+    )
+
+
+def _build_action_ai_block(action: dict[str, Any]) -> str:
+    interactions = _action_ai_interactions(action)
+    if not interactions:
+        return ""
+
+    cards: list[str] = []
+    for index, interaction in enumerate(interactions, start=1):
+        status_label, status_class = _ai_interaction_status_chip(interaction)
+
+        meta_bits = [f'<span class="trace-chip {status_class}">{escape(status_label)}</span>']
+        model = str(interaction.get("model") or "").strip()
+        helper = str(interaction.get("helper") or "").strip()
+        endpoint = str(interaction.get("endpoint") or "").strip()
+        locator_strategy = str(
+            interaction.get("validated_locator_strategy")
+            or interaction.get("last_locator_strategy")
+            or ""
+        ).strip()
+        if model:
+            meta_bits.append(f'<span class="trace-chip">Model: {escape(model)}</span>')
+        if helper:
+            meta_bits.append(f'<span class="trace-chip">Helper: {escape(helper)}</span>')
+        if locator_strategy:
+            meta_bits.append(f'<span class="trace-chip">Locator: {escape(_humanize_strategy(locator_strategy))}</span>')
+
+        for label, key in (
+            ("Page Candidates", "dom_candidate_count"),
+            ("Model Suggestions", "response_strategy_count"),
+            ("Usable Locators", "locator_candidate_count"),
+        ):
+            value = interaction.get(key)
+            if value not in (None, ""):
+                meta_bits.append(f'<span class="trace-chip">{escape(label)}: {escape(str(value))}</span>')
+
+        request_meta = {
+            key: value
+            for key, value in {
+                "feature": interaction.get("feature"),
+                "lookup_status": interaction.get("status"),
+                "repair_outcome": interaction.get("repair_outcome"),
+                "validated_locator_strategy": interaction.get("validated_locator_strategy"),
+                "last_locator_strategy": interaction.get("last_locator_strategy"),
+                "postcondition_kind": interaction.get("postcondition_kind"),
+                "postcondition_passed": interaction.get("postcondition_passed"),
+                "endpoint": endpoint,
+                "http_status": interaction.get("http_status"),
+                "max_output_tokens": interaction.get("max_output_tokens"),
+                "value": interaction.get("value"),
+                "error_type": interaction.get("error_type"),
+            }.items()
+            if value not in (None, "", [])
+        }
+
+        detail_blocks = "".join(
+            block
+            for block in [
+                _build_trace_ai_detail("Request Details", request_meta),
+                _build_trace_ai_detail("System Instructions", interaction.get("system_prompt")),
+                _build_trace_ai_detail("Context Sent To The Model", interaction.get("user_prompt")),
+                _build_trace_ai_detail("Model Response", interaction.get("response_text")),
+                _build_trace_ai_detail("Parsed Repair Plan", interaction.get("parsed_response")),
+                _build_trace_ai_detail("Suggested Strategies", interaction.get("response_strategies")),
+                _build_trace_ai_detail("Validated Locator Keys", interaction.get("locator_strategies")),
+                _build_trace_ai_detail("Rejected Suggestions", interaction.get("rejected_locator_reasons")),
+                _build_trace_ai_detail("Raw API Response", interaction.get("api_response_body")),
+                _build_trace_ai_detail("Raw API Error", interaction.get("error_response_body")),
+            ]
+            if block
+        )
+
+        error_text = str(interaction.get("repair_error") or interaction.get("error") or "").strip()
+        error_block = (
+            f'<div class="trace-error">{escape(error_text)}</div>'
+            if error_text
+            else ""
+        )
+
+        cards.append(
+            "".join(
+                [
+                    '<article class="trace-ai-card">',
+                    '<div class="trace-ai-top">',
+                    f'<div class="trace-ai-title">Repair Attempt {index}</div>',
+                    f'<div class="trace-ai-meta">{"".join(meta_bits)}</div>',
+                    '</div>',
+                    error_block,
+                    detail_blocks,
+                    '</article>',
+                ]
+            )
+        )
+
+    return "".join(
+        [
+            '<section class="trace-ai-block">',
+            '<div class="trace-ai-block-title">AI Repair Attempts</div>',
+            '<div class="trace-ai-list">',
+            "".join(cards),
+            '</div>',
+            '</section>',
+        ]
+    )
+
+
+def _build_failure_context_block(action: dict[str, Any]) -> str:
+    context = _action_failure_context(action)
+    if not context:
+        return ""
+
+    dom_context = context.get("dom_context")
+    if not isinstance(dom_context, dict):
+        dom_context = {}
+    candidates = dom_context.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = []
+
+    meta_bits: list[str] = []
+    ready_state = str(context.get("ready_state") or "").strip()
+    if ready_state:
+        meta_bits.append(f'<span class="trace-chip">Page Ready: {escape(ready_state)}</span>')
+    busy_indicators = context.get("busy_indicator_count")
+    if busy_indicators not in (None, ""):
+        meta_bits.append(f'<span class="trace-chip">Busy Indicators: {escape(str(busy_indicators))}</span>')
+    meta_bits.append(f'<span class="trace-chip">Candidate Elements: {escape(str(len(candidates)))}</span>')
+
+    meta = {
+        key: value
+        for key, value in {
+            "helper": context.get("helper"),
+            "label": context.get("label"),
+            "page_title": context.get("page_title"),
+            "page_url": context.get("page_url"),
+            "ready_state": ready_state,
+            "busy_indicator_count": busy_indicators,
+            "dom_candidate_count": context.get("dom_candidate_count", len(candidates)),
+            "error": context.get("error"),
+        }.items()
+        if value not in (None, "", [], {})
+    }
+
+    detail_blocks = "".join(
+        block
+        for block in [
+            _build_trace_ai_detail("Failure Snapshot", meta),
+            _build_trace_ai_detail("Focused Element", context.get("active_element")),
+            _build_trace_ai_detail("Elements Checked", candidates),
+        ]
+        if block
+    )
+    if not detail_blocks:
+        return ""
+
+    return "".join(
+        [
+            '<section class="trace-ai-block">',
+            '<div class="trace-ai-block-title">Page Context At Failure</div>',
+            '<div class="trace-ai-list">',
+            '<article class="trace-ai-card">',
+            '<div class="trace-ai-top">',
+            '<div class="trace-ai-title">What was on the page when this step failed</div>',
+            f'<div class="trace-ai-meta">{"".join(meta_bits)}</div>',
+            '</div>',
+            detail_blocks,
+            '</article>',
+            '</div>',
+            '</section>',
+        ]
+    )
+
+
+def _action_strategy_stats(action: dict[str, Any]) -> dict[str, Any]:
+    raw_attempts = action.get("fallback_strategies") or []
+    all_attempts = [
+        str(item).strip()
+        for item in raw_attempts
+        if str(item).strip()
+    ]
+    attempts = [item for item in all_attempts if item.lower() != "direct"]
+    raw_unique_attempts = [
+        str(item).strip()
+        for item in (action.get("fallback_strategies_unique") or all_attempts)
+        if str(item).strip()
+    ]
+    unique_attempts = _dedupe_preserving_order(
+        [
+            item
+            for item in raw_unique_attempts
+            if item.lower() != "direct"
+        ]
+    )
+    final_strategy = str(action.get("strategy") or "").strip()
+    if not attempts and final_strategy and final_strategy.lower() != "direct":
+        attempts = [final_strategy]
+    if not unique_attempts:
+        unique_attempts = _dedupe_preserving_order(attempts)
+    try:
+        attempt_count = len(attempts) if all_attempts else max(0, int(action.get("fallback_attempt_count") or 0))
+    except Exception:
+        attempt_count = len(attempts)
+    try:
+        unique_count = len(unique_attempts) if raw_unique_attempts else max(0, int(action.get("fallback_strategy_count") or 0))
+    except Exception:
+        unique_count = len(unique_attempts)
+    if not final_strategy:
+        final_strategy = attempts[-1] if attempts else "direct"
+    return {
+        "final_strategy": final_strategy or "direct",
+        "attempts": attempts,
+        "unique_attempts": unique_attempts,
+        "attempt_count": attempt_count,
+        "unique_count": unique_count,
+    }
+
+
+def _summarize_action_log(action_log: list[dict[str, Any]]) -> dict[str, int]:
+    recovery_actions = 0
+    recovery_attempts = 0
+    ai_interactions = 0
+    experience_interactions = 0
+    completed_actions = 0
+    failed_actions = 0
+    for action in action_log:
+        if str(action.get("status") or "").strip().lower() == "success":
+            completed_actions += 1
+        else:
+            failed_actions += 1
+        stats = _action_strategy_stats(action)
+        if stats["attempt_count"] > 0:
+            recovery_actions += 1
+            recovery_attempts += stats["attempt_count"]
+        ai_interactions += len(_action_ai_interactions(action))
+        experience_interactions += len(_action_experience_interactions(action))
+    return {
+        "action_count": len(action_log),
+        "completed_actions": completed_actions,
+        "failed_actions": failed_actions,
+        "recovery_actions": recovery_actions,
+        "recovery_attempts": recovery_attempts,
+        "ai_interactions": ai_interactions,
+        "experience_interactions": experience_interactions,
+    }
+
+
+def _format_fallback_meta_value(summary: dict[str, int]) -> str:
+    attempts = int(summary.get("recovery_attempts") or summary.get("fallback_attempts") or 0)
+    actions = int(summary.get("recovery_actions") or summary.get("fallback_actions") or 0)
+    if attempts <= 0:
+        return "Not needed"
+    return f"{_pluralize(attempts, 'attempt')} across {_pluralize(actions, 'step')}"
+
+
+def _action_status_details(action: dict[str, Any]) -> tuple[str, str]:
+    status = str(action.get("status") or "failed").strip().lower()
+    if status == "success":
+        return "Completed", "trace-chip-success"
+    return "Failed", "trace-chip-failed"
+
+
+def _map_actions_to_step_artifacts(
+    step_artifacts: list[dict[str, Any]],
+    action_log: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any] | None], list[dict[str, Any]]]:
+    matched_for_actions: list[dict[str, Any] | None] = [None] * len(action_log)
+    extras: list[dict[str, Any]] = []
+    action_index = 0
+    total_actions = len(action_log)
+    skip_untracked_navigation = len(step_artifacts) > len(action_log)
+    for step in step_artifacts:
+        action_name = str(step.get("action") or "").strip().lower()
+        expected_action = ""
+        if action_index < total_actions:
+            expected_action = str((action_log[action_index] or {}).get("action") or "").strip().lower()
+        if skip_untracked_navigation and action_name in {"goto", "reload"} and expected_action not in {"goto", "reload"}:
+            extras.append(step)
+            continue
+        if action_index < total_actions:
+            matched_for_actions[action_index] = step
+            action_index += 1
+        else:
+            extras.append(step)
+    return matched_for_actions, extras
+
+
+def _match_step_artifacts_to_actions(
+    step_artifacts: list[dict[str, Any]],
+    action_log: list[dict[str, Any]],
+) -> list[dict[str, Any] | None]:
+    matched: list[dict[str, Any] | None] = []
+    action_index = 0
+    total_actions = len(action_log)
+    for step in step_artifacts:
+        action_name = str(step.get("action") or "").strip().lower()
+        if action_name in {"goto", "reload"}:
+            matched.append(None)
+            continue
+        if action_index < total_actions:
+            matched.append(action_log[action_index])
+            action_index += 1
+        else:
+            matched.append(None)
+    return matched
+
+
+def _build_action_capture_block(
+    step_artifact: dict[str, Any] | None,
+    action_label: str,
+    status_label: str,
+    status_class: str,
+    *,
+    fallback_screenshot_src: str = "",
+    fallback_title: str = "",
+) -> str:
+    if not step_artifact and not fallback_screenshot_src:
+        return (
+            '<section class="trace-capture-card">'
+            '<div class="trace-capture-header">'
+            f'<span class="trace-chip {status_class}">{escape(status_label)}</span>'
+            '<span class="step-action-chip">No screenshot</span>'
+            '</div>'
+            '<div class="empty-thumb">No screenshot was captured for this action.</div>'
+            '</section>'
+        )
+
+    capture_index = int((step_artifact or {}).get("index") or 0)
+    action_text = str((step_artifact or {}).get("action") or "step")
+    screenshot_key = str((step_artifact or {}).get("screenshot_s3_key") or "")
+    screenshot_image = _to_data_uri(screenshot_key) or fallback_screenshot_src
+    capture_action = _humanize_action(action_text) if step_artifact else "Failure capture"
+    if step_artifact:
+        subtitle = (
+            f"Captured immediately after script step {capture_index}. "
+            f"Final action outcome: {status_label}."
+        )
+    else:
+        subtitle = "Captured at the point of failure for this action."
+
+    if screenshot_image:
+        image_html = _lightbox_button(
+            screenshot_image,
+            fallback_title or f"Step {capture_index} - {action_label}",
+            image_class="step-image",
+            alt_text=fallback_title or f"Step {capture_index} screenshot",
+        )
+    else:
+        image_html = '<div class="empty-thumb">No screenshot was captured for this action.</div>'
+
+    step_index_chip = (
+        f'<span class="step-index">Step {capture_index}</span>'
+        if step_artifact
+        else '<span class="step-index">Failure capture</span>'
+    )
+
+    return "".join(
+        [
+            '<section class="trace-capture-card">',
+            '<div class="trace-capture-header">',
+            step_index_chip,
+            f'<span class="step-action-chip">{escape(capture_action)}</span>',
+            f'<span class="trace-chip {status_class}">{escape(status_label)}</span>',
+            '</div>',
+            f'<div class="trace-capture-subtitle">{escape(subtitle)}</div>',
+            f'<div class="trace-capture-media">{image_html}</div>',
+            '</section>',
+        ]
+    )
+
+
+def _build_action_trace_block(result: dict[str, Any]) -> str:
+    action_log = list(result.get("action_log") or [])
+    if not action_log:
+        return ""
+    step_artifacts = list(result.get("step_artifacts") or [])
+    failure_screenshot_src = _to_data_uri(str(result.get("screenshot_s3_key") or ""))
+    last_failed_index = -1
+    for idx, action in enumerate(action_log, start=1):
+        if str(action.get("status") or "").strip().lower() != "success":
+            last_failed_index = idx
+    matched_artifacts, extra_step_artifacts = _map_actions_to_step_artifacts(step_artifacts, action_log)
+
+    summary = _summarize_action_log(action_log)
+    summary_bits = [
+        f"Recorded {_pluralize(summary['action_count'], 'script action')}: "
+        f"{_pluralize(summary['completed_actions'], 'completed action')} and "
+        f"{_pluralize(summary['failed_actions'], 'failed action')}."
+    ]
+    if summary["recovery_attempts"] > 0:
+        summary_bits.append(
+            f"{_pluralize(summary['recovery_actions'], 'action')} needed recovery, with "
+            f"{_pluralize(summary['recovery_attempts'], 'recovery attempt')} in total."
+        )
+    else:
+        summary_bits.append("All actions used the recorded targets without recovery.")
+    if summary["experience_interactions"] > 0:
+        summary_bits.append(
+            f"{_pluralize(summary['experience_interactions'], 'learned recovery lookup')} recorded."
+        )
+    if summary["ai_interactions"] > 0:
+        summary_bits.append(
+            f"{_pluralize(summary['ai_interactions'], 'AI-assisted repair call')} recorded."
+        )
+    else:
+        summary_bits.append("No AI-assisted repair calls were needed.")
+    summary_text = " ".join(summary_bits)
+
+    cards: list[str] = []
+    for index, action in enumerate(action_log, start=1):
+        stats = _action_strategy_stats(action)
+        status = str(action.get("status") or "failed").strip().lower()
+        status_label, status_class = _action_status_details(action)
+        label = str(action.get("label") or "").strip()
+        action_label = _humanize_action(str(action.get("action") or "step"))
+        final_strategy = stats["final_strategy"]
+        duration_label = _format_action_duration(action.get("duration_ms") or 0)
+        try:
+            step = int(action.get("step") or 0)
+        except Exception:
+            step = 0
+
+        used_recovery = stats["attempt_count"] > 0
+        if stats["attempt_count"] > 0:
+            if status == "success":
+                fallback_summary = (
+                    f"The recorded target needed recovery. The runner made "
+                    f"{_pluralize(stats['attempt_count'], 'recovery attempt')} across "
+                    f"{_pluralize(stats['unique_count'], 'strategy', 'strategies')} before this action completed."
+                )
+            else:
+                fallback_summary = (
+                    f"The runner could not complete this step after "
+                    f"{_pluralize(stats['attempt_count'], 'recovery attempt')} across "
+                    f"{_pluralize(stats['unique_count'], 'strategy', 'strategies')}."
+                )
+            strategy_chips = "".join(
+                f'<span class="strategy-chip" title="{escape(strategy)}">{escape(_humanize_strategy(strategy))}</span>'
+                for strategy in stats["unique_attempts"]
+            )
+        elif status == "success":
+            fallback_summary = "The recorded target worked on the first attempt."
+            strategy_chips = '<span class="strategy-chip strategy-chip-direct">Recorded target</span>'
+        else:
+            fallback_summary = "The recorded target failed before any recovery could run."
+            strategy_chips = '<span class="strategy-chip strategy-chip-direct">Recorded target</span>'
+
+        kicker_bits = [f"Action {index}"]
+        if step > 0:
+            kicker_bits.append(f"Step {step}")
+
+        label_block = (
+            ''.join(
+                [
+                    '<div class="trace-target">',
+                    '<span class="trace-target-label">Target</span>',
+                    f'<span class="trace-target-value">{escape(label)}</span>',
+                    '</div>',
+                ]
+            )
+            if label
+            else ""
+        )
+        error_text = str(action.get("error") or "").strip()
+        error_block = (
+            ''.join(
+                [
+                    '<section class="trace-detail-card trace-detail-card-error">',
+                    '<div class="trace-section-title">Why This Step Failed</div>',
+                    f'<div class="trace-error">{escape(error_text)}</div>',
+                    '</section>',
+                ]
+            )
+            if error_text and status != "success"
+            else ""
+        )
+        recovery_block = _build_action_recovery_block(action, stats)
+        failure_context_block = _build_failure_context_block(action)
+        ai_block = _build_action_ai_block(action)
+        use_failure_capture = index == last_failed_index and bool(failure_screenshot_src)
+        capture_block = _build_action_capture_block(
+            matched_artifacts[index - 1] if index - 1 < len(matched_artifacts) else None,
+            action_label,
+            status_label,
+            status_class,
+            fallback_screenshot_src=failure_screenshot_src if use_failure_capture else "",
+            fallback_title=f"{action_label} failure screenshot" if use_failure_capture else "",
+        )
+
+        cards.append(
+            "".join(
+                [
+                    '<article class="trace-card">',
+                    '<div class="trace-top">',
+                    f'<div class="trace-kicker">{escape(" · ".join(kicker_bits))}</div>',
+                    '<div class="trace-meta">',
+                    f'<span class="trace-chip {status_class}">{escape(status_label)}</span>',
+                    f'<span class="trace-chip">Duration: {escape(duration_label)}</span>',
+                    f'<span class="trace-chip">Resolution: {escape(_display_action_strategy(final_strategy))}</span>',
+                    '</div>',
+                    '</div>',
+                    f'<div class="trace-title">{escape(action_label)}</div>',
+                    label_block,
+                    '<div class="trace-layout">',
+                    capture_block,
+                    '<div class="trace-content">',
+                    f'<div class="trace-summary">{escape(fallback_summary)}</div>',
+                    f'<div class="trace-strategies">{strategy_chips}</div>' if strategy_chips else "",
+                    recovery_block,
+                    error_block,
+                    failure_context_block,
+                    ai_block,
+                    '</div>',
+                    '</div>',
+                    '</article>',
+                ]
+            )
+        )
+
+    extra_captures_block = ""
+    if extra_step_artifacts:
+        extra_captures_block = "".join(
+            [
+                '<section class="section-block">',
+                '<h4 class="block-title">Additional Captures</h4>',
+                '<p class="main-section-subtitle">These screenshots were captured outside the tracked action timeline, such as legacy navigation steps.</p>',
+                _build_step_gallery(extra_step_artifacts, []),
+                '</section>',
+            ]
+        )
+
+    return "".join(
+        [
+            '<section class="section-block">',
+            '<h3 class="block-title">Action Timeline</h3>',
+            '<p class="main-section-subtitle">Each recorded script action is shown as one debug card with its screenshot, outcome, recovery path, and failure context together.</p>',
+            f'<p class="main-section-subtitle">{escape(summary_text)}</p>',
+            '<div class="trace-list">',
+            "".join(cards),
+            '</div>',
+            extra_captures_block,
+            '</section>',
+        ]
+    )
+
+
 def _build_step_preview(step_artifacts: list[dict[str, Any]]) -> str:
     if not step_artifacts:
         return '<div class="empty-state">No captured steps for this recording.</div>'
@@ -157,14 +982,23 @@ def _build_step_preview(step_artifacts: list[dict[str, Any]]) -> str:
     return '<ol class="step-lines">' + ''.join(items) + '</ol>'
 
 
-def _build_step_gallery(step_artifacts: list[dict[str, Any]]) -> str:
+def _build_step_gallery(step_artifacts: list[dict[str, Any]], action_log: list[dict[str, Any]] | None = None) -> str:
     cards: list[str] = []
-    for step in step_artifacts:
+    matched_actions = _match_step_artifacts_to_actions(step_artifacts, action_log or [])
+    for step, matched_action in zip(step_artifacts, matched_actions):
         index = int(step.get("index") or 0)
         action_text = str(step.get("action") or "step")
         action_label = _humanize_action(action_text)
         screenshot_key = str(step.get("screenshot_s3_key") or "")
         screenshot_image = _to_data_uri(screenshot_key)
+        status_chip = ""
+        subtitle = f"Captured immediately after the {escape(action_text.replace('_', ' '))} action."
+        if matched_action:
+            status_label, status_class = _action_status_details(matched_action)
+            status_chip = f'<span class="trace-chip {status_class}">{escape(status_label)}</span>'
+            subtitle += f" Final action outcome: {status_label}."
+        else:
+            status_chip = '<span class="trace-chip">Captured</span>'
         if screenshot_image:
             image_html = _lightbox_button(
                 screenshot_image,
@@ -181,10 +1015,11 @@ def _build_step_gallery(step_artifacts: list[dict[str, Any]]) -> str:
                     '<div class="step-card-meta">',
                     f'<span class="step-index">Step {index}</span>',
                     f'<span class="step-action-chip">{escape(action_text.replace("_", " ").title())}</span>',
+                    status_chip,
                     '</div>',
                     '<div class="step-card-copy">',
                     f'<div class="step-card-title">{escape(action_label)}</div>',
-                    f'<div class="step-card-subtitle">Captured after the {escape(action_text.replace("_", " "))} action</div>',
+                    f'<div class="step-card-subtitle">{subtitle}</div>',
                     '</div>',
                     f'<div class="step-media">{image_html}</div>',
                     '</article>',
@@ -321,11 +1156,14 @@ def _build_result_detail_page(result: dict[str, Any]) -> str:
     screenshot_key = str(result.get("screenshot_s3_key") or "")
     screenshot_src = _to_data_uri(screenshot_key)
     step_artifacts = list(result.get("step_artifacts") or [])
+    action_log = list(result.get("action_log") or [])
+    action_summary = _summarize_action_log(action_log)
     ai_summary_block = _build_ai_failure_summary_block(result)
+    action_trace_block = _build_action_trace_block(result)
     video_block = _build_video_block(result)
 
     failure_block = ''
-    if screenshot_src:
+    if screenshot_src and not action_log:
         failure_block = ''.join([
             '<section class="section-block">',
             '<h3 class="block-title">Failure Screenshot</h3>',
@@ -378,13 +1216,11 @@ def _build_result_detail_page(result: dict[str, Any]) -> str:
         f'<div class="meta-card"><span class="label">Duration</span><span class="value">{duration}</span></div>',
         f'<div class="meta-card"><span class="label">Exit Code</span><span class="value">{escape(str(exit_code))}</span></div>',
         f'<div class="meta-card"><span class="label">Page Title</span><span class="value">{escape(str(page_title))}</span></div>',
+        f'<div class="meta-card"><span class="label">Recovery</span><span class="value">{escape(_format_fallback_meta_value(action_summary))}</span></div>',
         '</div>',
         error_block,
         ai_summary_block,
-        '<section class="section-block">',
-        '<h3 class="block-title">Execution Steps</h3>',
-        _build_step_gallery(step_artifacts),
-        '</section>',
+        action_trace_block,
         failure_block,
         video_block,
         logs_block,
@@ -397,6 +1233,8 @@ def _build_result_detail_page(result: dict[str, Any]) -> str:
 def _build_recording_accordion(result: dict[str, Any]) -> str:
     recording_name = _display_recording_name(result)
     step_artifacts = list(result.get("step_artifacts") or [])
+    action_log = list(result.get("action_log") or [])
+    action_summary = _summarize_action_log(action_log)
     status = str(result.get("status") or "failed")
     duration = _format_duration_minutes(result.get("duration_seconds") or 0)
     page_title = str(result.get("page_title") or "Not captured")
@@ -407,6 +1245,12 @@ def _build_recording_accordion(result: dict[str, Any]) -> str:
     screenshot_key = str(result.get("screenshot_s3_key") or "")
     screenshot_src = _to_data_uri(screenshot_key)
     ai_summary_block = _build_ai_failure_summary_block(result)
+    action_trace_block = _build_action_trace_block(result)
+
+    summary_bits = [f"{len(step_artifacts)} captured steps"]
+    if action_summary["recovery_attempts"] > 0:
+        summary_bits.append(_pluralize(action_summary["recovery_attempts"], "recovery attempt"))
+    recording_summary_subtitle = " · ".join(summary_bits)
 
     error_block = ""
     if error:
@@ -418,7 +1262,7 @@ def _build_recording_accordion(result: dict[str, Any]) -> str:
         ])
 
     failure_block = ""
-    if screenshot_src:
+    if screenshot_src and not action_log:
         failure_block = ''.join([
             '<section class="section-block">',
             '<h3 class="block-title">Failure Screenshot</h3>',
@@ -449,7 +1293,7 @@ def _build_recording_accordion(result: dict[str, Any]) -> str:
         '<summary class="recording-summary">',
         '<div class="recording-summary-main">',
         f'<div class="recording-summary-title">{escape(recording_name)}</div>',
-        f'<div class="recording-summary-subtitle">{len(step_artifacts)} captured steps</div>',
+        f'<div class="recording-summary-subtitle">{escape(recording_summary_subtitle)}</div>',
         '</div>',
         '<div class="recording-summary-side">',
         f'<span class="recording-duration">{duration}</span>',
@@ -463,14 +1307,11 @@ def _build_recording_accordion(result: dict[str, Any]) -> str:
         f'<div class="meta-card"><span class="label">Duration</span><span class="value">{duration}</span></div>',
         f'<div class="meta-card"><span class="label">Exit Code</span><span class="value">{exit_code}</span></div>',
         f'<div class="meta-card"><span class="label">Page Title</span><span class="value">{escape(page_title)}</span></div>',
+        f'<div class="meta-card"><span class="label">Recovery</span><span class="value">{escape(_format_fallback_meta_value(action_summary))}</span></div>',
         '</div>',
         error_block,
         ai_summary_block,
-        '<section class="section-block">',
-        '<h3 class="block-title">Captured Steps</h3>',
-        '<p class="main-section-subtitle">Each card below represents a captured browser step. Open any screenshot to inspect it at full size.</p>',
-        _build_step_gallery(step_artifacts),
-        '</section>',
+        action_trace_block,
         failure_block,
         logs_block,
         '</div>',
@@ -489,7 +1330,7 @@ def generate_html_report_content(
     duration = _format_duration_minutes(
         round(sum(float(item.get("duration_seconds") or 0) for item in results), 3)
     )
-    generated_at = datetime.utcnow().strftime("%d %b %Y, %H:%M UTC")
+    generated_at = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
 
     suite_entries = ''.join(_build_recording_accordion(result) for result in results)
     failed_results = [result for result in results if result.get("status") != "passed"]
@@ -724,7 +1565,7 @@ a, button { font: inherit; }
 .result-subtitle { margin-top: 8px; color: var(--muted); font-size: 14px; }
 .status-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 112px; padding: 10px 16px; border-radius: 999px; border: 1px solid transparent; font-size: 13px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45); }
 .result-body { padding: 20px; display: grid; gap: 18px; }
-.meta-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
 .meta-card { padding: 14px; background: rgba(255,255,255,0.82); }
 .callout { border-radius: 18px; padding: 18px; }
 .callout.error { background: rgba(180, 35, 24, 0.06); border: 1px solid rgba(180, 35, 24, 0.14); border-radius: 18px; padding: 18px; }
@@ -756,6 +1597,47 @@ a, button { font: inherit; }
 .step-card-subtitle { color: var(--muted); font-size: 11px; line-height: 1.4; }
 .step-action-chip { display: inline-flex; align-items: center; justify-content: center; padding: 5px 9px; border-radius: 999px; background: rgba(15, 23, 42, 0.05); color: #334155; font-size: 11px; font-weight: 700; }
 .step-media { background: linear-gradient(180deg, #f8fbff, #eef4ff); border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 16px; padding: 8px; }
+.trace-list { display: grid; gap: 12px; }
+.trace-card { background: linear-gradient(180deg, rgba(255,255,255,0.99), rgba(248,250,252,0.97)); border: 1px solid var(--border); border-radius: 18px; padding: 14px; display: grid; gap: 10px; }
+.trace-layout { display: grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }
+.trace-content { display: grid; gap: 10px; min-width: 0; }
+.trace-capture-card { display: grid; gap: 10px; padding: 12px; border-radius: 16px; background: linear-gradient(180deg, #f8fbff, #eef4ff); border: 1px solid rgba(148, 163, 184, 0.18); align-content: start; }
+.trace-capture-header { display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; }
+.trace-capture-subtitle { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.trace-capture-media { background: rgba(255,255,255,0.84); border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 16px; padding: 8px; }
+.trace-top { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+.trace-kicker { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+.trace-title { font-size: 14px; font-weight: 800; line-height: 1.35; }
+.trace-summary { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.trace-target { display: grid; gap: 4px; }
+.trace-target-label, .trace-section-title { color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.trace-target-value { color: var(--text); font-size: 13px; font-weight: 700; line-height: 1.45; }
+.trace-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.trace-chip { display: inline-flex; align-items: center; justify-content: center; padding: 5px 9px; border-radius: 999px; background: rgba(15, 23, 42, 0.05); color: #334155; font-size: 11px; font-weight: 700; }
+.trace-chip-success { background: rgba(21, 115, 71, 0.10); color: var(--success); }
+.trace-chip-failed { background: rgba(180, 35, 24, 0.10); color: var(--danger); }
+.trace-strategies { display: flex; gap: 8px; flex-wrap: wrap; }
+.strategy-chip { display: inline-flex; align-items: center; justify-content: center; padding: 6px 10px; border-radius: 999px; background: rgba(59, 130, 246, 0.08); color: #1d4ed8; font-size: 11px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.strategy-chip-direct { background: rgba(148, 163, 184, 0.12); color: #475569; }
+.trace-detail-card { background: rgba(15, 23, 42, 0.03); border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; padding: 12px; display: grid; gap: 10px; }
+.trace-detail-card-error { background: rgba(180, 35, 24, 0.04); border-color: rgba(180, 35, 24, 0.14); }
+.trace-detail-copy { color: var(--text); font-size: 13px; line-height: 1.55; }
+.trace-debug-details { border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 12px; background: rgba(255,255,255,0.86); overflow: hidden; }
+.trace-debug-details summary { cursor: pointer; list-style: none; padding: 10px 12px; font-size: 12px; font-weight: 700; color: #334155; }
+.trace-debug-details summary::-webkit-details-marker { display: none; }
+.trace-debug-details[open] summary { border-bottom: 1px solid rgba(148, 163, 184, 0.18); }
+.trace-ai-block { display: grid; gap: 10px; padding-top: 4px; border-top: 1px dashed rgba(148, 163, 184, 0.24); }
+.trace-ai-block-title { color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.trace-ai-list { display: grid; gap: 10px; }
+.trace-ai-card { background: rgba(59, 130, 246, 0.04); border: 1px solid rgba(59, 130, 246, 0.14); border-radius: 14px; padding: 12px; display: grid; gap: 10px; }
+.trace-ai-top { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
+.trace-ai-title { font-size: 12px; font-weight: 800; line-height: 1.35; }
+.trace-ai-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.trace-ai-detail { border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 12px; background: rgba(255, 255, 255, 0.9); overflow: hidden; }
+.trace-ai-detail summary { cursor: pointer; list-style: none; padding: 10px 12px; font-size: 12px; font-weight: 700; color: #334155; }
+.trace-ai-detail summary::-webkit-details-marker { display: none; }
+.trace-ai-detail[open] summary { border-bottom: 1px solid rgba(148, 163, 184, 0.18); }
+.trace-error { color: var(--danger); font-size: 12px; line-height: 1.45; }
 .empty-state, .empty-thumb { min-height: 120px; display: grid; place-items: center; border-radius: 16px; border: 1px dashed rgba(148, 163, 184, 0.28); background: rgba(59, 130, 246, 0.04); color: var(--muted); text-align: center; padding: 12px; }
 .log-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .log-card { background: #fff; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
@@ -774,6 +1656,7 @@ pre { margin: 0; padding: 14px; white-space: pre-wrap; word-break: break-word; f
   .content, .run-meta, .meta-grid, .log-grid { grid-template-columns: 1fr; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .sidebar, .main { min-height: auto; }
+  .trace-layout { grid-template-columns: 1fr; }
 }
 @media (max-width: 640px) {
   .shell { padding: 12px; }
