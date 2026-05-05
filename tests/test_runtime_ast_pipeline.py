@@ -138,6 +138,24 @@ def test_prepare_script_via_ast_fails_fast_for_raw_select_option_gap() -> None:
     assert 'Action "select_option" still relies on a raw Playwright call.' in message
 
 
+def test_prepare_script_via_ast_supports_checkbox_check_actions() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("checkbox", name="Create a job application on").check()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('check', 'Create a job application on', _ptr_check_target, "
+        "page.get_by_role('checkbox', name='Create a job application on'), page, 'Create a job application on')"
+    ) in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
 def test_generate_full_script_supports_named_secondary_pages() -> None:
     script = """
 def run(playwright):
@@ -174,3 +192,40 @@ def test_prepare_script_via_ast_keeps_home_navigation_and_followup_click_separat
         "_ptr_click_text_target, page.get_by_text('My Client Groups'), page, 'My Client Groups')"
     ) in prepared
     assert "_ptr_tracked_action('adf_menu_select', 'Home'" not in prepared
+
+
+def test_prepare_script_via_ast_supports_role_row_clicks() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("row", name="Academic").click()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('click_row', 'Academic', "
+        "_ptr_click_table_row, page.get_by_role('row', name='Academic'), page, 'Academic')"
+    ) in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
+def test_prepare_script_via_ast_preserves_exact_day_match_for_date_pick() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_title("Select Date.").click()
+    page.get_by_role("button", name="3", exact=True).click()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('date_pick', 'Select Date.', _ptr_pick_date_via_icon, "
+        "page.get_by_title('Select Date.'), page.get_by_role('button', name='3', exact=True), "
+        "page, 'Select Date.', '3')"
+    ) in prepared

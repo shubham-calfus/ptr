@@ -86,3 +86,23 @@ def run(playwright):
     ]
     assert optimized[2].name == "Actions"
     assert optimized[2].value == "Delete"
+
+
+def test_optimize_preserves_exact_day_match_for_date_pick() -> None:
+    script = """
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_title("Select Date.").click()
+    page.get_by_role("button", name="3", exact=True).click()
+    browser.close()
+"""
+
+    optimized = optimize(parse_script(script))
+
+    date_pick = next(action for action in optimized if action.type == "date_pick")
+
+    assert date_pick.action_kwargs["day_label"] == "3"
+    assert date_pick.action_kwargs["day_role"] == "button"
+    assert date_pick.action_kwargs["day_exact"] is True

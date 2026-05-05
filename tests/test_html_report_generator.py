@@ -6,6 +6,75 @@ from src.utils.html_report_generator import (
 )
 
 
+def _action(
+    *,
+    step: int,
+    action: str,
+    label: str,
+    status: str = "success",
+    strategy: str = "direct",
+    duration_ms: int = 1_000,
+    fallback_strategies: list[str] | None = None,
+    fallback_attempt_count: int | None = None,
+    script_value: str | None = None,
+    **extra,
+) -> dict:
+    strategies = list(fallback_strategies or [strategy])
+    payload = {
+        "step": step,
+        "action": action,
+        "label": label,
+        "status": status,
+        "strategy": strategy,
+        "duration_ms": duration_ms,
+        "fallback_attempt_count": fallback_attempt_count or len(strategies),
+        "fallback_strategy_count": len(strategies),
+        "fallback_strategies": strategies,
+        "fallback_strategies_unique": list(dict.fromkeys(strategies)),
+        "ai_interactions": [],
+        "experience_interactions": [],
+        "script_data": {"parsed_action": {}},
+    }
+    if script_value is not None:
+        payload["script_data"]["parsed_action"]["value"] = script_value
+    payload.update(extra)
+    return payload
+
+
+def _result(
+    *,
+    recording_id: str = "rec-1",
+    recording_name: str = "HCM_Demo",
+    status: str = "passed",
+    duration_seconds: float = 125,
+    action_log: list[dict] | None = None,
+    step_artifacts: list[dict] | None = None,
+    resolved_parameter_keys: list[str] | None = None,
+    **extra,
+) -> dict:
+    payload = {
+        "recording_id": recording_id,
+        "recording_name": recording_name,
+        "file_key": f"recordings/{recording_name}/{recording_name}.py",
+        "status": status,
+        "duration_seconds": duration_seconds,
+        "exit_code": 0 if status == "passed" else 1,
+        "page_title": "Demo Page",
+        "page_url": "https://example.test/demo",
+        "stdout": "",
+        "stderr": "",
+        "error": "" if status == "passed" else "Execution failed",
+        "step_artifacts": step_artifacts or [],
+        "screenshot_s3_key": "",
+        "video_s3_key": "",
+        "video_s3_keys": [],
+        "resolved_parameter_keys": resolved_parameter_keys or [],
+        "action_log": action_log or [],
+    }
+    payload.update(extra)
+    return payload
+
+
 def test_format_duration_minutes_uses_minute_units() -> None:
     assert _format_duration_minutes(30) == "0.5 mins"
     assert _format_duration_minutes(60) == "1 min"
@@ -20,629 +89,367 @@ def test_format_action_duration_uses_clock_style() -> None:
     assert _format_action_duration(65_000) == "1:05"
 
 
-def test_generate_html_report_content_renders_minutes_in_summary_and_result_cards() -> None:
+def test_generate_html_report_content_uses_final_aetherion_layout() -> None:
     html = generate_html_report_content(
-        test_suite_id="suite-1",
+        test_suite_id="HCM_Final_Suite",
         parent_run_id="run-1",
         results=[
-            {
-                "recording_id": "rec-1",
-                "recording_name": "recordings/demo.py",
-                "file_key": "recordings/demo.py",
-                "status": "passed",
-                "duration_seconds": 125,
-                "exit_code": 0,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "",
-                "step_artifacts": [],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-            }
+            _result(
+                recording_name="HCM_Promote_and_change_position",
+                status="failed",
+                duration_seconds=257.2,
+                page_url="https://example.test/should-not-show",
+                action_log=[
+                    _action(
+                        step=1,
+                        action="click_button",
+                        label="Continue",
+                        status="failed",
+                        strategy="direct",
+                        duration_ms=900,
+                        error="Continue did not advance.",
+                    )
+                ],
+            )
         ],
     )
 
-    assert "Total Duration" in html
-    assert "2.1 mins" in html
-    assert "125s" not in html
+    assert 'alt="Aetherion"' in html
+    assert "Suite Runs" in html
+    assert "Execution Trace" in html
+    assert "Request Sent to AI" not in html
+    assert "Action Timeline" not in html
+    assert "AI Repair Attempts" not in html
+    assert "Playwright Report" not in html
+    assert "Recovery Details" not in html
+    assert "Context Sent To The Model" not in html
+    assert "Model Response" not in html
+    assert "Parsed Repair Plan" not in html
+    assert "Additional Captures" not in html
+    assert "https://example.test/should-not-show" not in html
 
 
-def test_generate_html_report_content_prefers_recording_name_over_file_key() -> None:
+def test_generate_html_report_content_is_suite_aware_and_keeps_parameters_per_recording() -> None:
     html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
+        test_suite_id="HCM_Suite",
+        parent_run_id="run-2",
         results=[
-            {
-                "recording_id": "rec-1-row-2",
-                "recording_name": "fake_2 [row 2]",
-                "file_key": "recordings/8279897e-21b5-4781-ab82-fd4bd0095355/fake_2.py",
-                "status": "passed",
-                "duration_seconds": 30,
-                "exit_code": 0,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "",
-                "step_artifacts": [],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-            }
+            _result(
+                recording_id="create",
+                recording_name="HCM_Create_Requisition",
+                status="passed",
+                duration_seconds=88,
+                resolved_parameter_keys=["url", "username", "password", "business_unit"],
+                action_log=[
+                    _action(step=1, action="goto", label="Oracle", duration_ms=13005),
+                    _action(step=2, action="click_link", label="Hiring", duration_ms=9500),
+                ],
+            ),
+            _result(
+                recording_id="approve",
+                recording_name="HCM_Approve_Job_Requisition",
+                status="passed",
+                duration_seconds=144.9,
+                resolved_parameter_keys=["url", "username", "password", "search_value"],
+                action_log=[
+                    _action(step=1, action="goto", label="Oracle", duration_ms=12500),
+                    _action(step=2, action="click_button", label="Approve", duration_ms=10200),
+                ],
+            ),
         ],
     )
 
-    assert "fake 2 [row 2]" in html
+    assert "Run ID: run-2 · 2 recordings · 4 logged actions" in html
+    assert "HCM_Create_Requisition" in html
+    assert "HCM_Approve_Job_Requisition" in html
+    assert "Resolved parameter keys used for this recording run." in html
+    assert html.count("Resolved parameter keys used for this recording run.") == 2
+    assert "business_unit" in html
+    assert "search_value" in html
+    assert '<div class="rail-title">Parameters</div>' not in html
 
 
-def test_generate_html_report_content_renders_fallback_attempt_summary_and_trace() -> None:
+def test_generate_html_report_content_renders_flow_context_inputs_outputs_and_ai_extractors() -> None:
     html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
+        test_suite_id="HCM_First_3",
+        parent_run_id="run-flow-context",
         results=[
-            {
-                "recording_id": "rec-1",
-                "recording_name": "recordings/demo.py",
-                "file_key": "recordings/demo.py",
-                "status": "failed",
-                "duration_seconds": 42,
-                "exit_code": 1,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "boom",
-                "error": "Execution failed",
-                "step_artifacts": [],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-                "action_log": [
+            _result(
+                recording_name="HCM_Create_Requisition",
+                status="passed",
+                duration_seconds=88,
+                resolved_parameter_keys=["url", "username", "password"],
+                flow_input_status={
+                    "search_value": {
+                        "name": "search_value",
+                        "label": "Search Value",
+                        "required": True,
+                        "status": "available",
+                        "value": "1003",
+                        "error": "",
+                    }
+                },
+                flow_output_results=[
                     {
-                        "step": 3,
-                        "action": "click_textbox",
-                        "label": "Notes",
-                        "status": "failed",
-                        "strategy": "oj_label_hint",
-                        "duration_ms": 321,
-                        "fallback_attempt_count": 3,
-                        "fallback_strategy_count": 3,
-                        "fallback_strategies": [
-                            "label_exact",
-                            "placeholder",
-                            "oj_label_hint",
+                        "name": "requisition_id",
+                        "label": "Requisition Number",
+                        "required": True,
+                        "status": "extracted",
+                        "value": "1003",
+                        "source": "ai",
+                        "attempts": [
+                            {"source": "oracle_table", "status": "miss", "detail": "No captured oracle tables"},
+                            {"source": "ai", "status": "matched", "detail": "Found requisition number in confirmation text"},
                         ],
-                        "fallback_strategies_unique": [
-                            "label_exact",
-                            "placeholder",
-                            "oj_label_hint",
-                        ],
-                        "error": 'Unable to click text entry "Notes".',
-                        "failure_context": {
-                            "helper": "click_textbox",
-                            "label": "Notes",
-                            "page_title": "Demo Page",
-                            "page_url": "https://example.test/form",
-                            "ready_state": "complete",
-                            "busy_indicator_count": 0,
-                            "dom_candidate_count": 1,
-                            "active_element": {
-                                "tag": "input",
-                                "role": "textbox",
-                                "label_hint": "Notes",
-                                "html": '<input aria-label="Notes" />',
+                        "ai_interaction": {
+                            "status": "success",
+                            "feature": "flow_context_extraction",
+                            "model": "gpt-4.1-mini",
+                            "system_prompt": "Extract one field",
+                            "user_prompt": "Find the requisition number",
+                            "response_text": '{"value":"1003","reason":"Found in confirmation text"}',
+                            "parsed_response": {
+                                "value": "1003",
+                                "reason": "Found in confirmation text",
                             },
-                            "dom_context": {
-                                "helper": "click_textbox",
-                                "label": "Notes",
-                                "candidates": [
-                                    {
-                                        "tag": "oj-c-text-area",
-                                        "role": "",
-                                        "label_hint": "Notes",
-                                        "text": "Required",
-                                        "html": '<oj-c-text-area label-hint="Notes">Required</oj-c-text-area>',
-                                    }
-                                ],
-                            },
+                            "usage": {"input_tokens": 120, "output_tokens": 32, "total_tokens": 152},
                         },
-                    },
-                    {
-                        "step": 4,
-                        "action": "navigation_button",
-                        "label": "Continue",
-                        "status": "success",
-                        "strategy": "direct",
-                        "duration_ms": 98,
-                        "fallback_attempt_count": 0,
-                        "fallback_strategy_count": 0,
-                        "fallback_strategies": [],
-                        "fallback_strategies_unique": [],
-                    },
-                ],
-            }
-        ],
-    )
-
-    assert "Action Timeline" in html
-    assert "3 attempts across 1 step" in html
-    assert "Each recorded script action is shown as one debug card with its screenshot, outcome, recovery path, and failure context together." in html
-    assert "Recorded 2 script actions: 1 completed action and 1 failed action. 1 action needed recovery, with 3 recovery attempts in total. No AI-assisted repair calls were needed." in html
-    assert "The runner could not complete this step after 3 recovery attempts across 3 strategies." in html
-    assert "The recorded target worked on the first attempt." in html
-    assert "Resolution: Recorded target" in html
-    assert "Completed" in html
-    assert "&lt;0:01" in html
-    assert "Exact label match" in html
-    assert "Placeholder match" in html
-    assert "Oracle Label Hint" in html
-    assert "Recovery Details" in html
-    assert "Why This Step Failed" in html
-    assert "Page Context At Failure" in html
-    assert "Elements Checked" in html
-    assert "Required" in html
-    assert "No screenshot was captured for this action." in html
-
-
-def test_generate_html_report_content_renders_step_level_ai_trace_details() -> None:
-    html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
-        results=[
-            {
-                "recording_id": "rec-ai",
-                "recording_name": "recordings/demo_ai.py",
-                "file_key": "recordings/demo_ai.py",
-                "status": "failed",
-                "duration_seconds": 25,
-                "exit_code": 1,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "boom",
-                "error": "Execution failed",
-                "step_artifacts": [],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-                "action_log": [
-                    {
-                        "step": 7,
-                        "action": "click_textbox",
-                        "label": "Notes",
-                        "status": "failed",
-                        "strategy": "ai_css_1",
-                        "duration_ms": 902,
-                        "fallback_attempt_count": 5,
-                        "fallback_strategy_count": 5,
-                        "fallback_strategies": [
-                            "label_exact",
-                            "placeholder",
-                            "oj_label_hint",
-                            "ai_self_repair_lookup",
-                            "ai_css_1",
-                        ],
-                        "fallback_strategies_unique": [
-                            "label_exact",
-                            "placeholder",
-                            "oj_label_hint",
-                            "ai_self_repair_lookup",
-                            "ai_css_1",
-                        ],
-                        "error": 'Unable to click text entry "Notes".',
-                        "ai_interactions": [
-                            {
-                                "feature": "self_repair",
-                                "helper": "click_textbox",
-                                "label": "Notes",
-                                "status": "success",
-                                "model": "gpt-4.1-mini",
-                                "endpoint": "https://api.openai.com/v1/responses",
-                                "system_prompt": "You are a senior Playwright locator repair assistant.",
-                                "user_prompt": "Find the Notes field from these DOM candidates.",
-                                "response_text": '{"strategies":[{"kind":"css","selector":"oj-c-text-area[label-hint=\\"Notes\\"] textarea"}]}',
-                                "parsed_response": {
-                                    "strategies": [
-                                        {
-                                            "kind": "css",
-                                            "selector": 'oj-c-text-area[label-hint="Notes"] textarea',
-                                        }
-                                    ]
-                                },
-                                "response_strategy_count": 1,
-                                "response_strategies": [
-                                    {
-                                        "kind": "css",
-                                        "selector": 'oj-c-text-area[label-hint="Notes"] textarea',
-                                    }
-                                ],
-                                "locator_candidate_count": 1,
-                                "locator_strategies": ["ai_css_1"],
-                                "dom_candidate_count": 4,
-                                "max_output_tokens": 400,
-                                "http_status": 200,
-                            },
-                            {
-                                "feature": "self_repair",
-                                "helper": "click_textbox",
-                                "label": "Notes",
-                                "status": "request_error",
-                                "model": "gpt-4.1-mini",
-                                "endpoint": "https://api.openai.com/v1/responses",
-                                "system_prompt": "You are a senior Playwright locator repair assistant.",
-                                "user_prompt": "Find the Notes field from these DOM candidates.",
-                                "error": "HTTP Error 429: Too Many Requests",
-                                "error_type": "HTTPError",
-                                "error_response_body": '{"error":{"message":"rate limited"}}',
-                                "dom_candidate_count": 4,
-                                "max_output_tokens": 400,
-                                "http_status": 429,
-                            },
-                        ],
                     }
                 ],
-            }
+                action_log=[
+                    _action(step=1, action="goto", label="Oracle", duration_ms=13005),
+                ],
+            )
         ],
     )
 
-    assert "AI Repair Attempts" in html
-    assert "1 AI self-repair call recorded." not in html
-    assert "2 AI-assisted repair calls recorded." in html
-    assert "Repair Attempt 1" in html
-    assert "Repair Attempt 2" in html
-    assert "System Instructions" in html
-    assert "Context Sent To The Model" in html
-    assert "Model Response" in html
-    assert "Parsed Repair Plan" in html
-    assert "Raw API Error" in html
-    assert "Find the Notes field from these DOM candidates." in html
-    assert "Too Many Requests" in html
+    assert "Flow Context" in html
+    assert "Workbook-defined parent inputs and extracted outputs for this recording run." in html
+    assert "Inputs" in html
+    assert "Extracted Outputs" in html
+    assert "Search Value" in html
+    assert "Requisition Number" in html
+    assert "Found requisition number in confirmation text" in html
+    assert "Request Sent to AI" in html
+    assert "Model Output" in html
 
 
-def test_generate_html_report_content_ai_lookup_success_is_not_shown_as_action_success() -> None:
+def test_generate_html_report_content_renders_combined_ai_request_and_model_output() -> None:
+    interaction = {
+        "feature": "self_repair",
+        "helper": "click_text_target",
+        "label": "Notifications",
+        "status": "success",
+        "repair_outcome": "validated",
+        "model": "gpt-4.1-mini",
+        "endpoint": "https://api.openai.com/v1/responses",
+        "system_prompt": "You are a senior Playwright locator repair assistant. Return concise JSON only.",
+        "user_prompt": (
+            "Find the Notifications control.\n"
+            "Recorded script data JSON:\n"
+            '{"tracked_action":"click_text","helper_name":"_ptr_click_text_target"}\n'
+            "Recorded target context JSON:\n"
+            '{"text":"Notifications (7 unread)","tag":"title"}\n'
+            "DOM candidates JSON:\n"
+            '{"helper":"click_text_target","label":"Notifications","candidates":[{"tag":"a","id":"pt1:_UISatr:0:cil1","title":"Notifications (7 unread)","text":"Notifications (7 unread)"},{"tag":"a","id":"d1::skip","text":"Skip to main content"}]}'
+        ),
+        "response_text": (
+            '{"strategies":[{"kind":"css","selector":"#pt1\\\\:_UISatr\\\\:0\\\\:cil1",'
+            '"reason":"Use the stable id selector."},'
+            '{"kind":"xpath","selector":"//a[@id=\'pt1:_UISatr:0:cil1\']","reason":"Fallback XPath selector."},'
+            '{"kind":"text","text":"Notifications (7 unread)","exact":true,"reason":"Fallback visible text."}]}'
+        ),
+        "parsed_response": {
+            "strategies": [
+                {"kind": "css", "selector": r"#pt1\:_UISatr\:0\:cil1", "reason": "Use the stable id selector."},
+                {"kind": "xpath", "selector": "//a[@id='pt1:_UISatr:0:cil1']", "reason": "Fallback XPath selector."},
+                {"kind": "text", "text": "Notifications (7 unread)", "exact": True, "reason": "Fallback visible text."},
+            ]
+        },
+        "locator_strategies": ["ai_css_1", "ai_xpath_2", "ai_text_3"],
+        "validated_locator_strategy": "ai_css_1",
+        "last_locator_strategy": "ai_css_1",
+        "usage": {"input_tokens": 4949, "output_tokens": 179, "total_tokens": 5128},
+    }
+
     html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
+        test_suite_id="HCM_Approve_Job_Requisition",
+        parent_run_id="run-ai",
         results=[
-            {
-                "recording_id": "rec-ai-lookup",
-                "recording_name": "recordings/demo.py",
-                "file_key": "recordings/demo.py",
-                "status": "failed",
-                "duration_seconds": 8,
-                "exit_code": 1,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "Execution failed",
-                "step_artifacts": [],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-                "action_log": [
-                    {
-                        "step": 1,
-                        "action": "click_combobox",
-                        "label": "Search for people to add as",
-                        "status": "failed",
-                        "strategy": "ai_css_1",
-                        "duration_ms": 612,
-                        "fallback_attempt_count": 2,
-                        "fallback_strategy_count": 2,
-                        "fallback_strategies": ["ai_self_repair_lookup", "ai_css_1"],
-                        "fallback_strategies_unique": ["ai_self_repair_lookup", "ai_css_1"],
-                        "error": 'Unable to open combobox "Search for people to add as".',
-                        "ai_interactions": [
-                            {
-                                "feature": "self_repair",
-                                "helper": "click_combobox",
-                                "label": "Search for people to add as",
-                                "status": "success",
-                                "model": "gpt-4.1-mini",
-                                "endpoint": "https://api.openai.com/v1/responses",
-                                "response_strategy_count": 3,
-                                "locator_candidate_count": 2,
-                                "dom_candidate_count": 8,
-                            }
-                        ],
-                    }
+            _result(
+                recording_name="HCM_Approve_Job_Requisition",
+                status="passed",
+                duration_seconds=144.9,
+                resolved_parameter_keys=["notifications_label", "password", "search_value", "url", "username"],
+                action_log=[
+                    _action(
+                        step=7,
+                        action="click_text",
+                        label="Notifications",
+                        status="success",
+                        strategy="ai_css_1",
+                        duration_ms=26668,
+                        fallback_strategies=["direct", "experience_lookup", "ai_self_repair_lookup", "ai_css_1"],
+                        recovery={
+                            "handler_name": "ai_locator_repair",
+                            "kind": "ai_locator_repair",
+                        },
+                        ai_interactions=[interaction],
+                    )
                 ],
-            }
+            )
         ],
     )
 
-    assert "Suggestions Found" in html
-    assert 'trace-chip trace-chip-success">Success<' not in html
+    assert "Execution Path" in html
+    assert "AI self-repair details" in html
+    assert "Request Sent to AI" in html
+    assert "Model Output" in html
+    assert "recorded_script_data" in html
+    assert "recorded_target_context" in html
+    assert "dom_candidates" in html
+    assert "Validated" in html
+    assert "Suggested" in html
+    assert "Elements Sent to AI" not in html
+    assert "Failure Sent to AI" not in html
+    assert "json-pre" in html
 
 
-def test_generate_html_report_content_renders_failed_ai_repair_attempt_with_runtime_outcome() -> None:
-    html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
-        results=[
-            {
-                "recording_id": "rec-ai-failed",
-                "recording_name": "recordings/demo.py",
-                "file_key": "recordings/demo.py",
-                "status": "failed",
-                "duration_seconds": 8,
-                "exit_code": 1,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "Execution failed",
-                "step_artifacts": [],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-                "action_log": [
-                    {
-                        "step": 1,
-                        "action": "click_combobox",
-                        "label": "Search for people to add as",
-                        "status": "failed",
-                        "strategy": "ai_css_2",
-                        "duration_ms": 612,
-                        "fallback_attempt_count": 3,
-                        "fallback_strategy_count": 3,
-                        "fallback_strategies": ["ai_self_repair_lookup", "ai_role_1", "ai_css_2"],
-                        "fallback_strategies_unique": ["ai_self_repair_lookup", "ai_role_1", "ai_css_2"],
-                        "error": 'Unable to open combobox "Search for people to add as".',
-                        "ai_interactions": [
-                            {
-                                "feature": "self_repair",
-                                "helper": "click_combobox",
-                                "label": "Search for people to add as",
-                                "status": "success",
-                                "repair_outcome": "execution_failed",
-                                "last_locator_strategy": "ai_css_2",
-                                "postcondition_kind": "dialog_opened",
-                                "postcondition_passed": False,
-                                "repair_error": 'AI strategy "ai_css_2" did not open combobox "Search for people to add as".',
-                                "model": "gpt-4.1-mini",
-                                "endpoint": "https://api.openai.com/v1/responses",
-                                "response_strategy_count": 3,
-                                "locator_candidate_count": 2,
-                                "dom_candidate_count": 8,
-                            }
-                        ],
-                    }
-                ],
-            }
-        ],
-    )
-
-    assert 'trace-chip trace-chip-failed">Failed<' in html
-    assert "Locator: AI repaired CSS locator" in html
-    assert "did not open combobox" in html
-
-
-def test_generate_html_report_content_step_gallery_shows_final_action_outcome() -> None:
-    html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
-        results=[
-            {
-                "recording_id": "rec-steps",
-                "recording_name": "recordings/demo_steps.py",
-                "file_key": "recordings/demo_steps.py",
-                "status": "failed",
-                "duration_seconds": 12,
-                "exit_code": 1,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "Execution failed",
-                "step_artifacts": [
-                    {"index": 1, "action": "goto", "screenshot_s3_key": ""},
-                    {"index": 2, "action": "date_pick", "screenshot_s3_key": ""},
-                    {"index": 3, "action": "navigation_button", "screenshot_s3_key": ""},
-                ],
-                "action_log": [
-                    {
-                        "step": 1,
-                        "action": "date_pick",
-                        "label": "Select Date.",
-                        "status": "success",
-                        "strategy": "day_select",
-                        "duration_ms": 5200,
-                        "fallback_attempt_count": 1,
-                        "fallback_strategy_count": 1,
-                        "fallback_strategies": ["day_select"],
-                        "fallback_strategies_unique": ["day_select"],
-                    },
-                    {
-                        "step": 2,
-                        "action": "navigation_button",
-                        "label": "Continue",
-                        "status": "failed",
-                        "strategy": "direct",
-                        "duration_ms": 900,
-                        "fallback_attempt_count": 0,
-                        "fallback_strategy_count": 0,
-                        "fallback_strategies": [],
-                        "fallback_strategies_unique": [],
-                        "error": "Continue did not advance.",
-                    },
-                ],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-            }
-        ],
-    )
-
-    assert "Final action outcome: Completed." in html
-    assert "Final action outcome: Failed." in html
-
-
-def test_generate_html_report_content_groups_screenshot_and_trace_in_same_action_card() -> None:
-    html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
-        results=[
-            {
-                "recording_id": "rec-combined",
-                "recording_name": "recordings/demo_combined.py",
-                "file_key": "recordings/demo_combined.py",
-                "status": "failed",
-                "duration_seconds": 12,
-                "exit_code": 1,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "Execution failed",
-                "step_artifacts": [
-                    {"index": 1, "action": "goto", "screenshot_s3_key": ""},
-                    {"index": 2, "action": "click_button", "screenshot_s3_key": ""},
-                ],
-                "action_log": [
-                    {
-                        "step": 1,
-                        "action": "click_button",
-                        "label": "Continue",
-                        "status": "failed",
-                        "strategy": "direct",
-                        "duration_ms": 900,
-                        "fallback_attempt_count": 0,
-                        "fallback_strategy_count": 0,
-                        "fallback_strategies": [],
-                        "fallback_strategies_unique": [],
-                        "error": "Continue did not advance.",
-                    },
-                ],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-            }
-        ],
-    )
-
-    assert "Captured immediately after script step 2. Final action outcome: Failed." in html
-    assert "Additional Captures" in html
-
-
-def test_generate_html_report_content_embeds_failure_capture_inside_failed_action_card(monkeypatch) -> None:
+def test_generate_html_report_content_hides_screenshot_object_keys_but_embeds_images(monkeypatch) -> None:
     monkeypatch.setattr(
         report_generator,
         "_to_data_uri",
-        lambda key: "data:image/png;base64,ZmFrZQ==" if key == "failure.png" else "",
+        lambda key: "data:image/png;base64,AAAA" if key else None,
     )
 
     html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
+        test_suite_id="HCM_Failure",
+        parent_run_id="run-img",
         results=[
-            {
-                "recording_id": "rec-failure-image",
-                "recording_name": "recordings/demo_failure_image.py",
-                "file_key": "recordings/demo_failure_image.py",
-                "status": "failed",
-                "duration_seconds": 12,
-                "exit_code": 1,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "Execution failed",
-                "step_artifacts": [],
-                "action_log": [
+            _result(
+                recording_name="HCM_Promote_and_change_position",
+                status="failed",
+                duration_seconds=257.2,
+                screenshot_s3_key="playwright-test-results/failure.png",
+                step_artifacts=[
                     {
-                        "step": 1,
-                        "action": "navigation_button",
-                        "label": "Continue",
-                        "status": "failed",
-                        "strategy": "direct",
-                        "duration_ms": 900,
-                        "fallback_attempt_count": 0,
-                        "fallback_strategy_count": 0,
-                        "fallback_strategies": [],
-                        "fallback_strategies_unique": [],
-                        "error": "Continue did not advance.",
+                        "index": 1,
+                        "action": "date_pick",
+                        "screenshot_s3_key": "playwright-test-results/steps/step_001_date_pick.png",
                     }
                 ],
-                "screenshot_s3_key": "failure.png",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-            }
-        ],
-    )
-
-    assert "Failure capture" in html
-    assert "Captured at the point of failure for this action." in html
-    assert "Failure Screenshot" not in html
-
-
-def test_generate_html_report_content_renders_recovery_details_and_experience_lookup() -> None:
-    html = generate_html_report_content(
-        test_suite_id="suite-1",
-        parent_run_id="run-1",
-        results=[
-            {
-                "recording_id": "rec-recovery",
-                "recording_name": "recordings/demo_recovery.py",
-                "file_key": "recordings/demo_recovery.py",
-                "status": "passed",
-                "duration_seconds": 18,
-                "exit_code": 0,
-                "page_title": "Demo Page",
-                "stdout": "",
-                "stderr": "",
-                "error": "",
-                "step_artifacts": [],
-                "screenshot_s3_key": "",
-                "video_s3_key": "",
-                "video_s3_keys": [],
-                "action_log": [
-                    {
-                        "step": 1,
-                        "action": "click_link",
-                        "label": "Home",
-                        "status": "success",
-                        "strategy": "ai_css_1",
-                        "duration_ms": 742,
-                        "fallback_attempt_count": 4,
-                        "fallback_strategy_count": 4,
-                        "fallback_strategies": [
-                            "direct",
-                            "experience_lookup",
-                            "ai_self_repair_lookup",
-                            "ai_css_1",
-                        ],
-                        "fallback_strategies_unique": [
-                            "direct",
-                            "experience_lookup",
-                            "ai_self_repair_lookup",
-                            "ai_css_1",
-                        ],
-                        "experience_interactions": [
-                            {
-                                "feature": "experience_recovery",
-                                "helper": "click_text_target",
-                                "label": "Home",
-                                "status": "miss",
-                                "candidate_count": 0,
-                            }
-                        ],
-                        "recovery": {
-                            "source": "ai_validated",
-                            "kind": "ai_locator_repair",
-                            "handler_name": "ai_locator_repair",
-                            "details": {
-                                "strategy_name": "ai_css_1",
-                                "locator_strategy": {
-                                    "kind": "css",
-                                    "selector": "#pt1\\:_UIShome",
-                                },
+                action_log=[
+                    _action(
+                        step=1,
+                        action="date_pick",
+                        label="Select Date.",
+                        status="failed",
+                        strategy="direct",
+                        duration_ms=5700,
+                        error='Date option "30" did not become ready.',
+                        failure_context={
+                            "helper": "date_pick",
+                            "page_title": "Promote and Change Position",
+                            "ready_state": "complete",
+                            "busy_indicator_count": 0,
+                            "active_element": {
+                                "tag": "table",
+                                "role": "grid",
+                                "text": "1 2 3 4 5 6 7",
+                            },
+                            "dom_context": {
+                                "candidates": [
+                                    {"tag": "span", "text": "Select Date."},
+                                    {"tag": "a", "text": "April", "title": "April"},
+                                ]
                             },
                         },
-                    }
+                    )
                 ],
-            }
+            )
         ],
     )
 
-    assert "Recovery Details" in html
-    assert "The runner tried 3 recovery attempts across 3 strategies." in html
-    assert "Final resolution: an AI-suggested locator that passed validation (AI repaired CSS locator)." in html
-    assert "Learned recovery lookup" in html
-    assert "AI repair lookup" in html
-    assert "AI repaired CSS locator" in html
-    assert "Recovery Debug Data" in html
+    assert "Failure Context" in html
+    assert "Active Element" in html
+    assert "DOM Candidates" in html
+    assert "data:image/png;base64,AAAA" in html
+    assert "playwright-test-results/failure.png" not in html
+    assert "playwright-test-results/steps/step_001_date_pick.png" not in html
+
+
+def test_generate_html_report_content_formats_duration_cards_with_small_units() -> None:
+    html = generate_html_report_content(
+        test_suite_id="HCM_Durations",
+        parent_run_id="run-dur",
+        results=[
+            _result(
+                recording_name="HCM_Move_To_Posting",
+                status="passed",
+                duration_seconds=257.2,
+                action_log=[_action(step=1, action="click_button", label="Save", duration_ms=10300)],
+            )
+        ],
+    )
+
+    assert 'class="stat-val b duration-value"' in html
+    assert html.count('class="dur-unit">m<') >= 2
+    assert html.count('class="dur-unit">s<') >= 2
+
+
+def test_generate_html_report_content_uses_green_status_chip_for_success_actions() -> None:
+    html = generate_html_report_content(
+        test_suite_id="HCM_Status_Colors",
+        parent_run_id="run-status",
+        results=[
+            _result(
+                recording_name="HCM_Approve_Job_Requisition",
+                status="passed",
+                duration_seconds=144.9,
+                action_log=[
+                    _action(step=1, action="click_button", label="Approve", status="success", duration_ms=10301),
+                    _action(step=2, action="click_button", label="Done", status="failed", duration_ms=3000, error="Done did not appear"),
+                ],
+            )
+        ],
+    )
+
+    assert 'status-chip status-passed">success<' in html
+    assert 'status-chip status-failed">failed<' in html
+
+
+def test_generate_html_report_content_masks_password_literals_in_execution_trace_and_script() -> None:
+    secret = "Abc&123!"
+    html = generate_html_report_content(
+        test_suite_id="HCM_Mask_Password",
+        parent_run_id="run-mask-password",
+        results=[
+            _result(
+                recording_name="HCM_Login",
+                status="passed",
+                duration_seconds=15,
+                action_log=[
+                    _action(
+                        step=5,
+                        action="fill_textbox",
+                        label="Password",
+                        status="success",
+                        duration_ms=10057,
+                        script_value=secret,
+                        script_data={
+                            "parsed_action": {
+                                "value": secret,
+                                "name": "Password",
+                            },
+                            "raw": f'page.get_by_role("textbox", name="Password").fill("{secret}")',
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert "Password" in html
+    assert "*****" in html
+    assert secret not in html
+    assert "Abc&amp;123!" not in html

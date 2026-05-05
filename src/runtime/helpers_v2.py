@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from playwright.sync_api import Locator, Page
+from playwright.sync_api import Browser, BrowserContext, Locator, Page
 from src.runtime.experience import (
     append_episode as _experience_append_episode,
     retrieve_recovery_candidates as _experience_retrieve_recovery_candidates,
@@ -37,6 +37,8 @@ __all__ = [
     "_ptr_click_textbox",
     "_ptr_click_combobox",
     "_ptr_click_button_target",
+    "_ptr_check_target",
+    "_ptr_uncheck_target",
     "_ptr_click_numeric_button_target",
     "_ptr_click_text_target",
     "_ptr_click_listbox_option",
@@ -70,6 +72,8 @@ _PTR_STEP_ARTIFACTS_DIR = os.getenv("PTR_STEP_ARTIFACTS_DIR", "")
 _PTR_EXPERIENCE_STORE_PATH = os.getenv("PTR_EXPERIENCE_STORE_PATH", "")
 _PTR_RUNNER_VERSION = str(os.getenv("PTR_RUNNER_VERSION", "ptr-v2")).strip() or "ptr-v2"
 _PTR_SUPPRESS_PATCH_CAPTURE = 0
+_PTR_LAST_PAGE_SNAPSHOT: dict[str, Any] = {}
+_PTR_HARDCODED_AFTER_ACTION_WAIT_MS = 10_000
 
 _PTR_POPUP_SCOPE_SELECTORS = [
     '[role="dialog"]:visible',
@@ -250,6 +254,386 @@ def _ptr_register_page(page: Page) -> Page:
     global _PTR_LAST_PAGE
     _PTR_LAST_PAGE = page
     return page
+
+
+def _ptr_capture_oracle_table_snapshots(page: Page | None) -> list[dict[str, Any]]:
+    tables = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const text = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") return false;
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+
+            const seen = new Set();
+            const candidates = Array.from(
+                document.querySelectorAll(".oj-table-scroller table.oj-table-element, table.oj-table-element")
+            );
+
+            return candidates
+                .filter((table) => {
+                    if (!isVisible(table) || seen.has(table)) return false;
+                    seen.add(table);
+                    return true;
+                })
+                .slice(0, 3)
+                .map((table, tableIndex) => {
+                    const headerCells = Array.from(table.querySelectorAll("thead tr th"));
+                    const columnIndexes = [];
+                    const headers = [];
+                    headerCells.forEach((cell, index) => {
+                        const label = text(cell.getAttribute("abbr") || cell.innerText || cell.textContent);
+                        if (!label) return;
+                        columnIndexes.push(index);
+                        headers.push(label);
+                    });
+
+                    const rows = Array.from(table.querySelectorAll("tbody tr"))
+                        .slice(0, 5)
+                        .map((row) => {
+                            const cells = Array.from(row.children);
+                            return columnIndexes.map((columnIndex) =>
+                                text(cells[columnIndex]?.innerText || cells[columnIndex]?.textContent)
+                            );
+                        })
+                        .filter((row) => row.some((value) => value));
+
+                    return {
+                        table_index: tableIndex,
+                        id: text(table.id),
+                        aria_labelledby: text(table.getAttribute("aria-labelledby")),
+                        headers,
+                        rows,
+                    };
+                })
+                .filter((table) => table.headers.length > 0 && table.rows.length > 0);
+        }""",
+    )
+    return tables if isinstance(tables, list) else []
+
+
+def _ptr_flow_context_capture_enabled() -> bool:
+    return _ptr_env_flag("PTR_FLOW_CONTEXT_CAPTURE_ENABLED", "true")
+
+
+def _ptr_capture_semantic_snapshot(page: Page | None) -> dict[str, Any]:
+    if page is None:
+        return {
+            "label_values": [],
+            "text_candidates": [],
+            "dialogs": [],
+        }
+
+    snapshot = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const normalize = (value, maxLen = 300) => {
+                const text = String(value || "").replace(/\s+/g, " ").trim();
+                return text.length > maxLen ? text.slice(0, maxLen).trim() : text;
+            };
+            const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") return false;
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const byIdsText = (ids) => {
+                return normalize(
+                    String(ids || "")
+                        .split(/\s+/)
+                        .map((id) => document.getElementById(id))
+                        .filter(Boolean)
+                        .map((node) => normalize(node.innerText || node.textContent))
+                        .filter(Boolean)
+                        .join(" ")
+                );
+            };
+            const nearestLabelText = (node) => {
+                if (!node) return "";
+                const explicit = normalize(node.getAttribute?.("aria-label"));
+                if (explicit) return explicit;
+                const labelledBy = byIdsText(node.getAttribute?.("aria-labelledby"));
+                if (labelledBy) return labelledBy;
+                const host = node.closest?.("[data-oj-field], oj-select-single, oj-c-select-single, oj-input-text, oj-c-input-text, oj-input-number, oj-c-input-number, oj-input-date, oj-c-input-date, oj-text-area, oj-c-text-area");
+                const hostLabelledBy = byIdsText(host?.getAttribute?.("labelled-by") || host?.getAttribute?.("aria-labelledby"));
+                if (hostLabelledBy) return hostLabelledBy;
+                const label = node.closest?.("label, oj-label") || host?.querySelector?.("label, oj-label");
+                if (label) {
+                    const labelText = normalize(label.innerText || label.textContent);
+                    if (labelText) return labelText;
+                }
+                const previous = node.previousElementSibling;
+                if (previous) {
+                    const previousText = normalize(previous.innerText || previous.textContent, 120);
+                    if (previousText && previousText.length <= 120) return previousText;
+                }
+                return "";
+            };
+            const controlValue = (node) => {
+                if (!node) return "";
+                const host = node.closest?.("[data-oj-field], oj-select-single, oj-c-select-single, oj-input-text, oj-c-input-text, oj-input-number, oj-c-input-number, oj-input-date, oj-c-input-date, oj-text-area, oj-c-text-area");
+                const directValue = normalize(("value" in node ? node.value : "") || node.getAttribute?.("value"));
+                if (directValue) return directValue;
+                const ariaValueText = normalize(node.getAttribute?.("aria-valuetext"));
+                if (ariaValueText) return ariaValueText;
+                const ariaChecked = normalize(node.getAttribute?.("aria-checked"));
+                if (ariaChecked) return ariaChecked;
+                const readonlyValue = normalize(
+                    host?.querySelector?.(".oj-text-field-readonly")?.innerText
+                    || host?.querySelector?.(".oj-searchselect-filter-text-field")?.value
+                    || host?.querySelector?.(".oj-searchselect-filter-text-field")?.innerText
+                );
+                if (readonlyValue) return readonlyValue;
+                const text = normalize(node.innerText || node.textContent);
+                if (text) return text;
+                const title = normalize(node.getAttribute?.("title"));
+                if (title) return title;
+                return normalize(host?.innerText || host?.textContent);
+            };
+
+            const labelValues = [];
+            const labelSeen = new Set();
+            const controlSelector = [
+                "input",
+                "textarea",
+                "select",
+                "[role='textbox']",
+                "[role='combobox']",
+                "[role='spinbutton']",
+                "oj-select-single",
+                "oj-c-select-single",
+                "oj-input-text",
+                "oj-c-input-text",
+                "oj-input-number",
+                "oj-c-input-number",
+                "oj-input-date",
+                "oj-c-input-date",
+                "oj-text-area",
+                "oj-c-text-area",
+                "[data-oj-field]"
+            ].join(",");
+
+            Array.from(document.querySelectorAll(controlSelector))
+                .filter(isVisible)
+                .slice(0, 180)
+                .forEach((node) => {
+                    const label = nearestLabelText(node);
+                    const value = controlValue(node);
+                    if (!label || !value) return;
+                    const key = `${label}||${value}`;
+                    if (labelSeen.has(key)) return;
+                    labelSeen.add(key);
+                    labelValues.push({
+                        label,
+                        value,
+                        tag: normalize(node.tagName).toLowerCase(),
+                        role: normalize(node.getAttribute?.("role")).toLowerCase(),
+                        id: normalize(node.id),
+                        title: normalize(node.getAttribute?.("title")),
+                        aria_label: normalize(node.getAttribute?.("aria-label")),
+                        data_oj_field: normalize(node.getAttribute?.("data-oj-field") || node.closest?.("[data-oj-field]")?.getAttribute?.("data-oj-field")),
+                    });
+                });
+
+            const textCandidates = [];
+            const textSeen = new Set();
+            Array.from(document.querySelectorAll("[role='heading'],h1,h2,h3,a,button,[title],[aria-label],li,td,th"))
+                .filter(isVisible)
+                .slice(0, 160)
+                .forEach((node) => {
+                    const text = normalize(node.innerText || node.textContent);
+                    const title = normalize(node.getAttribute?.("title"));
+                    const ariaLabel = normalize(node.getAttribute?.("aria-label"));
+                    const combined = text || title || ariaLabel;
+                    if (!combined) return;
+                    const key = `${normalize(node.tagName)}|${normalize(node.id)}|${combined}`;
+                    if (textSeen.has(key)) return;
+                    textSeen.add(key);
+                    textCandidates.push({
+                        text,
+                        title,
+                        aria_label: ariaLabel,
+                        tag: normalize(node.tagName).toLowerCase(),
+                        role: normalize(node.getAttribute?.("role")).toLowerCase(),
+                        id: normalize(node.id),
+                    });
+                });
+
+            const dialogs = [];
+            Array.from(document.querySelectorAll("[role='dialog'], .oj-dialog, .oj-popup"))
+                .filter(isVisible)
+                .slice(0, 5)
+                .forEach((node, index) => {
+                    const titleNode = node.querySelector("[role='heading'], h1, h2, h3, .oj-dialog-title");
+                    dialogs.push({
+                        index,
+                        title: normalize(titleNode?.innerText || titleNode?.textContent, 160),
+                        text: normalize(node.innerText || node.textContent, 1200),
+                    });
+                });
+
+            return {
+                label_values: labelValues,
+                text_candidates: textCandidates,
+                dialogs,
+            };
+        }""",
+    )
+
+    if not isinstance(snapshot, dict):
+        return {
+            "label_values": [],
+            "text_candidates": [],
+            "dialogs": [],
+        }
+    return {
+        "label_values": snapshot.get("label_values") if isinstance(snapshot.get("label_values"), list) else [],
+        "text_candidates": snapshot.get("text_candidates") if isinstance(snapshot.get("text_candidates"), list) else [],
+        "dialogs": snapshot.get("dialogs") if isinstance(snapshot.get("dialogs"), list) else [],
+    }
+
+
+def _ptr_semantic_snapshot_has_content(snapshot: dict[str, Any] | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    return any(bool(snapshot.get(key)) for key in ("label_values", "text_candidates", "dialogs"))
+
+
+def _ptr_persist_diagnostics_snapshot(snapshot: dict[str, Any] | None = None) -> None:
+    if not _PTR_DIAGNOSTICS_PATH:
+        return
+    current = snapshot if isinstance(snapshot, dict) else dict(_PTR_LAST_PAGE_SNAPSHOT)
+    payload = {
+        "page_url": str(current.get("page_url") or "").strip(),
+        "page_title": str(current.get("page_title") or "").strip(),
+        "page_text": str(current.get("page_text") or "").strip(),
+        "oracle_tables": current.get("oracle_tables") or [],
+        "page_semantics": current.get("page_semantics") or {},
+        "failure_screenshot_path": _PTR_FAILURE_SCREENSHOT_PATH or None,
+        "step_artifacts": _PTR_STEP_ARTIFACTS,
+        "action_log": _PTR_ACTION_LOG,
+    }
+    try:
+        Path(_PTR_DIAGNOSTICS_PATH).write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _ptr_capture_live_snapshot_before_close(page: Page | None) -> None:
+    current_page = page or _PTR_LAST_PAGE
+    if current_page is None:
+        return
+    try:
+        wait_ms = _ptr_wait_ms("PTR_FLOW_CONTEXT_PRE_CLOSE_WAIT_MS", 0)
+        if wait_ms > 0:
+            current_page.wait_for_timeout(wait_ms)
+    except Exception:
+        pass
+    try:
+        snapshot = _ptr_capture_page_snapshot(current_page)
+        _ptr_persist_diagnostics_snapshot(snapshot)
+    except Exception:
+        return
+
+
+def _ptr_context_pages(context: BrowserContext) -> list[Page]:
+    try:
+        pages = getattr(context, "pages", None)
+        if callable(pages):
+            items = pages()
+        else:
+            items = pages
+        return list(items or [])
+    except Exception:
+        return []
+
+
+def _ptr_browser_contexts(browser: Browser) -> list[BrowserContext]:
+    try:
+        contexts = getattr(browser, "contexts", None)
+        if callable(contexts):
+            items = contexts()
+        else:
+            items = contexts
+        return list(items or [])
+    except Exception:
+        return []
+
+
+def _ptr_order_pages_for_snapshot(pages: list[Page]) -> list[Page]:
+    ordered: list[Page] = []
+    last_page = _PTR_LAST_PAGE
+    trailing_page: Page | None = None
+    for page in pages:
+        if page is last_page:
+            trailing_page = page
+            continue
+        ordered.append(page)
+    if trailing_page is not None:
+        ordered.append(trailing_page)
+    return ordered
+
+
+def _ptr_capture_page_snapshot(page: Page | None) -> dict[str, Any]:
+    global _PTR_LAST_PAGE_SNAPSHOT
+    if page is None:
+        return _PTR_LAST_PAGE_SNAPSHOT
+
+    snapshot = dict(_PTR_LAST_PAGE_SNAPSHOT)
+    try:
+        page_url = str(page.url or "").strip()
+        if page_url:
+            snapshot["page_url"] = page_url
+    except Exception:
+        snapshot.setdefault("page_url", "")
+    try:
+        page_title = str(page.title() or "").strip()
+        if page_title:
+            snapshot["page_title"] = page_title
+    except Exception:
+        snapshot.setdefault("page_title", "")
+
+    body_text = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const body = document?.body;
+            if (!body) return "";
+            return String(body.innerText || body.textContent || "").replace(/\s+/g, " ").trim();
+        }""",
+    )
+    text = str(body_text or "").strip()
+    max_chars = max(0, _ptr_int_env("PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS", 12000))
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+    if text:
+        snapshot["page_text"] = text
+    elif "page_text" not in snapshot:
+        snapshot["page_text"] = ""
+
+    tables = _ptr_capture_oracle_table_snapshots(page)
+    if tables:
+        snapshot["oracle_tables"] = tables
+    elif "oracle_tables" not in snapshot:
+        snapshot["oracle_tables"] = []
+
+    semantics = _ptr_capture_semantic_snapshot(page)
+    if _ptr_semantic_snapshot_has_content(semantics):
+        snapshot["page_semantics"] = semantics
+    elif "page_semantics" not in snapshot:
+        snapshot["page_semantics"] = {
+            "label_values": [],
+            "text_candidates": [],
+            "dialogs": [],
+        }
+
+    _PTR_LAST_PAGE_SNAPSHOT = snapshot
+    _ptr_persist_diagnostics_snapshot(snapshot)
+    return snapshot
 
 
 def _ptr_locator_element_handle(locator: Locator, timeout_ms: int | None = None):
@@ -809,6 +1193,22 @@ def _ptr_generic_click_postcondition(before: dict[str, Any], after: dict[str, An
     return False
 
 
+def _ptr_table_row_postcondition(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    before_meta = before.get("target_meta") if isinstance(before.get("target_meta"), dict) else {}
+    after_meta = after.get("target_meta") if isinstance(after.get("target_meta"), dict) else {}
+    before_selected = _ptr_normalize_text(before_meta.get("aria_selected"))
+    after_selected = _ptr_normalize_text(after_meta.get("aria_selected"))
+    if after_selected == "true" and before_selected != after_selected:
+        return True
+
+    before_classes = _ptr_normalize_text(before_meta.get("class_name"))
+    after_classes = _ptr_normalize_text(after_meta.get("class_name"))
+    if before_classes != after_classes and "selected" in after_classes:
+        return True
+
+    return _ptr_generic_click_postcondition(before, after)
+
+
 def _ptr_combobox_open_postcondition(before: dict[str, Any], after: dict[str, Any]) -> bool:
     if int(after.get("dialog_count") or 0) > int(before.get("dialog_count") or 0):
         return True
@@ -826,9 +1226,95 @@ def _ptr_value_matches(expected: str, observed: str) -> bool:
     normalized_observed = _ptr_normalize_text(observed)
     if not normalized_expected:
         return bool(normalized_observed)
+    if not normalized_observed:
+        return False
     if normalized_expected == normalized_observed:
         return True
     return normalized_expected in normalized_observed or normalized_observed in normalized_expected
+
+
+def _ptr_checkbox_state(locator: Locator) -> str:
+    metadata = _ptr_extract_locator_metadata(locator)
+    if isinstance(metadata, dict):
+        normalized_aria_checked = _ptr_normalize_text(metadata.get("aria_checked"))
+        if normalized_aria_checked in {"true", "false", "mixed"}:
+            return normalized_aria_checked
+    try:
+        return "true" if bool(locator.is_checked()) else "false"
+    except Exception:
+        pass
+    checked = _ptr_safe_locator_eval(
+        locator,
+        r"""(node) => {
+            if (!node) return "";
+            const ariaChecked = String(node.getAttribute?.("aria-checked") || "").trim().toLowerCase();
+            if (ariaChecked === "true" || ariaChecked === "false" || ariaChecked === "mixed") return ariaChecked;
+            if (typeof node.checked === "boolean") return node.checked ? "true" : "false";
+            if (node.hasAttribute?.("checked")) return "true";
+            return "";
+        }""",
+    )
+    normalized_checked = _ptr_normalize_text(checked)
+    if normalized_checked in {"true", "false", "mixed"}:
+        return normalized_checked
+    return ""
+
+
+def _ptr_checkbox_matches(locator: Locator, desired_checked: bool) -> bool:
+    desired_state = "true" if desired_checked else "false"
+    return _ptr_checkbox_state(locator) == desired_state
+
+
+def _ptr_set_checkbox_state(locator: Locator, current_page: Page, label: str, desired_checked: bool) -> None:
+    _ptr_register_page(current_page)
+    desired_state = "true" if desired_checked else "false"
+    if _ptr_checkbox_matches(locator, desired_checked):
+        return
+
+    timeout_ms = _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    last_error: Exception | None = None
+
+    try:
+        locator.wait_for(state="visible", timeout=timeout_ms)
+        try:
+            locator.scroll_into_view_if_needed(timeout=min(timeout_ms, 1000))
+        except Exception:
+            pass
+        _ptr_record_strategy_attempt("raw_set_checked")
+        if desired_checked:
+            locator.check(timeout=timeout_ms)
+        else:
+            locator.uncheck(timeout=timeout_ms)
+    except Exception as exc:
+        last_error = exc
+
+    _ptr_wait_for_field_processing(
+        current_page,
+        env_name="PTR_CHECKBOX_CHANGE_PROCESSING_WAIT_MS",
+        default_ms=750,
+    )
+    if _ptr_checkbox_matches(locator, desired_checked):
+        return
+
+    try:
+        _ptr_record_strategy_attempt("checkbox_click_fallback")
+        _ptr_strict_click(locator, timeout_ms=timeout_ms)
+    except Exception as exc:
+        last_error = exc
+
+    _ptr_wait_for_field_processing(
+        current_page,
+        env_name="PTR_CHECKBOX_CHANGE_PROCESSING_WAIT_MS",
+        default_ms=750,
+    )
+    if _ptr_checkbox_matches(locator, desired_checked):
+        return
+
+    if last_error is not None:
+        raise RuntimeError(
+            f'Checkbox "{label}" did not become {desired_state} after raw set_checked and click fallback.'
+        ) from last_error
+    raise RuntimeError(f'Checkbox "{label}" did not become {desired_state}.')
 
 
 def _ptr_normalize_runtime_action_name(name: Any) -> str:
@@ -855,6 +1341,55 @@ def _ptr_option_selection_postcondition(
     if int(before.get("dialog_count") or 0) > 0 and not _ptr_locator_is_actionable(option_locator, timeout_ms=250):
         return True
     return False
+
+
+def _ptr_combobox_trigger_reflects_option(trigger: Locator, option_name: str) -> bool:
+    observed = _ptr_locator_value(trigger) or _ptr_locator_text(trigger)
+    if _ptr_value_matches(option_name, observed):
+        return True
+    metadata = _ptr_extract_locator_metadata(trigger)
+    if not isinstance(metadata, dict):
+        return False
+    for key in ("text", "oracle_host_text", "title"):
+        if _ptr_value_matches(option_name, str(metadata.get(key) or "")):
+            return True
+    return False
+
+
+def _ptr_try_apply_combobox_option_candidate(
+    trigger: Locator,
+    option_locator: Locator,
+    current_page: Page,
+    label: str,
+    option_name: str,
+) -> Exception | None:
+    retry_count = max(0, _ptr_int_env("PTR_COMBOBOX_VALUE_RETRY_COUNT", 1))
+    last_error: Exception | None = None
+    for attempt in range(retry_count + 1):
+        try:
+            if attempt > 0:
+                _ptr_click_combobox(trigger, current_page, label)
+                current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_RETRY_WAIT_MS", 250))
+            before = _ptr_observe(current_page, option_locator)
+            _ptr_strict_click(option_locator)
+            current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_SELECT_WAIT_MS", 400))
+            after = _ptr_observe(current_page, option_locator)
+            if not _ptr_option_selection_postcondition(before, after, trigger, option_locator, option_name):
+                last_error = RuntimeError(f'Combobox "{label}" did not reflect option "{option_name}".')
+                continue
+            _ptr_wait_for_field_processing(
+                current_page,
+                env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+                default_ms=5000,
+            )
+            if _ptr_combobox_trigger_reflects_option(trigger, option_name):
+                return None
+            last_error = RuntimeError(
+                f'Combobox "{label}" did not reflect option "{option_name}" after selection.'
+            )
+        except Exception as exc:
+            last_error = exc
+    return last_error or RuntimeError(f'Combobox "{label}" did not reflect option "{option_name}".')
 
 
 def _ptr_guided_flow_advanced(before: dict[str, Any], after: dict[str, Any]) -> bool:
@@ -1384,25 +1919,11 @@ def _ptr_capture_step(action: str) -> None:
 def _ptr_write_diagnostics() -> None:
     if not _PTR_DIAGNOSTICS_PATH:
         return
-    page_url = ""
-    page_title = ""
     try:
-        if _PTR_LAST_PAGE is not None:
-            page_url = str(_PTR_LAST_PAGE.url or "").strip()
-            page_title = str(_PTR_LAST_PAGE.title() or "").strip()
+        _ptr_capture_live_snapshot_before_close(_PTR_LAST_PAGE)
     except Exception:
         pass
-    payload = {
-        "page_url": page_url,
-        "page_title": page_title,
-        "failure_screenshot_path": _PTR_FAILURE_SCREENSHOT_PATH or None,
-        "step_artifacts": _PTR_STEP_ARTIFACTS,
-        "action_log": _PTR_ACTION_LOG,
-    }
-    try:
-        Path(_PTR_DIAGNOSTICS_PATH).write_text(json.dumps(payload), encoding="utf-8")
-    except Exception:
-        return
+    _ptr_persist_diagnostics_snapshot()
 
 
 atexit.register(_ptr_write_diagnostics)
@@ -1414,6 +1935,9 @@ def _ptr_patch_page_methods() -> None:
 
     original_goto = Page.goto
     original_reload = Page.reload
+    original_page_close = Page.close
+    original_context_close = BrowserContext.close
+    original_browser_close = Browser.close
 
     def _wrapped_goto(self, *args, **kwargs):
         global _PTR_SUPPRESS_PATCH_CAPTURE
@@ -1441,8 +1965,29 @@ def _ptr_patch_page_methods() -> None:
                 _ptr_capture_failure_screenshot()
             raise
 
+    def _wrapped_page_close(self, *args, **kwargs):
+        _ptr_register_page(self)
+        _ptr_capture_live_snapshot_before_close(self)
+        return original_page_close(self, *args, **kwargs)
+
+    def _wrapped_context_close(self, *args, **kwargs):
+        for page in _ptr_order_pages_for_snapshot(_ptr_context_pages(self)):
+            _ptr_capture_live_snapshot_before_close(page)
+        return original_context_close(self, *args, **kwargs)
+
+    def _wrapped_browser_close(self, *args, **kwargs):
+        pages: list[Page] = []
+        for context in _ptr_browser_contexts(self):
+            pages.extend(_ptr_context_pages(context))
+        for page in _ptr_order_pages_for_snapshot(pages):
+            _ptr_capture_live_snapshot_before_close(page)
+        return original_browser_close(self, *args, **kwargs)
+
     Page.goto = _wrapped_goto
     Page.reload = _wrapped_reload
+    Page.close = _wrapped_page_close
+    BrowserContext.close = _wrapped_context_close
+    Browser.close = _wrapped_browser_close
     setattr(Page, "_ptr_v2_patched", True)
 
 
@@ -1843,6 +2388,43 @@ def _ptr_try_expand_oracle_quick_actions(page: Page, label: str) -> bool:
     return False
 
 
+def _ptr_try_oracle_quick_action_exact_match(page: Page, label: str, error: Any, postcondition) -> str:
+    error_text = str(error or "")
+    lowered_error = error_text.lower()
+    if "strict mode violation" not in lowered_error:
+        return ""
+    if "get_by_role(\"link\"" not in error_text and "get_by_role('link'" not in error_text:
+        return ""
+
+    label_text = str(label or "").strip()
+    if not label_text:
+        return ""
+
+    exact_text = re.compile(rf"^{re.escape(label_text)}$")
+    candidates = [
+        ("oracle_quick_action_exact_link", page.locator("a[type='quickaction']").filter(has_text=exact_text)),
+        ("oracle_quick_action_exact_class", page.locator("a.flat-quickactions-item-link").filter(has_text=exact_text)),
+        ("oracle_quick_action_exact_role", page.get_by_role("link", name=label_text, exact=True)),
+        ("oracle_quick_action_exact_text", page.get_by_text(label_text, exact=True)),
+    ]
+
+    for strategy_name, candidate in candidates:
+        try:
+            resolved = candidate.first if hasattr(candidate, "first") else candidate
+            if not _ptr_locator_is_actionable(resolved, timeout_ms=1200):
+                continue
+            before = _ptr_observe(page, resolved)
+            _ptr_record_strategy_attempt(strategy_name)
+            _ptr_strict_click(resolved)
+            page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+            after = _ptr_observe(page, resolved)
+            if postcondition(before, after):
+                return strategy_name
+        except Exception:
+            continue
+    return ""
+
+
 def _ptr_try_oracle_home_search(page: Page, label: str, postcondition) -> bool:
     observation = _ptr_observe(page)
     page_signature = _ptr_page_signature(page, observation)
@@ -2183,16 +2765,14 @@ def _ptr_login_submit_and_redirect(locator: Locator, current_page: Page, label: 
 
 
 def _ptr_wait_after_interaction(page: Page | None) -> None:
-    wait_ms = _ptr_wait_ms("PTR_AFTER_ACTION_WAIT_MS", 10000)
-    if wait_ms <= 0:
-        return
     current_page = page or _PTR_LAST_PAGE
     if current_page is None:
         return
     try:
-        current_page.wait_for_timeout(wait_ms)
+        current_page.wait_for_timeout(_PTR_HARDCODED_AFTER_ACTION_WAIT_MS)
     except Exception:
-        return
+        pass
+    _ptr_capture_page_snapshot(current_page)
 
 
 def _ptr_tracked_action(action_type: str, label: str, fn, *args, **kwargs):
@@ -2274,6 +2854,26 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                 last_error = RuntimeError(f'Action "{label}" still had no postcondition after expanding quick actions.')
             except Exception as exc:
                 last_error = exc
+
+        quick_action_strategy = _ptr_try_oracle_quick_action_exact_match(page, label, last_error, postcondition)
+        if quick_action_strategy:
+            _ptr_set_recovery_record(
+                "oracle_handler",
+                "quick_action_exact_match",
+                "oracle_quick_action_exact_match",
+                {"label": label, "strategy_name": quick_action_strategy},
+            )
+            _ptr_store_experience_episode(
+                action_type=helper,
+                label=label,
+                page=page,
+                locator=locator,
+                error=last_error,
+                status="success",
+                postcondition_kind="action_effect",
+                postcondition_passed=True,
+            )
+            return
 
         if _ptr_try_oracle_home_search(page, label, postcondition):
             _ptr_set_recovery_record(
@@ -2627,6 +3227,14 @@ def _ptr_click_button_target(locator: Locator, current_page: Page, label: str) -
     )
 
 
+def _ptr_check_target(locator: Locator, current_page: Page, label: str) -> None:
+    _ptr_set_checkbox_state(locator, current_page, label, True)
+
+
+def _ptr_uncheck_target(locator: Locator, current_page: Page, label: str) -> None:
+    _ptr_set_checkbox_state(locator, current_page, label, False)
+
+
 def _ptr_click_numeric_button_target(locator: Locator, current_page: Page, label: str) -> None:
     _ptr_register_page(current_page)
     _ptr_click_with_candidates(
@@ -2653,6 +3261,17 @@ def _ptr_click_listbox_option(locator: Locator, current_page: Page, label: str) 
     _ptr_click_text_target(locator, current_page, label)
 
 
+def _ptr_click_table_row(locator: Locator, current_page: Page, label: str) -> None:
+    _ptr_register_page(current_page)
+    before = _ptr_observe(current_page, locator)
+    _ptr_strict_click(locator)
+    current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+    after = _ptr_observe(current_page, locator)
+    if _ptr_table_row_postcondition(before, after):
+        return
+    raise RuntimeError(f'Table row "{label}" did not change row selection state.')
+
+
 def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page: Page, label: str, option_name: str) -> None:
     _ptr_register_page(current_page)
     _ptr_click_combobox(trigger, current_page, label)
@@ -2669,18 +3288,16 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
         try:
             _ptr_record_strategy_attempt(strategy_name)
             resolved = candidate.first if hasattr(candidate, "first") else candidate
-            before = _ptr_observe(current_page, resolved)
-            _ptr_strict_click(resolved)
-            current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_SELECT_WAIT_MS", 400))
-            after = _ptr_observe(current_page, resolved)
-            if _ptr_option_selection_postcondition(before, after, trigger, resolved, option_name):
-                _ptr_wait_for_field_processing(
-                    current_page,
-                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
-                    default_ms=5000,
-                )
+            candidate_error = _ptr_try_apply_combobox_option_candidate(
+                trigger,
+                resolved,
+                current_page,
+                label,
+                option_name,
+            )
+            if candidate_error is None:
                 return
-            last_error = RuntimeError(f'Combobox "{label}" did not reflect option "{option_name}".')
+            last_error = candidate_error
         except Exception as exc:
             last_error = exc
     if last_error is None:
@@ -2695,16 +3312,14 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
     ):
         try:
             _ptr_record_strategy_attempt(strategy_name)
-            before_experience = _ptr_observe(current_page, experience_locator)
-            _ptr_strict_click(experience_locator)
-            current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_SELECT_WAIT_MS", 400))
-            after_experience = _ptr_observe(current_page, experience_locator)
-            if _ptr_option_selection_postcondition(before_experience, after_experience, trigger, experience_locator, option_name):
-                _ptr_wait_for_field_processing(
-                    current_page,
-                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
-                    default_ms=5000,
-                )
+            candidate_error = _ptr_try_apply_combobox_option_candidate(
+                trigger,
+                experience_locator,
+                current_page,
+                label,
+                option_name,
+            )
+            if candidate_error is None:
                 _ptr_set_recovery_record(
                     "experience_reuse",
                     str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -2724,11 +3339,11 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
                     locator=experience_locator,
                     error=last_error,
                     status="success",
-                    postcondition_kind="option_selected",
-                    postcondition_passed=True,
-                )
+                        postcondition_kind="option_selected",
+                        postcondition_passed=True,
+                    )
                 return
-            last_error = RuntimeError(f'Experience strategy "{strategy_name}" did not select option "{option_name}" for "{label}".')
+            last_error = candidate_error
         except Exception as exc:
             last_error = exc
 
@@ -2744,16 +3359,14 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
         last_ai_strategy_name = strategy_name
         try:
             _ptr_record_strategy_attempt(strategy_name)
-            before_ai = _ptr_observe(current_page, ai_locator)
-            _ptr_strict_click(ai_locator)
-            current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_SELECT_WAIT_MS", 400))
-            after_ai = _ptr_observe(current_page, ai_locator)
-            if _ptr_option_selection_postcondition(before_ai, after_ai, trigger, ai_locator, option_name):
-                _ptr_wait_for_field_processing(
-                    current_page,
-                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
-                    default_ms=5000,
-                )
+            candidate_error = _ptr_try_apply_combobox_option_candidate(
+                trigger,
+                ai_locator,
+                current_page,
+                label,
+                option_name,
+            )
+            if candidate_error is None:
                 _ptr_set_recovery_record(
                     "ai_validated",
                     "ai_locator_repair",
@@ -2781,7 +3394,7 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
                     postcondition_kind="option_selected",
                 )
                 return
-            last_error = RuntimeError(f'AI strategy "{strategy_name}" did not select option "{option_name}" for "{label}".')
+            last_error = candidate_error
         except Exception as exc:
             last_error = exc
     if ai_candidates:
@@ -2802,6 +3415,7 @@ def _ptr_select_search_trigger_option(
     option_name: str,
     *,
     option_kind: str = "text",
+    option_exact: bool | None = None,
     fill_value: str | None = None,
 ) -> None:
     _ptr_register_page(current_page)
@@ -2824,7 +3438,12 @@ def _ptr_select_search_trigger_option(
         ("role_option", current_page.get_by_role("option", name=option_name)),
         ("role_cell", current_page.get_by_role("cell", name=option_name)),
         ("role_gridcell", current_page.get_by_role("gridcell", name=option_name)),
-        ("text_option", current_page.get_by_text(option_name, exact=True)),
+        (
+            "text_option",
+            current_page.get_by_text(option_name)
+            if option_exact is None
+            else current_page.get_by_text(option_name, exact=option_exact),
+        ),
     ]
     for strategy_name, candidate in option_candidates:
         try:
@@ -3222,8 +3841,6 @@ def _ptr_click_navigation_button(locator: Locator, current_page: Page, label: st
                 return
             if before.get("title") != after.get("title"):
                 return
-        elif _ptr_generic_click_postcondition(before, after):
-            return
         validation_messages = _ptr_collect_validation_messages(current_page)
         if validation_messages:
             if validation_messages != last_validation_messages:
@@ -3248,6 +3865,8 @@ def _ptr_click_navigation_button(locator: Locator, current_page: Page, label: st
             raise RuntimeError(f"{prefix}. " + "; ".join(validation_messages))
         validation_seen_at = None
         last_validation_messages = []
+        if not guided_process and _ptr_generic_click_postcondition(before, after):
+            return
         current_page.wait_for_timeout(250)
     suffix = f' from step "{before_step}"' if before_step else ""
     validation_messages = _ptr_collect_validation_messages(current_page)

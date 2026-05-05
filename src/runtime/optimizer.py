@@ -508,6 +508,7 @@ def optimize(actions: list[Action]) -> list[Action]:
                 action_kwargs={
                     "day_role": day_action.role,
                     "day_label": day_action.name,
+                    "day_exact": day_action.exact,
                 },
             )
             result.append(merged)

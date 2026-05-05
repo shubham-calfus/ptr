@@ -176,7 +176,7 @@ def _unsupported_action_reason(action: Action) -> str | None:
             return None
         if method in ("get_by_text", "get_by_title"):
             return None
-        if role in ("link", "option", "cell", "gridcell", "tab", "menuitem"):
+        if role in ("link", "option", "cell", "gridcell", "tab", "menuitem", "row"):
             return None
         if method in ("get_by_label", "get_by_placeholder", "get_by_alt_text", "get_by_test_id"):
             return None
@@ -187,7 +187,7 @@ def _unsupported_action_reason(action: Action) -> str | None:
             f"(locator_method={method!r}, role={role!r})."
         )
 
-    if action.type in {"select_option", "check", "uncheck", "set_input_files", "hover", "dblclick"}:
+    if action.type in {"select_option", "set_input_files", "hover", "dblclick"}:
         return (
             f'Action "{action.type}" still relies on a raw Playwright call. '
             "Add helper coverage before replaying this recording via AST."
@@ -198,6 +198,9 @@ def _unsupported_action_reason(action: Action) -> str | None:
 
     if action.type == "press" and not action.locator_steps:
         return "Press action is missing locator steps."
+
+    if action.type in {"check", "uncheck"} and not action.locator_steps:
+        return f'{action.type.title()} action is missing locator steps.'
 
     return None
 
@@ -408,6 +411,18 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
             primary_locator_expr=locator_expr,
         )
 
+    # Row click → _ptr_click_table_row
+    if role == "row":
+        return _tracked_action_lines(
+            action,
+            "click_row",
+            label,
+            "_ptr_click_table_row",
+            [locator_expr, page_var, _escape(label)],
+            page_var,
+            primary_locator_expr=locator_expr,
+        )
+
     # get_by_label, get_by_placeholder, get_by_test_id, locator() → generic click with fallback
     if method in ("get_by_label", "get_by_placeholder", "get_by_alt_text", "get_by_test_id"):
         return _tracked_action_lines(
@@ -448,18 +463,36 @@ def _gen_select_option(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_check(action: Action, page_var: str) -> list[str]:
-    _raise_coverage_error(
+    if not action.locator_steps:
+        _raise_coverage_error(action, "Check action is missing locator steps.")
+
+    locator_expr = _build_locator_expr(page_var, action.locator_steps)
+    label = action.name or "Check"
+    return _tracked_action_lines(
         action,
-        'Action "check" still relies on a raw Playwright call. '
-        "Add helper coverage before replaying this recording via AST.",
+        "check",
+        label,
+        "_ptr_check_target",
+        [locator_expr, page_var, _escape(label)],
+        page_var,
+        primary_locator_expr=locator_expr,
     )
 
 
 def _gen_uncheck(action: Action, page_var: str) -> list[str]:
-    _raise_coverage_error(
+    if not action.locator_steps:
+        _raise_coverage_error(action, "Uncheck action is missing locator steps.")
+
+    locator_expr = _build_locator_expr(page_var, action.locator_steps)
+    label = action.name or "Uncheck"
+    return _tracked_action_lines(
         action,
-        'Action "uncheck" still relies on a raw Playwright call. '
-        "Add helper coverage before replaying this recording via AST.",
+        "uncheck",
+        label,
+        "_ptr_uncheck_target",
+        [locator_expr, page_var, _escape(label)],
+        page_var,
+        primary_locator_expr=locator_expr,
     )
 
 
@@ -589,6 +622,8 @@ def _gen_search_and_select(action: Action, page_var: str) -> list[str]:
         _escape(option_name),
         f"option_kind={_escape(option_kind)}",
     ]
+    if option_exact is not None:
+        helper_args.append(f"option_exact={_escape(option_exact)}")
     if fill_value is not None:
         helper_args.append(f"fill_value={_escape(fill_value)}")
 
@@ -642,8 +677,13 @@ def _gen_date_pick(action: Action, page_var: str) -> list[str]:
     title = action.name or ""
     day_label = (action.action_kwargs or {}).get("day_label", action.value or "")
     day_role = (action.action_kwargs or {}).get("day_role", "button")
+    day_exact = (action.action_kwargs or {}).get("day_exact")
 
-    day_expr = f'{page_var}.get_by_role({_escape(day_role)}, name={_escape(day_label)})'
+    exact_kwarg = ""
+    if day_exact is not None:
+        exact_kwarg = f", exact={_escape(day_exact)}"
+
+    day_expr = f'{page_var}.get_by_role({_escape(day_role)}, name={_escape(day_label)}{exact_kwarg})'
 
     return _tracked_action_lines(
         action,
@@ -657,6 +697,7 @@ def _gen_date_pick(action: Action, page_var: str) -> list[str]:
         extra={
             "day_label": day_label,
             "day_role": day_role,
+            "day_exact": day_exact,
         },
     )
 
