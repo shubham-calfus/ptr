@@ -12,6 +12,8 @@ from temporalio.common import RetryPolicy
 
 logger = setup_logger(__name__)
 
+_CHILD_RECORDING_TIMEOUT = timedelta(minutes=16)
+
 
 def _safe_segment(value: Any) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
@@ -145,8 +147,8 @@ async def _expand_recordings_for_parameter_rows(
     return expanded_recordings
 
 
-@agent(name="PlaywrightTestRunnerChild")
-async def PlaywrightTestRunnerChild(payload: dict[str, Any]) -> dict[str, Any]:
+@agent(name="TestRunnerChild")
+async def TestRunnerChild(payload: dict[str, Any]) -> dict[str, Any]:
     recording = payload.get("recording") or {}
     test_suite_id = str(payload.get("test_suite_id", "")).strip()
     parent_run_id = str(payload.get("parent_run_id", "")).strip()
@@ -159,15 +161,47 @@ async def PlaywrightTestRunnerChild(payload: dict[str, Any]) -> dict[str, Any]:
         recording,
         test_suite_id,
         parent_run_id,
-        start_to_close_timeout=timedelta(minutes=15),
+        start_to_close_timeout=_CHILD_RECORDING_TIMEOUT,
         retry_policy=RetryPolicy(maximum_attempts=1),
     )
     return result
 
 
-@agent(name="playwright_test_runner")
-async def PlaywrightTestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    logger.info("Starting PlaywrightTestRunnerAgent with payload: %s", payload)
+async def _persist_child_failure_manifest(
+    *,
+    recording: dict[str, Any],
+    test_suite_id: str,
+    parent_run_id: str,
+    error: str,
+) -> dict[str, Any]:
+    try:
+        return await toolExecutor.execute(
+            "record_activity_failure",
+            test_suite_id,
+            parent_run_id,
+            recording,
+            error,
+            start_to_close_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+    except Exception as persist_exc:
+        logger.error(
+            "Failed to persist failure manifest for recording %s: %s",
+            recording,
+            persist_exc,
+        )
+        return {
+            "recording_name": str(recording.get("name") or recording.get("file") or "unknown"),
+            "status": "failed",
+            "error": error,
+            "stderr": error,
+            "result_s3_key": "",
+        }
+
+
+@agent(name="test_runner")
+async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    logger.info("Starting TestRunnerAgent with payload: %s", payload)
 
     test_suite_id, recordings, execution_mode, resume_from_run_id = _extract_trigger_payload(payload)
 
@@ -236,7 +270,7 @@ async def PlaywrightTestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, A
             }
             try:
                 result = await agentExecutor.execute(
-                    "PlaywrightTestRunnerChild",
+                    "TestRunnerChild",
                     child_payload,
                     workflow_id=_child_workflow_id(child_recording, parent_run_id, idx),
                     task_queue=workflow.info().task_queue,
@@ -275,7 +309,13 @@ async def PlaywrightTestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, A
                 break
             except Exception as exc:  # pragma: no cover - runtime path
                 logger.error("Child workflow failed for recording %s: %s", recording, exc)
-                results.append(exc)
+                persisted_failure = await _persist_child_failure_manifest(
+                    recording=child_recording,
+                    test_suite_id=test_suite_id,
+                    parent_run_id=parent_run_id,
+                    error=str(exc).strip() or "Child workflow failed before returning a manifest.",
+                )
+                results.append(persisted_failure)
                 block_reason = _blocked_dependency_reason(child_recording, exc)
                 remaining_recordings = ordered_recordings[(idx - resume_offset + 1) :]
                 for blocked_recording in remaining_recordings:
@@ -308,7 +348,7 @@ async def PlaywrightTestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, A
     else:
         child_tasks = [
             agentExecutor.execute(
-                "PlaywrightTestRunnerChild",
+                "TestRunnerChild",
                 {
                     "recording": recording,
                     "test_suite_id": test_suite_id,
@@ -329,6 +369,14 @@ async def PlaywrightTestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, A
     for recording, result in zip(ordered_recordings, results, strict=False):
         display_name = str(recording.get("name") or recording.get("file") or "unknown")
         ordered_names.append(display_name)
+        if isinstance(result, Exception):
+            result = await _persist_child_failure_manifest(
+                recording=recording,
+                test_suite_id=test_suite_id,
+                parent_run_id=parent_run_id,
+                error=str(result).strip() or "Child workflow failed before returning a manifest.",
+            )
+
         if isinstance(result, Exception):
             failed += 1
             manifest_keys[display_name] = ""

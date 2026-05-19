@@ -16,7 +16,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.runtime.parser import Action, LocatorStep
+try:
+    from .parser import Action, LocatorStep
+except ImportError:  # pragma: no cover - published/runtime fallback
+    from src.runtime.parser import Action, LocatorStep
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +169,6 @@ def _unsupported_action_reason(action: Action) -> str | None:
             return "Click action is missing locator steps."
         role = action.role
         method = action.locator_method
-        label = action.name or ""
 
         if role in ("textbox", "spinbutton"):
             return None
@@ -180,6 +182,8 @@ def _unsupported_action_reason(action: Action) -> str | None:
             return None
         if method in ("get_by_label", "get_by_placeholder", "get_by_alt_text", "get_by_test_id"):
             return None
+        if _is_table_label_click(action):
+            return None
         if role == "listbox" and len(action.locator_steps) > 1:
             return None
         return (
@@ -187,11 +191,24 @@ def _unsupported_action_reason(action: Action) -> str | None:
             f"(locator_method={method!r}, role={role!r})."
         )
 
-    if action.type in {"select_option", "set_input_files", "hover", "dblclick"}:
+    if action.type == "dblclick":
+        if not action.locator_steps:
+            return "Double-click action is missing locator steps."
+        if action.locator_method == "get_by_text":
+            return None
+        return (
+            "Double-click target does not map to a resilient helper "
+            f"(locator_method={action.locator_method!r}, role={action.role!r})."
+        )
+
+    if action.type in {"set_input_files", "hover"}:
         return (
             f'Action "{action.type}" still relies on a raw Playwright call. '
             "Add helper coverage before replaying this recording via AST."
         )
+
+    if action.type == "select_option" and not action.locator_steps:
+        return "Select option action is missing locator steps."
 
     if action.type == "fill" and not action.locator_steps:
         return "Fill action is missing locator steps."
@@ -256,13 +273,52 @@ def _gen_goto(action: Action, page_var: str) -> list[str]:
     )
 
 
+def _specific_locator_label(action: Action) -> str:
+    for step in reversed(action.locator_steps or []):
+        if step.method == "get_by_role":
+            name = step.kwargs.get("name")
+            if isinstance(name, str) and name.strip():
+                return name
+        elif step.method in {
+            "get_by_label",
+            "get_by_text",
+            "get_by_title",
+            "get_by_placeholder",
+            "get_by_alt_text",
+            "get_by_test_id",
+        }:
+            if step.args:
+                value = str(step.args[0] or "").strip()
+                if value:
+                    return value
+    return str(action.name or action.selector or "").strip()
+
+
+def _is_table_label_click(action: Action) -> bool:
+    if action.role != "table":
+        return False
+    steps = action.locator_steps or []
+    if len(steps) < 2:
+        return False
+    return steps[-1].method == "get_by_label"
+
+
+def _is_row_label_click(action: Action) -> bool:
+    if action.role != "row":
+        return False
+    steps = action.locator_steps or []
+    if len(steps) < 2:
+        return False
+    return steps[-1].method == "get_by_label"
+
+
 def _gen_fill(action: Action, page_var: str) -> list[str]:
     """Generate fill call — routes through _ptr_fill_textbox for non-login fields."""
     if not action.locator_steps:
         _raise_coverage_error(action, "Fill action is missing locator steps.")
 
     locator_expr = _build_locator_expr(page_var, action.locator_steps)
-    label = action.name or ""
+    label = _specific_locator_label(action)
 
     # Login fields stay raw (Username, Password, Email)
     if _is_login_field(label):
@@ -411,6 +467,19 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
             primary_locator_expr=locator_expr,
         )
 
+    # Row-scoped label click → _ptr_click_table_field
+    if _is_row_label_click(action):
+        label = _specific_locator_label(action)
+        return _tracked_action_lines(
+            action,
+            "click_table_field",
+            label,
+            "_ptr_click_table_field",
+            [locator_expr, page_var, _escape(label)],
+            page_var,
+            primary_locator_expr=locator_expr,
+        )
+
     # Row click → _ptr_click_table_row
     if role == "row":
         return _tracked_action_lines(
@@ -418,6 +487,19 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
             "click_row",
             label,
             "_ptr_click_table_row",
+            [locator_expr, page_var, _escape(label)],
+            page_var,
+            primary_locator_expr=locator_expr,
+        )
+
+    # Table-scoped label click → _ptr_click_table_field
+    if _is_table_label_click(action):
+        label = _specific_locator_label(action)
+        return _tracked_action_lines(
+            action,
+            "click_table_field",
+            label,
+            "_ptr_click_table_field",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
@@ -455,10 +537,37 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_select_option(action: Action, page_var: str) -> list[str]:
-    _raise_coverage_error(
+    if not action.locator_steps:
+        _raise_coverage_error(action, "Select option action is missing locator steps.")
+
+    locator_expr = _build_locator_expr(page_var, action.locator_steps)
+    option_args = list(action.action_args or [])
+    option_kwargs = dict(action.action_kwargs or {})
+    if not option_args and not option_kwargs:
+        _raise_coverage_error(
+            action,
+            "Select option action is missing option arguments.",
+        )
+
+    label = action.name or action.selector or action.option_value or "Select option"
+    return _tracked_action_lines(
         action,
-        'Action "select_option" still relies on a raw Playwright call. '
-        "Add helper coverage before replaying this recording via AST.",
+        "select_option",
+        label,
+        "_ptr_select_option_target",
+        [
+            locator_expr,
+            page_var,
+            _escape(label),
+            _escape(option_args),
+            _escape(option_kwargs),
+        ],
+        page_var,
+        primary_locator_expr=locator_expr,
+        extra={
+            "option_args": option_args,
+            "option_kwargs": option_kwargs,
+        },
     )
 
 
@@ -513,10 +622,27 @@ def _gen_hover(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_dblclick(action: Action, page_var: str) -> list[str]:
+    if not action.locator_steps:
+        _raise_coverage_error(action, "Double-click action is missing locator steps.")
+
+    locator_expr = _build_locator_expr(page_var, action.locator_steps)
+    label = _specific_locator_label(action)
+
+    if action.locator_method == "get_by_text":
+        return _tracked_action_lines(
+            action,
+            "dblclick_text",
+            label,
+            "_ptr_dblclick_text_target",
+            [locator_expr, page_var, _escape(label)],
+            page_var,
+            primary_locator_expr=locator_expr,
+        )
+
     _raise_coverage_error(
         action,
-        'Action "dblclick" still relies on a raw Playwright call. '
-        "Add helper coverage before replaying this recording via AST.",
+        "Double-click target does not map to a resilient helper "
+        f"(locator_method={action.locator_method!r}, role={action.role!r}).",
     )
 
 
@@ -525,7 +651,7 @@ def _gen_dblclick(action: Action, page_var: str) -> list[str]:
 def _gen_fill_and_submit(action: Action, page_var: str) -> list[str]:
     """fill + Enter → _ptr_fill_textbox then _ptr_submit_textbox_enter."""
     locator_expr = _build_locator_expr(page_var, action.locator_steps)
-    label = action.name or ""
+    label = _specific_locator_label(action)
     fill_lines = _tracked_action_lines(
         action,
         "fill_textbox",

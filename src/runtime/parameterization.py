@@ -235,7 +235,8 @@ def parameterise_script(script_text: str) -> tuple[str, dict[str, str]]:
       1. .fill("value") with field-name context      → text inputs
       2. .select_option(label=..) / ("value")        → <select> fields
       3. gridcell.click() after combobox click()     → LOV / dropdown picks
-      4. get_by_text().click() after "Search: X"     → popup LOV picks
+      4. get_by_text()/cell/gridcell/option click()
+         after "Search: X"                           → popup LOV picks
     """
     tree = ast.parse(script_text)
     run_func = _find_run_function(tree)
@@ -244,12 +245,15 @@ def parameterise_script(script_text: str) -> tuple[str, dict[str, str]]:
     line_starts = _build_line_starts(script_text)
     replacements: list[_Replacement] = []
     params: dict[str, str] = {}
-    seen: set[str] = set()
+    reserved_placeholders = set(find_placeholder_names(script_text))
+    seen: set[str] = set(reserved_placeholders)
     pending_gridcell_context: str | None = None
     last_search: str | None = None
 
     def _record_placeholder(param_name: str, value: str, node: ast.Constant) -> None:
         if not value or is_placeholder_token(value):
+            return
+        if param_name in reserved_placeholders:
             return
         if param_name not in seen:
             params[param_name] = value
@@ -307,6 +311,32 @@ def parameterise_script(script_text: str) -> tuple[str, dict[str, str]]:
                 )
                 pending_gridcell_context = None
                 continue
+
+            if last_search:
+                search_value: str | None = None
+                search_value_node: ast.Constant | None = None
+                search_role_value, search_role_node = _first_role_name(
+                    chain,
+                    roles={"cell", "gridcell", "option"},
+                )
+                if search_role_value and search_role_node:
+                    search_value = search_role_value
+                    search_value_node = search_role_node
+                else:
+                    text_value, text_node = _first_call_string_arg(chain, method="get_by_text")
+                    if text_value and text_node:
+                        search_value = text_value
+                        search_value_node = text_node
+
+                if search_value and search_value_node:
+                    _record_placeholder(
+                        normalize_param_name(last_search),
+                        search_value,
+                        search_value_node,
+                    )
+                    last_search = None
+                    pending_gridcell_context = None
+                    continue
 
             text_value, text_node = _first_call_string_arg(chain, method="get_by_text")
             if last_search and text_value and text_node:

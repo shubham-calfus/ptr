@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from src.tools.tools import (
+    _call_openai_failure_summary,
     _collect_unresolved_execution_parameters,
     _default_experience_store_path,
     _derive_parameters_file_candidates,
@@ -23,6 +24,7 @@ from src.tools.tools import (
     _prepare_script_for_execution,
     _run_python_script,
     _split_storage_object_ref,
+    _store_executed_script_artifact,
     _validate_flow_context_inputs,
 )
 
@@ -102,6 +104,27 @@ def test_manifest_key_for_recording_matches_result_artifact_layout() -> None:
         "playwright-test-results/hcm_first_3/68128641-03ed-444a-8d36-0632ec3aa88a/"
         "recordings_HCM_Move_To_Posting_HCM_Move_To_Posting.py/manifest.json"
     )
+
+
+def test_store_executed_script_artifact_uploads_prepared_script(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_put_bytes(object_key: str, payload: bytes, *, content_type: str | None = None) -> None:
+        captured["object_key"] = object_key
+        captured["payload"] = payload
+        captured["content_type"] = content_type
+
+    monkeypatch.setattr("src.tools.tools._storage_put_bytes", _fake_put_bytes)
+
+    object_key = _store_executed_script_artifact(
+        "playwright-test-results/demo-suite/run-1/recording-demo",
+        "print('ready to run')\n",
+    )
+
+    assert object_key == "playwright-test-results/demo-suite/run-1/recording-demo/executed_script.py"
+    assert captured["object_key"] == object_key
+    assert captured["payload"] == b"print('ready to run')\n"
+    assert captured["content_type"] == "text/x-python"
 
 
 def test_load_resume_state_from_run_data_starts_from_first_failed_recording(monkeypatch) -> None:
@@ -293,6 +316,38 @@ page.get_by_role("textbox", name="Username").fill("{{username}}")
 
     assert 'page.goto("{{url}}")' in parameterised_script
     assert 'page.get_by_role("textbox", name="Username").fill("{{username}}")' in parameterised_script
+    assert default_params == {}
+
+
+def test_parameterise_script_uses_search_result_cell_for_payment_terms_not_later_validate() -> None:
+    script = """
+page.get_by_title("Search: Payment Terms").click()
+page.get_by_role("cell", name="Immediate", exact=True).click()
+page.get_by_role("link", name="Invoice Actions").click()
+page.get_by_text("Validate").click()
+"""
+
+    parameterised_script, default_params = _parameterise_script(script)
+
+    assert default_params == {"payment_terms": "Immediate"}
+    assert 'page.get_by_role("cell", name="{{payment_terms}}", exact=True).click()' in parameterised_script
+    assert 'page.get_by_text("Validate").click()' in parameterised_script
+    assert 'page.get_by_text("{{payment_terms}}").click()' not in parameterised_script
+
+
+def test_parameterise_script_does_not_rebind_existing_payment_terms_placeholder_to_validate() -> None:
+    script = """
+page.get_by_title("Search: Payment Terms").click()
+page.get_by_role("cell", name="{{payment_terms}}", exact=True).click()
+page.get_by_role("link", name="Invoice Actions").click()
+page.get_by_text("Validate").click()
+"""
+
+    parameterised_script, default_params = _parameterise_script(script)
+
+    assert 'page.get_by_role("cell", name="{{payment_terms}}", exact=True).click()' in parameterised_script
+    assert 'page.get_by_text("Validate").click()' in parameterised_script
+    assert 'page.get_by_text("{{payment_terms}}").click()' not in parameterised_script
     assert default_params == {}
 
 
@@ -1019,6 +1074,101 @@ def test_extract_flow_context_outputs_reads_labelled_value_from_page_semantics_b
     assert details[0]["source"] == "page_semantics"
     assert details[0]["attempts"][1]["source"] == "page_semantics"
     assert details[0]["attempts"][1]["status"] == "matched"
+
+
+def test_extract_flow_context_outputs_ignores_weak_semantic_label_overlap() -> None:
+    extracted, details, errors = _extract_flow_context_outputs(
+        {
+            "page_text": "",
+            "page_url": "",
+            "page_title": "",
+            "stdout": "",
+            "stderr": "",
+            "oracle_tables": [],
+            "page_semantics": {
+                "label_values": [
+                    {
+                        "label": "Automatically Fill Requisition",
+                        "value": "N",
+                        "tag": "oj-select-single",
+                        "role": "",
+                        "id": "auto-fill",
+                        "title": "",
+                        "aria_label": "",
+                        "data_oj_field": "AutomaticFillCode",
+                    }
+                ],
+                "text_candidates": [],
+                "dialogs": [],
+            },
+        },
+        [
+            {
+                "kind": "output",
+                "name": "requisition_title",
+                "label": "Requisition Title",
+                "source": "auto",
+                "required": True,
+                "use_ai": False,
+                "value_type": "text",
+            }
+        ],
+    )
+
+    assert extracted == {}
+    assert errors == ['Failed to extract required output "requisition_title"']
+    assert details[0]["status"] == "failed"
+    assert details[0]["attempts"][1]["source"] == "page_semantics"
+    assert details[0]["attempts"][1]["status"] == "miss"
+
+
+def test_extract_flow_context_outputs_ignores_weak_oracle_table_header_overlap() -> None:
+    extracted, details, errors = _extract_flow_context_outputs(
+        {
+            "page_text": "",
+            "page_url": "",
+            "page_title": "",
+            "stdout": "",
+            "stderr": "",
+            "oracle_tables": [
+                {
+                    "headers": ["Automatically Fill Requisition", "Status"],
+                    "rows": [["N", "Draft"]],
+                }
+            ],
+        },
+        [
+            {
+                "kind": "output",
+                "name": "requisition_title",
+                "label": "Requisition Title",
+                "source": "auto",
+                "required": True,
+                "use_ai": False,
+                "value_type": "text",
+            }
+        ],
+    )
+
+    assert extracted == {}
+    assert errors == ['Failed to extract required output "requisition_title"']
+    assert details[0]["status"] == "failed"
+    assert details[0]["attempts"][0]["source"] == "oracle_table"
+    assert details[0]["attempts"][0]["status"] == "miss"
+
+
+def test_call_openai_failure_summary_skips_placeholder_openai_key(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "##OPENAI_API_KEY##")
+    monkeypatch.setenv("OPENAI_FAILURE_SUMMARY_ENABLED", "true")
+
+    result = _call_openai_failure_summary(
+        {"recording_name": "demo.py", "error": "boom", "stderr": "", "stdout": "", "step_artifacts": []},
+        failure_screenshot_path=None,
+        step_image_paths=[],
+    )
+
+    assert result["status"] == "skipped"
+    assert "valid runtime key" in result["reason"]
 
 
 def test_extract_flow_context_outputs_falls_back_to_ai_when_needed(monkeypatch) -> None:

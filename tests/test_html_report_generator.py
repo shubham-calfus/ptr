@@ -418,8 +418,51 @@ def test_generate_html_report_content_uses_green_status_chip_for_success_actions
     assert 'status-chip status-failed">failed<' in html
 
 
-def test_generate_html_report_content_masks_password_literals_in_execution_trace_and_script() -> None:
+def test_generate_html_report_content_renders_executed_script_from_artifact_key(monkeypatch) -> None:
+    script_key = "playwright-test-results/demo-suite/run-1/demo-recording/executed_script.py"
+
+    def _fake_load_bytes(object_key: str | None) -> bytes | None:
+        if object_key == script_key:
+            return b"print('hello from executed script')\n"
+        return None
+
+    monkeypatch.setattr(report_generator, "_load_bytes", _fake_load_bytes)
+    report_generator._load_text_object.cache_clear()
+
+    html = generate_html_report_content(
+        test_suite_id="HCM_Executed_Script",
+        parent_run_id="run-script",
+        results=[
+            _result(
+                recording_name="HCM_Login",
+                status="passed",
+                duration_seconds=15,
+                executed_script_s3_key=script_key,
+            )
+        ],
+    )
+
+    assert "Executed Script" in html
+    assert 'class="recording-script-block executed-script-details"' in html
+    assert "print(&#x27;hello from executed script&#x27;)" in html
+
+    report_generator._load_text_object.cache_clear()
+
+
+def test_generate_html_report_content_masks_password_literals_in_execution_trace_and_script(monkeypatch) -> None:
     secret = "Abc&123!"
+    script_key = "playwright-test-results/demo-suite/run-mask/HCM_Login/executed_script.py"
+
+    def _fake_load_bytes(object_key: str | None) -> bytes | None:
+        if object_key == script_key:
+            return (
+                "page.get_by_role(\"textbox\", name=\"Password\").fill(\"Abc&123!\")\n".encode("utf-8")
+            )
+        return None
+
+    monkeypatch.setattr(report_generator, "_load_bytes", _fake_load_bytes)
+    report_generator._load_text_object.cache_clear()
+
     html = generate_html_report_content(
         test_suite_id="HCM_Mask_Password",
         parent_run_id="run-mask-password",
@@ -428,6 +471,7 @@ def test_generate_html_report_content_masks_password_literals_in_execution_trace
                 recording_name="HCM_Login",
                 status="passed",
                 duration_seconds=15,
+                executed_script_s3_key=script_key,
                 action_log=[
                     _action(
                         step=5,
@@ -453,3 +497,5 @@ def test_generate_html_report_content_masks_password_literals_in_execution_trace
     assert "*****" in html
     assert secret not in html
     assert "Abc&amp;123!" not in html
+
+    report_generator._load_text_object.cache_clear()

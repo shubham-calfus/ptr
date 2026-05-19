@@ -1,1 +1,1 @@
-"""Shared helpers for playwright_test_runner."""
+"""Shared helpers for test_runner."""

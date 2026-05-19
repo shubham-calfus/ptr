@@ -6,11 +6,11 @@ aligned with the Oracle runner redesign.
 ```text
 This repository has two separate systems:
 
-1. playwright-codegen
+1. codegen
 - This is the recording/code generation side.
 - Phantom owns the real Playwright desktop session, noVNC/browser lifecycle, and raw generated recording scripts.
 
-2. playwright_test_runner
+2. test_runner
 - This is the execution side.
 - The runner downloads stored Python Playwright recordings and executes them directly in its own worker process.
 - The runner does not execute recordings through Phantom.

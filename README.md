@@ -1,4 +1,4 @@
-# playwright_test_runner
+# test_runner
 
 Runs Playwright-generated Python scripts as a test suite and produces an HTML report.
 
@@ -26,8 +26,11 @@ Before publishing, validate it locally with:
 - The runner executes scripts directly in its own worker process; it does not proxy execution through Phantom.
 - Script execution uses `python3` by default.
 - You can override the interpreter with `PLAYWRIGHT_TEST_PYTHON_BIN`.
-- When `STEEL_API_KEY` is set, the runner creates a Steel session and connects Playwright via `wss://connect.steel.dev?apiKey=...&sessionId=...`.
 - Set `PTR_BROWSER_PROVIDER=steel` to require Steel explicitly and fail fast if the API key is missing.
+- Set `PTR_BROWSER_PROVIDER=local` to require local Chromium explicitly.
+- If `PTR_BROWSER_PROVIDER` is unset, `PTR_IS_LOCAL_ENV=true` forces local Chromium for local development.
+- If `PTR_BROWSER_PROVIDER` is unset and `PTR_IS_LOCAL_ENV` is not true, the runner uses Steel whenever `STEEL_API_KEY` is present; otherwise it falls back to local Chromium.
+- Local Chromium launch honors `PTR_CHROMIUM_EXECUTABLE_PATH` first, then `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`, then Playwright's `channel="chromium"` fallback.
 - `STEEL_SESSION_ID` optionally reuses an existing Steel session instead of creating a new one.
 - `STEEL_CONNECT_URL` optionally overrides the Steel CDP endpoint.
 - `PTR_STEEL_CONNECT_RETRIES` and `PTR_STEEL_SESSION_TIMEOUT_MS` tune Steel connection retries and session lifetime.
@@ -47,10 +50,10 @@ Environment variables:
 
 ## Design docs
 
-- [`RUNNER_EXPERIENCE_SYSTEM.md`](/Users/shubhammore/Documents/act-v2/playwright_test_runner/RUNNER_EXPERIENCE_SYSTEM.md)
+- [`RUNNER_EXPERIENCE_SYSTEM.md`](/Users/shubhammore/Documents/act-v2/test_runner/RUNNER_EXPERIENCE_SYSTEM.md)
   defines the planned experience-driven recovery system for the Oracle-focused
   runner.
-- [`CODEX_CUSTOM_INSTRUCTIONS.md`](/Users/shubhammore/Documents/act-v2/playwright_test_runner/CODEX_CUSTOM_INSTRUCTIONS.md)
+- [`CODEX_CUSTOM_INSTRUCTIONS.md`](/Users/shubhammore/Documents/act-v2/test_runner/CODEX_CUSTOM_INSTRUCTIONS.md)
   contains a paste-ready Codex custom-instructions block aligned with the new
   runner direction.
 # ptr

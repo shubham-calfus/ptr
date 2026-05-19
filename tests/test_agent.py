@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.agent.agent import (
-    PlaywrightTestRunnerAgent,
+    TestRunnerAgent,
     _build_suite_context_from_previous_results,
     _blocked_dependency_reason,
     _expand_recordings_for_parameter_rows,
@@ -179,7 +179,7 @@ async def test_sequential_suite_stops_after_first_failed_recording_and_blocks_de
         raise AssertionError(f"Unexpected tool call: {tool_name}")
 
     async def _fake_agent_execute(agent_name, payload, **kwargs):
-        assert agent_name == "PlaywrightTestRunnerChild"
+        assert agent_name == "TestRunnerChild"
         child_calls.append(payload["recording"]["id"])
         if payload["recording"]["id"] == "create":
             return {
@@ -198,7 +198,7 @@ async def test_sequential_suite_stops_after_first_failed_recording_and_blocks_de
         lambda: SimpleNamespace(run_id="parent-run-1", task_queue="ptr-task-queue"),
     )
 
-    response = await PlaywrightTestRunnerAgent.fn(
+    response = await TestRunnerAgent.fn(
         {
             "test_suite_id": "suite-1",
             "execution_mode": "sequential",
@@ -215,3 +215,128 @@ async def test_sequential_suite_stops_after_first_failed_recording_and_blocks_de
     assert summary["total"] == 3
     assert summary["passed"] == 0
     assert summary["failed"] == 3
+
+
+@pytest.mark.asyncio
+async def test_sequential_suite_persists_failure_manifest_when_child_workflow_raises(monkeypatch) -> None:
+    recordings = [
+        {"id": "create", "name": "HCM_Create_Requisition", "file": "recordings/create.py"},
+        {"id": "approve", "name": "HCM_Approve_Job_Requisition", "file": "recordings/approve.py"},
+    ]
+    tool_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def _fake_tool_execute(tool_name, *args, **kwargs):
+        tool_calls.append((tool_name, args))
+        if tool_name == "expand_recordings_for_parameter_rows":
+            return args[0]
+        if tool_name == "record_activity_failure":
+            recording = args[2]
+            return {
+                "recording_name": recording["name"],
+                "status": "failed",
+                "error": args[3],
+                "stderr": args[3],
+                "result_s3_key": f"failed/{recording['id']}.json",
+            }
+        if tool_name == "record_blocked_recording":
+            recording = args[2]
+            return {
+                "recording_name": recording["name"],
+                "status": "failed",
+                "error": args[3],
+                "result_s3_key": f"blocked/{recording['id']}.json",
+            }
+        if tool_name == "generate_html_report":
+            manifest_keys = args[2]
+            assert manifest_keys == {
+                "HCM_Create_Requisition": "failed/create.json",
+                "HCM_Approve_Job_Requisition": "blocked/approve.json",
+            }
+            return "report.html"
+        raise AssertionError(f"Unexpected tool call: {tool_name}")
+
+    async def _fake_agent_execute(agent_name, payload, **kwargs):
+        assert agent_name == "TestRunnerChild"
+        raise TimeoutError("Timed out waiting for recording execution to complete.")
+
+    monkeypatch.setattr("src.agent.agent.toolExecutor.execute", _fake_tool_execute)
+    monkeypatch.setattr("src.agent.agent.agentExecutor.execute", _fake_agent_execute)
+    monkeypatch.setattr(
+        "src.agent.agent.workflow.info",
+        lambda: SimpleNamespace(run_id="parent-run-2", task_queue="ptr-task-queue"),
+    )
+
+    response = await TestRunnerAgent.fn(
+        {
+            "test_suite_id": "suite-2",
+            "execution_mode": "sequential",
+            "recordings": recordings,
+        }
+    )
+
+    summary = next(item for item in response if item.get("type") == "summary")
+    assert summary["passed"] == 0
+    assert summary["failed"] == 2
+    assert any(tool_name == "record_activity_failure" for tool_name, _ in tool_calls)
+
+
+@pytest.mark.asyncio
+async def test_parallel_suite_persists_failure_manifest_when_child_workflow_raises(monkeypatch) -> None:
+    recordings = [
+        {"id": "create", "name": "HCM_Create_Requisition", "file": "recordings/create.py"},
+        {"id": "approve", "name": "HCM_Approve_Job_Requisition", "file": "recordings/approve.py"},
+    ]
+    tool_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def _fake_tool_execute(tool_name, *args, **kwargs):
+        tool_calls.append((tool_name, args))
+        if tool_name == "expand_recordings_for_parameter_rows":
+            return args[0]
+        if tool_name == "record_activity_failure":
+            recording = args[2]
+            return {
+                "recording_name": recording["name"],
+                "status": "failed",
+                "error": args[3],
+                "stderr": args[3],
+                "result_s3_key": f"failed/{recording['id']}.json",
+            }
+        if tool_name == "generate_html_report":
+            manifest_keys = args[2]
+            assert manifest_keys == {
+                "HCM_Create_Requisition": "manifest/create.json",
+                "HCM_Approve_Job_Requisition": "failed/approve.json",
+            }
+            return "report.html"
+        raise AssertionError(f"Unexpected tool call: {tool_name}")
+
+    async def _fake_agent_execute(agent_name, payload, **kwargs):
+        assert agent_name == "TestRunnerChild"
+        if payload["recording"]["id"] == "create":
+            return {
+                "recording_name": "HCM_Create_Requisition",
+                "status": "passed",
+                "result_s3_key": "manifest/create.json",
+                "extracted_outputs": {},
+            }
+        raise RuntimeError("Activity timed out before manifest upload.")
+
+    monkeypatch.setattr("src.agent.agent.toolExecutor.execute", _fake_tool_execute)
+    monkeypatch.setattr("src.agent.agent.agentExecutor.execute", _fake_agent_execute)
+    monkeypatch.setattr(
+        "src.agent.agent.workflow.info",
+        lambda: SimpleNamespace(run_id="parent-run-3", task_queue="ptr-task-queue"),
+    )
+
+    response = await TestRunnerAgent.fn(
+        {
+            "test_suite_id": "suite-3",
+            "execution_mode": "parallel",
+            "recordings": recordings,
+        }
+    )
+
+    summary = next(item for item in response if item.get("type") == "summary")
+    assert summary["passed"] == 1
+    assert summary["failed"] == 1
+    assert any(tool_name == "record_activity_failure" for tool_name, _ in tool_calls)

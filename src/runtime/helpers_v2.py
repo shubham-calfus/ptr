@@ -9,14 +9,21 @@ import uuid
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from playwright.sync_api import Browser, BrowserContext, Locator, Page
-from src.runtime.experience import (
-    append_episode as _experience_append_episode,
-    retrieve_recovery_candidates as _experience_retrieve_recovery_candidates,
-)
+
+try:
+    from .experience import (
+        append_episode as _experience_append_episode,
+        retrieve_recovery_candidates as _experience_retrieve_recovery_candidates,
+    )
+except ImportError:  # pragma: no cover - published/runtime fallback
+    from src.runtime.experience import (
+        append_episode as _experience_append_episode,
+        retrieve_recovery_candidates as _experience_retrieve_recovery_candidates,
+    )
 
 __all__ = [
     "_ptr_launch_chromium",
@@ -41,7 +48,11 @@ __all__ = [
     "_ptr_uncheck_target",
     "_ptr_click_numeric_button_target",
     "_ptr_click_text_target",
+    "_ptr_dblclick_text_target",
+    "_ptr_click_table_field",
+    "_ptr_click_table_row",
     "_ptr_click_listbox_option",
+    "_ptr_select_option_target",
     "_ptr_select_combobox_option",
     "_ptr_select_search_trigger_option",
     "_ptr_select_adf_menu_panel_option",
@@ -74,6 +85,8 @@ _PTR_RUNNER_VERSION = str(os.getenv("PTR_RUNNER_VERSION", "ptr-v2")).strip() or 
 _PTR_SUPPRESS_PATCH_CAPTURE = 0
 _PTR_LAST_PAGE_SNAPSHOT: dict[str, Any] = {}
 _PTR_HARDCODED_AFTER_ACTION_WAIT_MS = 10_000
+_PTR_STEEL_BROWSER_SESSION_IDS: dict[int, str] = {}
+_PTR_STEEL_RELEASE_SESSION_IDS: set[str] = set()
 
 _PTR_POPUP_SCOPE_SELECTORS = [
     '[role="dialog"]:visible',
@@ -238,15 +251,148 @@ def _ptr_strategy_snapshot() -> tuple[list[str], list[str], str]:
     return attempts, unique_attempts, final_strategy
 
 
+def _ptr_resolve_browser_provider() -> str:
+    explicit_provider = str(os.getenv("PTR_BROWSER_PROVIDER", "")).strip().lower()
+    if explicit_provider:
+        if explicit_provider not in {"local", "steel"}:
+            raise RuntimeError(f"Unsupported PTR_BROWSER_PROVIDER: {explicit_provider}")
+        return explicit_provider
+
+    if _ptr_env_flag("PTR_IS_LOCAL_ENV", "false"):
+        return "local"
+
+    return "steel" if str(os.getenv("STEEL_API_KEY", "")).strip() else "local"
+
+
+def _ptr_release_steel_session(session_id: str) -> None:
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id or normalized_session_id not in _PTR_STEEL_RELEASE_SESSION_IDS:
+        return
+
+    steel_api_key = str(os.getenv("STEEL_API_KEY", "")).strip()
+    if not steel_api_key:
+        return
+
+    try:
+        from steel import Steel
+
+        Steel(steel_api_key=steel_api_key).sessions.release(normalized_session_id)
+    except Exception:
+        pass
+    finally:
+        _PTR_STEEL_RELEASE_SESSION_IDS.discard(normalized_session_id)
+
+
+def _ptr_release_pending_steel_sessions() -> None:
+    for pending_session_id in list(_PTR_STEEL_RELEASE_SESSION_IDS):
+        _ptr_release_steel_session(pending_session_id)
+
+
+def _ptr_launch_steel_browser(playwright, *, headless: bool) -> Any:
+    steel_api_key = str(os.getenv("STEEL_API_KEY", "")).strip()
+    if not steel_api_key:
+        raise RuntimeError("PTR_BROWSER_PROVIDER=steel but STEEL_API_KEY is not configured.")
+
+    from steel import Steel
+
+    browser_type = getattr(playwright, "chromium")
+    connect_over_cdp = getattr(browser_type, "connect_over_cdp", None)
+    if connect_over_cdp is None:
+        raise RuntimeError("Playwright chromium browser type does not support connect_over_cdp.")
+
+    steel_session_id = str(os.getenv("STEEL_SESSION_ID", "")).strip()
+    steel_connect_url = str(os.getenv("STEEL_CONNECT_URL", "wss://connect.steel.dev")).strip() or "wss://connect.steel.dev"
+    steel_client = Steel(steel_api_key=steel_api_key)
+    steel_connect_retries = max(0, _ptr_int_env("PTR_STEEL_CONNECT_RETRIES", 2))
+    steel_session_timeout_ms = max(60_000, _ptr_int_env("PTR_STEEL_SESSION_TIMEOUT_MS", 900_000))
+
+    last_error: Exception | None = None
+    for attempt in range(steel_connect_retries + 1):
+        created_session_id = ""
+        should_release_session = False
+        try:
+            if steel_session_id:
+                steel_session = steel_client.sessions.retrieve(steel_session_id)
+            else:
+                steel_session = steel_client.sessions.create(
+                    api_timeout=steel_session_timeout_ms,
+                    headless=bool(headless),
+                )
+                created_session_id = str(getattr(steel_session, "id", "")).strip()
+                should_release_session = bool(created_session_id)
+                if should_release_session:
+                    _PTR_STEEL_RELEASE_SESSION_IDS.add(created_session_id)
+
+            active_session_id = str(getattr(steel_session, "id", "")).strip()
+            if not active_session_id:
+                raise RuntimeError("Steel session creation did not return a session id.")
+
+            connect_url = f"{steel_connect_url}?{urlencode({'apiKey': steel_api_key, 'sessionId': active_session_id})}"
+            browser = connect_over_cdp(connect_url)
+            if should_release_session:
+                _PTR_STEEL_BROWSER_SESSION_IDS[id(browser)] = active_session_id
+            return browser
+        except Exception as exc:
+            exc_text = str(exc)
+            if (
+                exc.__class__.__name__ == "AuthenticationError"
+                or "Authentication failed" in exc_text
+                or "Unauthorized" in exc_text
+            ):
+                raise RuntimeError(
+                    "Steel authentication failed while creating the browser session. "
+                    "Verify STEEL_API_KEY in the worker environment and restart both "
+                    "the tool and agent workers after updating it."
+                ) from exc
+
+            if created_session_id:
+                _ptr_release_steel_session(created_session_id)
+            last_error = exc
+            if attempt >= steel_connect_retries:
+                break
+            time.sleep(min(2**attempt, 5))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to connect to Steel browser.")
+
+
 def _ptr_launch_chromium(playwright, headless: bool = False):
+    browser_provider = _ptr_resolve_browser_provider()
     desired_headless = _ptr_env_flag("PTR_HEADLESS", "false")
+    effective_headless = desired_headless if not headless else headless
+    if browser_provider == "steel":
+        return _ptr_launch_steel_browser(playwright, headless=effective_headless)
+
     window_width = max(960, _ptr_int_env("PTR_WINDOW_WIDTH", 1440))
     window_height = max(700, _ptr_int_env("PTR_WINDOW_HEIGHT", 900))
     launch_kwargs: dict[str, Any] = {
-        "channel": "chromium",
-        "headless": desired_headless if not headless else headless,
+        "headless": effective_headless,
         "args": [f"--window-size={window_width},{window_height}"],
     }
+
+    chromium_executable = ""
+    if _ptr_env_flag("PTR_USE_SYSTEM_CHROMIUM", "true"):
+        configured_path = str(
+            os.getenv("PTR_CHROMIUM_EXECUTABLE_PATH")
+            or os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+            or ""
+        ).strip()
+        candidate_paths = [configured_path] if configured_path else []
+        candidate_paths.extend([
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ])
+        for candidate in candidate_paths:
+            if candidate and os.path.exists(candidate):
+                chromium_executable = candidate
+                break
+
+    if chromium_executable:
+        launch_kwargs["executable_path"] = chromium_executable
+    else:
+        launch_kwargs["channel"] = "chromium"
+
     return playwright.chromium.launch(**launch_kwargs)
 
 
@@ -907,6 +1053,16 @@ def _ptr_strict_click(locator: Locator, timeout_ms: int | None = None) -> None:
     locator.click(timeout=timeout)
 
 
+def _ptr_strict_dblclick(locator: Locator, timeout_ms: int | None = None) -> None:
+    timeout = timeout_ms or _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    locator.wait_for(state="visible", timeout=timeout)
+    try:
+        locator.scroll_into_view_if_needed(timeout=min(timeout, 1000))
+    except Exception:
+        pass
+    locator.dblclick(timeout=timeout)
+
+
 def _ptr_strict_fill(locator: Locator, value: str, timeout_ms: int | None = None) -> None:
     timeout = timeout_ms or _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
     locator.wait_for(state="visible", timeout=timeout)
@@ -1193,6 +1349,45 @@ def _ptr_generic_click_postcondition(before: dict[str, Any], after: dict[str, An
     return False
 
 
+def _ptr_active_element_matches_target(observation: dict[str, Any]) -> bool:
+    active = observation.get("active_element") if isinstance(observation, dict) else {}
+    target = observation.get("target_meta") if isinstance(observation, dict) else {}
+    active = active if isinstance(active, dict) else {}
+    target = target if isinstance(target, dict) else {}
+    if not active or not target:
+        return False
+
+    active_tag = _ptr_normalize_text(active.get("tag"))
+    target_tag = _ptr_normalize_text(target.get("tag"))
+    tags_compatible = not active_tag or not target_tag or active_tag == target_tag
+
+    active_id = _ptr_normalize_text(active.get("id"))
+    target_id = _ptr_normalize_text(target.get("id"))
+    if active_id and target_id and active_id == target_id:
+        return True
+
+    if not tags_compatible:
+        return False
+
+    for active_key, target_key in (
+        ("name", "name"),
+        ("aria_label", "aria_label"),
+        ("title", "title"),
+    ):
+        active_value = _ptr_normalize_text(active.get(active_key))
+        target_value = _ptr_normalize_text(target.get(target_key))
+        if active_value and target_value and active_value == target_value:
+            return True
+
+    return False
+
+
+def _ptr_table_field_click_postcondition(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    if _ptr_generic_click_postcondition(before, after):
+        return True
+    return _ptr_active_element_matches_target(after)
+
+
 def _ptr_table_row_postcondition(before: dict[str, Any], after: dict[str, Any]) -> bool:
     before_meta = before.get("target_meta") if isinstance(before.get("target_meta"), dict) else {}
     after_meta = after.get("target_meta") if isinstance(after.get("target_meta"), dict) else {}
@@ -1344,9 +1539,55 @@ def _ptr_option_selection_postcondition(
 
 
 def _ptr_combobox_trigger_reflects_option(trigger: Locator, option_name: str) -> bool:
-    observed = _ptr_locator_value(trigger) or _ptr_locator_text(trigger)
-    if _ptr_value_matches(option_name, observed):
-        return True
+    observed_candidates: list[str] = []
+
+    def _record_observed(value: Any) -> None:
+        normalized = str(value or "").strip()
+        if normalized:
+            observed_candidates.append(normalized)
+
+    _record_observed(_ptr_locator_value(trigger))
+    _record_observed(_ptr_locator_text(trigger))
+
+    descendant_values = _ptr_safe_locator_eval(
+        trigger,
+        r"""(node) => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const values = [];
+            const seen = new Set();
+            const record = (value) => {
+                const normalized = normalize(value);
+                if (!normalized || seen.has(normalized)) return;
+                seen.add(normalized);
+                values.push(normalized);
+            };
+
+            if (!node) return values;
+
+            record("value" in node ? node.value : "");
+            record(node.innerText || node.textContent);
+
+            const descendants = node.querySelectorAll?.("input, textarea, select") || [];
+            for (const descendant of descendants) {
+                record("value" in descendant ? descendant.value : "");
+                record(descendant.getAttribute?.("value"));
+                record(descendant.innerText || descendant.textContent);
+                if (descendant.tagName?.toLowerCase() === "select" && descendant.selectedOptions?.length) {
+                    for (const selected of descendant.selectedOptions) {
+                        record(selected.innerText || selected.textContent);
+                    }
+                }
+            }
+            return values;
+        }""",
+    )
+    if isinstance(descendant_values, list):
+        for value in descendant_values:
+            _record_observed(value)
+
+    for observed in observed_candidates:
+        if _ptr_value_matches(option_name, observed):
+            return True
     metadata = _ptr_extract_locator_metadata(trigger)
     if not isinstance(metadata, dict):
         return False
@@ -1927,6 +2168,7 @@ def _ptr_write_diagnostics() -> None:
 
 
 atexit.register(_ptr_write_diagnostics)
+atexit.register(_ptr_release_pending_steel_sessions)
 
 
 def _ptr_patch_page_methods() -> None:
@@ -1981,7 +2223,11 @@ def _ptr_patch_page_methods() -> None:
             pages.extend(_ptr_context_pages(context))
         for page in _ptr_order_pages_for_snapshot(pages):
             _ptr_capture_live_snapshot_before_close(page)
-        return original_browser_close(self, *args, **kwargs)
+        steel_session_id = _PTR_STEEL_BROWSER_SESSION_IDS.pop(id(self), "")
+        try:
+            return original_browser_close(self, *args, **kwargs)
+        finally:
+            _ptr_release_steel_session(steel_session_id)
 
     Page.goto = _wrapped_goto
     Page.reload = _wrapped_reload
@@ -2998,6 +3244,11 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
     _ptr_register_page(current_page)
     try:
         _ptr_strict_fill(locator, value)
+        _ptr_wait_for_field_processing(
+            current_page,
+            env_name="PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS",
+            default_ms=500,
+        )
         observed = _ptr_locator_value(locator) or _ptr_locator_text(locator)
         if _ptr_value_matches(value, observed):
             return
@@ -3008,6 +3259,11 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
             try:
                 _ptr_record_strategy_attempt(strategy_name)
                 _ptr_strict_fill(experience_locator, value)
+                _ptr_wait_for_field_processing(
+                    current_page,
+                    env_name="PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS",
+                    default_ms=500,
+                )
                 observed = _ptr_locator_value(experience_locator) or _ptr_locator_text(experience_locator)
                 if _ptr_value_matches(value, observed):
                     _ptr_set_recovery_record(
@@ -3041,6 +3297,11 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
             try:
                 _ptr_record_strategy_attempt(strategy_name)
                 _ptr_strict_fill(ai_locator, value)
+                _ptr_wait_for_field_processing(
+                    current_page,
+                    env_name="PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS",
+                    default_ms=500,
+                )
                 observed = _ptr_locator_value(ai_locator) or _ptr_locator_text(ai_locator)
                 if _ptr_value_matches(value, observed):
                     _ptr_set_recovery_record(
@@ -3079,6 +3340,294 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
                 postcondition_kind="field_value_changed",
             )
         raise RuntimeError(f'Unable to fill textbox "{label}" using strict execution and AI self-repair.') from last_error
+
+
+def _ptr_select_option_expectations(option_args: list[Any] | None, option_kwargs: dict[str, Any] | None) -> dict[str, list[Any]]:
+    expectations: dict[str, list[Any]] = {
+        "values": [],
+        "labels": [],
+        "indexes": [],
+    }
+
+    def _record(kind: str, value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _record(kind, item)
+            return
+        if isinstance(value, dict):
+            for nested_kind in ("value", "label", "index"):
+                if nested_kind in value:
+                    _record(nested_kind, value.get(nested_kind))
+            return
+        if kind == "index":
+            try:
+                normalized_index = int(value)
+            except Exception:
+                return
+            if normalized_index not in expectations["indexes"]:
+                expectations["indexes"].append(normalized_index)
+            return
+        normalized_text = str(value or "").strip()
+        if not normalized_text:
+            return
+        bucket = "labels" if kind == "label" else "values"
+        if normalized_text not in expectations[bucket]:
+            expectations[bucket].append(normalized_text)
+
+    for arg in option_args or []:
+        _record("value", arg)
+
+    for kind in ("value", "label", "index"):
+        if kind in (option_kwargs or {}):
+            _record(kind, option_kwargs.get(kind))
+
+    return expectations
+
+
+def _ptr_select_option_state(locator: Locator) -> dict[str, Any]:
+    state = _ptr_safe_locator_eval(
+        locator,
+        r"""(node) => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const dedupe = (items) => Array.from(new Set(items.map(normalize).filter(Boolean)));
+            if (!node) {
+                return {
+                    value: "",
+                    selected_values: [],
+                    selected_labels: [],
+                    selected_indexes: [],
+                    text: "",
+                };
+            }
+            const selectedOptions = Array.from(node.selectedOptions || []);
+            return {
+                value: normalize("value" in node ? node.value : ""),
+                selected_values: dedupe(selectedOptions.map((option) => option?.value)),
+                selected_labels: dedupe(selectedOptions.map((option) => option?.label || option?.innerText || option?.textContent)),
+                selected_indexes: selectedOptions
+                    .map((option) => Number(option?.index))
+                    .filter((value) => Number.isInteger(value)),
+                text: normalize(node.innerText || node.textContent),
+            };
+        }""",
+    )
+    return state if isinstance(state, dict) else {}
+
+
+def _ptr_select_option_postcondition(
+    before_state: dict[str, Any],
+    after_state: dict[str, Any],
+    option_args: list[Any] | None,
+    option_kwargs: dict[str, Any] | None,
+) -> bool:
+    expectations = _ptr_select_option_expectations(option_args, option_kwargs)
+
+    def _normalized_strings(values: list[Any]) -> list[str]:
+        return [str(value or "").strip() for value in values if str(value or "").strip()]
+
+    def _match_all(expected: list[str], observed: list[str]) -> bool:
+        if not expected:
+            return True
+        if not observed:
+            return False
+        return all(
+            any(_ptr_value_matches(expected_value, observed_value) for observed_value in observed)
+            for expected_value in expected
+        )
+
+    observed_values = _normalized_strings([after_state.get("value")] + list(after_state.get("selected_values") or []))
+    observed_labels = _normalized_strings(list(after_state.get("selected_labels") or []))
+    observed_indexes: list[int] = []
+    for value in list(after_state.get("selected_indexes") or []):
+        try:
+            observed_indexes.append(int(value))
+        except Exception:
+            continue
+
+    matched_explicit_expectation = False
+    if expectations["values"]:
+        matched_explicit_expectation = True
+        if not _match_all([str(item) for item in expectations["values"]], observed_values):
+            return False
+    if expectations["labels"]:
+        matched_explicit_expectation = True
+        if not _match_all([str(item) for item in expectations["labels"]], observed_labels):
+            return False
+    if expectations["indexes"]:
+        matched_explicit_expectation = True
+        if not all(int(item) in observed_indexes for item in expectations["indexes"]):
+            return False
+
+    if matched_explicit_expectation:
+        return True
+
+    return after_state != before_state and bool(observed_values or observed_labels or observed_indexes)
+
+
+def _ptr_apply_select_option(locator: Locator, option_args: list[Any] | None, option_kwargs: dict[str, Any] | None) -> None:
+    timeout_ms = _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    locator.wait_for(state="visible", timeout=timeout_ms)
+    try:
+        locator.scroll_into_view_if_needed(timeout=min(timeout_ms, 1000))
+    except Exception:
+        pass
+
+    call_kwargs = dict(option_kwargs or {})
+    call_kwargs.setdefault("timeout", timeout_ms)
+    locator.select_option(*(option_args or []), **call_kwargs)
+
+
+def _ptr_select_option_target(
+    locator: Locator,
+    current_page: Page,
+    label: str,
+    option_args: list[Any] | None,
+    option_kwargs: dict[str, Any] | None,
+) -> None:
+    _ptr_register_page(current_page)
+    target_description = json.dumps(
+        _ptr_clone_json_value(
+            {
+                "args": option_args or [],
+                "kwargs": option_kwargs or {},
+            }
+        ),
+        ensure_ascii=False,
+    )
+
+    before_state = _ptr_select_option_state(locator)
+    try:
+        _ptr_apply_select_option(locator, option_args, option_kwargs)
+        _ptr_wait_for_field_processing(
+            current_page,
+            env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+            default_ms=5000,
+        )
+        after_state = _ptr_select_option_state(locator)
+        if _ptr_select_option_postcondition(before_state, after_state, option_args, option_kwargs):
+            return
+        raise RuntimeError(
+            f'Select "{label}" did not reflect the requested option selection {target_description}.'
+        )
+    except Exception as direct_exc:
+        last_error: Exception = direct_exc
+        for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(
+            current_page,
+            "select_option_target",
+            label,
+            direct_exc,
+            locator=locator,
+        ):
+            try:
+                _ptr_record_strategy_attempt(strategy_name)
+                before_experience = _ptr_select_option_state(experience_locator)
+                _ptr_apply_select_option(experience_locator, option_args, option_kwargs)
+                _ptr_wait_for_field_processing(
+                    current_page,
+                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+                    default_ms=5000,
+                )
+                after_experience = _ptr_select_option_state(experience_locator)
+                if _ptr_select_option_postcondition(
+                    before_experience,
+                    after_experience,
+                    option_args,
+                    option_kwargs,
+                ):
+                    _ptr_set_recovery_record(
+                        "experience_reuse",
+                        str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
+                        "experience_reuse",
+                        {
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "locator_strategy": _ptr_clone_json_value(((episode.get("recovery") or {}).get("details") or {}).get("locator_strategy") or {}),
+                        },
+                    )
+                    _ptr_store_experience_episode(
+                        action_type="select_option_target",
+                        label=label,
+                        page=current_page,
+                        locator=experience_locator,
+                        error=direct_exc,
+                        status="success",
+                        postcondition_kind="option_selected",
+                        postcondition_passed=True,
+                    )
+                    return
+                last_error = RuntimeError(
+                    f'Experience strategy "{strategy_name}" did not satisfy select_option for "{label}".'
+                )
+            except Exception as exc:
+                last_error = exc
+
+        ai_candidates = _ptr_ai_repair_locators(
+            current_page,
+            "select_option_target",
+            label,
+            direct_exc,
+            value=target_description,
+            locator=locator,
+        )
+        last_ai_strategy_name = ""
+        for strategy_name, ai_locator, ai_strategy in ai_candidates:
+            last_ai_strategy_name = strategy_name
+            try:
+                _ptr_record_strategy_attempt(strategy_name)
+                before_ai = _ptr_select_option_state(ai_locator)
+                _ptr_apply_select_option(ai_locator, option_args, option_kwargs)
+                _ptr_wait_for_field_processing(
+                    current_page,
+                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+                    default_ms=5000,
+                )
+                after_ai = _ptr_select_option_state(ai_locator)
+                if _ptr_select_option_postcondition(
+                    before_ai,
+                    after_ai,
+                    option_args,
+                    option_kwargs,
+                ):
+                    _ptr_set_recovery_record(
+                        "ai_validated",
+                        "ai_locator_repair",
+                        "ai_locator_repair",
+                        {
+                            "strategy_name": strategy_name,
+                            "locator_strategy": _ptr_clone_json_value(ai_strategy),
+                        },
+                    )
+                    _ptr_store_experience_episode(
+                        action_type="select_option_target",
+                        label=label,
+                        page=current_page,
+                        locator=ai_locator,
+                        error=direct_exc,
+                        status="success",
+                        postcondition_kind="option_selected",
+                        postcondition_passed=True,
+                    )
+                    _ptr_finalize_last_ai_interaction(
+                        repair_outcome="validated",
+                        strategy_name=strategy_name,
+                        postcondition_kind="option_selected",
+                    )
+                    return
+                last_error = RuntimeError(
+                    f'AI strategy "{strategy_name}" did not satisfy select_option for "{label}".'
+                )
+            except Exception as exc:
+                last_error = exc
+        if ai_candidates:
+            _ptr_finalize_last_ai_interaction(
+                repair_outcome="execution_failed",
+                strategy_name=last_ai_strategy_name,
+                error=last_error,
+                postcondition_kind="option_selected",
+            )
+        raise RuntimeError(
+            f'Unable to apply select_option for "{label}" with target {target_description}.'
+        ) from last_error
 
 
 def _ptr_submit_textbox_enter(locator: Locator, current_page: Page, label: str) -> None:
@@ -3246,6 +3795,17 @@ def _ptr_click_numeric_button_target(locator: Locator, current_page: Page, label
     )
 
 
+def _ptr_click_table_field(locator: Locator, current_page: Page, label: str) -> None:
+    _ptr_register_page(current_page)
+    before = _ptr_observe(current_page, locator)
+    _ptr_strict_click(locator)
+    current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+    after = _ptr_observe(current_page, locator)
+    if _ptr_table_field_click_postcondition(before, after):
+        return
+    raise RuntimeError(f'Table field "{label}" did not change focus or control state.')
+
+
 def _ptr_click_text_target(locator: Locator, current_page: Page, label: str) -> None:
     _ptr_register_page(current_page)
     _ptr_click_with_candidates(
@@ -3255,6 +3815,17 @@ def _ptr_click_text_target(locator: Locator, current_page: Page, label: str) -> 
         "click_text_target",
         _ptr_generic_click_postcondition,
     )
+
+
+def _ptr_dblclick_text_target(locator: Locator, current_page: Page, label: str) -> None:
+    _ptr_register_page(current_page)
+    before = _ptr_observe(current_page, locator)
+    _ptr_strict_dblclick(locator)
+    current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+    after = _ptr_observe(current_page, locator)
+    if _ptr_generic_click_postcondition(before, after):
+        return
+    raise RuntimeError(f'Double-click target "{label}" did not change page or control state.')
 
 
 def _ptr_click_listbox_option(locator: Locator, current_page: Page, label: str) -> None:
@@ -3407,6 +3978,58 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
     raise RuntimeError(f'Unable to select combobox option "{option_name}" for "{label}".') from last_error
 
 
+def _ptr_oracle_searchselect_state(page: Page | None) -> dict[str, Any]:
+    state = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                if (!style) return false;
+                if (style.visibility === "hidden" || style.display === "none") return false;
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+
+            const hosts = Array.from(document.querySelectorAll("oj-select-single, oj-c-select-single"))
+                .filter((host) => {
+                    if (!isVisible(host)) return false;
+                    return (
+                        host.classList?.contains("oj-listbox-dropdown-open")
+                        || Boolean(host.querySelector?.(".oj-searchselect-filter"))
+                        || Boolean(host.querySelector?.("input[role='combobox'][aria-expanded='true']"))
+                    );
+                });
+
+            let host = document.activeElement?.closest?.("oj-select-single, oj-c-select-single");
+            if (!host && hosts.length === 1) host = hosts[0];
+            if (!host || !isVisible(host)) return {};
+
+            const liveRegion = host.querySelector?.(".oj-listbox-liveregion");
+            const filterInput = host.querySelector?.(
+                "input[role='combobox'], input.oj-inputtext-input, input.oj-searchselect-input"
+            );
+            const liveText = normalize(liveRegion?.innerText || liveRegion?.textContent);
+            const hostText = normalize(host.innerText || host.textContent);
+            const filterValue = normalize(
+                (filterInput && "value" in filterInput ? filterInput.value : "")
+                || filterInput?.getAttribute?.("value")
+            );
+
+            return {
+                host_id: normalize(host.id),
+                open: true,
+                no_matches: /no matches found/i.test(liveText || hostText),
+                live_text: liveText,
+                host_text: hostText,
+                filter_value: filterValue,
+            };
+        }""",
+    )
+    return state if isinstance(state, dict) else {}
+
+
 def _ptr_select_search_trigger_option(
     trigger: Locator,
     option: Locator,
@@ -3430,6 +4053,14 @@ def _ptr_select_search_trigger_option(
     else:
         _ptr_strict_click(trigger)
     current_page.wait_for_timeout(_ptr_wait_ms("PTR_SEARCH_RESULTS_WAIT_MS", 750))
+    oracle_search_state = _ptr_oracle_searchselect_state(current_page)
+    if bool(oracle_search_state.get("no_matches")):
+        query_text = str(oracle_search_state.get("filter_value") or fill_value or option_name or "").strip()
+        visible_state = str(oracle_search_state.get("live_text") or "No matches found").strip() or "No matches found"
+        raise RuntimeError(
+            f'Oracle search-select "{title}" returned no matches for query "{query_text}" '
+            f'while looking for option "{option_name}". Visible state: {visible_state}'
+        )
     last_error: Exception | None = None
     option_target = str(option_name or "").strip()
     raw_option_timeout_ms = _ptr_wait_ms("PTR_SEARCH_RESULT_TIMEOUT_MS", 6000)

@@ -19,12 +19,21 @@ from urllib.request import Request, urlopen
 from aetherion_sdk import tool
 from common_lib.storage.storage_client import RetrievalMode, storage
 from common_lib.utils.logger import setup_logger
-from src.runtime.parameterization import (
-    normalize_param_name as _normalize_param_name,
-    parameterise_script as _parameterise_script,
-    substitute_parameters as _substitute_parameters,
-)
-from src.utils.html_report_generator import generate_html_report_content
+
+try:
+    from runtime.parameterization import (
+        normalize_param_name as _normalize_param_name,
+        parameterise_script as _parameterise_script,
+        substitute_parameters as _substitute_parameters,
+    )
+    from utils.html_report_generator import generate_html_report_content
+except ImportError:  # pragma: no cover - published/runtime fallback
+    from src.runtime.parameterization import (
+        normalize_param_name as _normalize_param_name,
+        parameterise_script as _parameterise_script,
+        substitute_parameters as _substitute_parameters,
+    )
+    from src.utils.html_report_generator import generate_html_report_content
 
 logger = setup_logger(__name__)
 
@@ -57,9 +66,12 @@ _RUNNER_DATA_DIR = _RUNNER_PROJECT_ROOT / ".runner_data"
 
 
 def _get_bucket_name() -> str:
-    bucket_name = os.getenv("STORAGE_ACTIVITIES_BUCKET", "").strip()
+    # Artifacts (recordings, test reports, screenshots) live in the per-tenant
+    # bucket. TENANT_ID is the bucket name. STORAGE_ACTIVITIES_BUCKET kept as a
+    # legacy fallback for environments that haven't migrated yet.
+    bucket_name = os.getenv("TENANT_ID", "").strip() or os.getenv("STORAGE_ACTIVITIES_BUCKET", "").strip()
     if not bucket_name:
-        raise RuntimeError("STORAGE_ACTIVITIES_BUCKET is not configured.")
+        raise RuntimeError("Neither TENANT_ID nor STORAGE_ACTIVITIES_BUCKET is configured.")
     return bucket_name
 
 
@@ -183,7 +195,7 @@ def _storage_put_bytes(object_key: str, data: bytes, *, content_type: str) -> tu
 
 def _load_script_bytes(object_key: str) -> bytes:
     if not object_key.lower().endswith(".py"):
-        raise ValueError(f"Unsupported recording artifact: {object_key}. playwright_test_runner can only execute .py recordings.")
+        raise ValueError(f"Unsupported recording artifact: {object_key}. test_runner can only execute .py recordings.")
     return _storage_get_bytes(object_key)
 
 
@@ -922,6 +934,9 @@ def _normalize_output_label(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().lower()
 
 
+_FLOW_CONTEXT_STRONG_LABEL_SCORE = 250
+
+
 def _flow_context_display_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name or "").replace("_", " ")).strip()
 
@@ -981,6 +996,8 @@ def _flow_context_best_header_match(headers: list[Any], spec: dict[str, Any]) ->
             best_index = index
             best_header = header_text
             best_score = score
+    if best_score < _FLOW_CONTEXT_STRONG_LABEL_SCORE:
+        return None, ""
     return best_index, best_header
 
 
@@ -1238,7 +1255,7 @@ def _extract_flow_context_from_page_semantics(
                     continue
                 label_score = score
                 matched_label = candidate_text
-        if label_score <= 0:
+        if label_score < _FLOW_CONTEXT_STRONG_LABEL_SCORE:
             continue
         normalized_value = _normalize_flow_context_extracted_value(candidate.get("value"), spec)
         if not normalized_value:
@@ -1442,11 +1459,11 @@ def _call_openai_flow_context_extraction(
             "model": model,
             "reason": "Flow context AI extraction is disabled by PTR_FLOW_CONTEXT_AI_EXTRACTION_ENABLED.",
         }
-    if not api_key:
+    if not _is_valid_openai_api_key(api_key):
         return {
             "status": "skipped",
             "model": model,
-            "reason": "OPENAI_API_KEY is not configured.",
+            "reason": "OPENAI_API_KEY is not configured with a valid runtime key.",
         }
 
     request_payload, system_prompt, user_prompt = _build_flow_context_ai_request_payload(
@@ -1608,6 +1625,18 @@ def _is_ai_failure_summary_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _is_valid_openai_api_key(value: str) -> bool:
+    key = str(value or "").strip()
+    if not key:
+        return False
+    lowered = key.lower()
+    if "##openai" in lowered or "******" in key or "your_openai" in lowered:
+        return False
+    if key.startswith("sk-proj-") or key.startswith("sk-"):
+        return True
+    return False
+
+
 def _get_openai_base_url() -> str:
     return os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 
@@ -1756,10 +1785,10 @@ def _call_openai_failure_summary(
             "status": "skipped",
             "reason": "AI failure summaries are disabled by OPENAI_FAILURE_SUMMARY_ENABLED.",
         }
-    if not api_key:
+    if not _is_valid_openai_api_key(api_key):
         return {
             "status": "skipped",
-            "reason": "OPENAI_API_KEY is not configured.",
+            "reason": "OPENAI_API_KEY is not configured with a valid runtime key.",
         }
 
     model = _get_openai_failure_summary_model()
@@ -1889,7 +1918,7 @@ def _validate_python_playwright_script(script_text: str) -> None:
     if any(marker in trimmed for marker in obvious_js_markers):
         raise ValueError(
             "Recording is not a Python Playwright script. "
-            "playwright_test_runner currently supports Python recordings only."
+            "test_runner currently supports Python recordings only."
         )
 
     python_markers = [
@@ -1937,9 +1966,14 @@ def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] |
     Known coverage gaps fail fast with an explicit error so we do not silently
     replay unsupported raw actions through the old fallback-heavy runtime.
     """
-    from src.runtime.parser import ParseCoverageError, parse_script
-    from src.runtime.optimizer import optimize
-    from src.runtime.script_generator import CoverageError, generate_full_script
+    try:
+        from runtime.optimizer import optimize
+        from runtime.parser import ParseCoverageError, parse_script
+        from runtime.script_generator import CoverageError, generate_full_script
+    except ImportError:  # pragma: no cover - published/runtime fallback
+        from src.runtime.optimizer import optimize
+        from src.runtime.parser import ParseCoverageError, parse_script
+        from src.runtime.script_generator import CoverageError, generate_full_script
 
     _validate_python_playwright_script(script_text)
     if parameters:
@@ -2067,6 +2101,7 @@ def _base_recording_result(recording: dict[str, Any]) -> dict[str, Any]:
         "oracle_tables": [],
         "page_semantics": {},
         "screenshot_s3_key": None,
+        "executed_script_s3_key": None,
         "video_s3_key": None,
         "video_s3_keys": [],
         "step_artifacts": [],
@@ -2083,6 +2118,32 @@ def _base_recording_result(recording: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _persist_recording_manifest(
+    manifest_key: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    _storage_put_bytes(
+        manifest_key,
+        json.dumps(result, indent=2).encode("utf-8"),
+        content_type="application/json",
+    )
+    result["result_s3_key"] = manifest_key
+    return result
+
+
+def _store_executed_script_artifact(artifact_prefix: str, prepared_script: str) -> str | None:
+    script_text = str(prepared_script or "")
+    if not script_text.strip():
+        return None
+    object_key = f"{artifact_prefix}/executed_script.py"
+    _storage_put_bytes(
+        object_key,
+        script_text.encode("utf-8"),
+        content_type="text/x-python",
+    )
+    return object_key
+
+
 @tool()
 async def record_blocked_recording(
     test_suite_id: str,
@@ -2094,14 +2155,21 @@ async def record_blocked_recording(
     result = _base_recording_result(recording)
     result["error"] = str(reason or "Recording was not executed because an upstream dependency failed.")
     result["blocked_by_dependency"] = True
+    return _persist_recording_manifest(manifest_key, result)
 
-    _storage_put_bytes(
-        manifest_key,
-        json.dumps(result, indent=2).encode("utf-8"),
-        content_type="application/json",
-    )
-    result["result_s3_key"] = manifest_key
-    return result
+
+@tool()
+async def record_activity_failure(
+    test_suite_id: str,
+    parent_run_id: str,
+    recording: dict[str, Any],
+    error: str,
+) -> dict[str, Any]:
+    manifest_key = _manifest_key_for_recording(test_suite_id, parent_run_id, recording)
+    result = _base_recording_result(recording)
+    result["error"] = str(error or "Recording activity failed before a manifest was returned.")
+    result["stderr"] = result["error"]
+    return _persist_recording_manifest(manifest_key, result)
 
 
 @tool()
@@ -2124,13 +2192,7 @@ async def execute_recording_script(
 
     if not file_key:
         result["error"] = "Recording file key is required."
-        _storage_put_bytes(
-            manifest_key,
-            json.dumps(result, indent=2).encode("utf-8"),
-            content_type="application/json",
-        )
-        result["result_s3_key"] = manifest_key
-        return result
+        return _persist_recording_manifest(manifest_key, result)
 
     try:
         raw_script_bytes = await asyncio.to_thread(_load_script_bytes, file_key)
@@ -2217,18 +2279,19 @@ async def execute_recording_script(
             parameterised_script,
             execution_parameters or None,
         )
+        try:
+            result["executed_script_s3_key"] = _store_executed_script_artifact(
+                artifact_prefix,
+                prepared_script,
+            )
+        except Exception as exc:
+            logger.warning("Failed to store executed script artifact for %s: %s", file_key, exc)
     except Exception as exc:
         logger.exception("Failed to download or prepare recording script for %s", file_key)
         result["error"] = f"Failed to download or prepare recording script: {exc}"
-        _storage_put_bytes(
-            manifest_key,
-            json.dumps(result, indent=2).encode("utf-8"),
-            content_type="application/json",
-        )
-        result["result_s3_key"] = manifest_key
-        return result
+        return _persist_recording_manifest(manifest_key, result)
 
-    with tempfile.TemporaryDirectory(prefix="playwright-test-runner-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="test-runner-") as temp_dir:
         working_dir = Path(temp_dir)
         script_path = working_dir / f"{_safe_segment(Path(file_key).stem)}.py"
         script_path.write_text(prepared_script, encoding="utf-8")
@@ -2376,13 +2439,7 @@ async def execute_recording_script(
         result["duration_seconds"],
     )
 
-    _storage_put_bytes(
-        manifest_key,
-        json.dumps(result, indent=2).encode("utf-8"),
-        content_type="application/json",
-    )
-    result["result_s3_key"] = manifest_key
-    return result
+    return _persist_recording_manifest(manifest_key, result)
 
 
 @tool()

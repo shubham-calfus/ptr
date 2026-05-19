@@ -24,7 +24,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.runtime.parser import Action
+try:
+    from .parser import Action
+except ImportError:  # pragma: no cover - published/runtime fallback
+    from src.runtime.parser import Action
 
 
 # ---------------------------------------------------------------------------

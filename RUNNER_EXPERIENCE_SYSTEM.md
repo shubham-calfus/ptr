@@ -1,14 +1,14 @@
 # Runner Experience System
 
-This document defines how `playwright_test_runner` should learn from past
+This document defines how `test_runner` should learn from past
 failures and recoveries without turning into a generic fallback engine.
 
 ## Context
 
-- `playwright-codegen` plus Phantom own recording generation.
+- `codegen` plus Phantom own recording generation.
 - Phantom owns the Playwright desktop session, noVNC/browser lifecycle, and the
   raw generated recording script.
-- `playwright_test_runner` owns execution.
+- `test_runner` owns execution.
 - Once a recording reaches the runner, it must be treated as read-only
   execution input.
 

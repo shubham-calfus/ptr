@@ -59,6 +59,14 @@ def _to_data_uri(object_key: str | None) -> str | None:
     return f"data:image/png;base64,{base64.b64encode(image_bytes).decode('utf-8')}"
 
 
+@lru_cache(maxsize=256)
+def _load_text_object(object_key: str | None) -> str | None:
+    payload = _load_bytes(object_key)
+    if not payload:
+        return None
+    return payload.decode("utf-8", errors="replace")
+
+
 def _format_duration_minutes(duration_seconds: Any) -> str:
     try:
         seconds = max(0.0, float(duration_seconds or 0))
@@ -736,6 +744,29 @@ def _script_block(action: dict[str, Any]) -> str:
     )
 
 
+def _executed_script_block(result: dict[str, Any]) -> str:
+    script_key = _safe_text(result.get("executed_script_s3_key"))
+    script_text = _load_text_object(script_key) if script_key else None
+    if not script_text:
+        return ""
+    return (
+        '<details class="recording-script-block executed-script-details">'
+        '<summary class="executed-script-summary">'
+        '<div class="executed-script-summary-main">'
+        '<div class="trace-title">Executed Script</div>'
+        '<div class="trace-subtitle">Final prepared Python script for this run.</div>'
+        "</div>"
+        '<span class="executed-script-chevron"></span>'
+        "</summary>"
+        '<div class="executed-script-body">'
+        '<div class="detail-card">'
+        f'<pre class="code-block">{escape(script_text)}</pre>'
+        "</div>"
+        "</div>"
+        "</details>"
+    )
+
+
 def _flow_context_request_payload_json(interaction: dict[str, Any]) -> str:
     payload: dict[str, Any] = {}
     for field in ("model", "feature", "status", "reason"):
@@ -1167,6 +1198,7 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
         )
 
     flow_context_block = _flow_context_block(result)
+    executed_script_block = _executed_script_block(result)
 
     trace_body = (
         "".join(_step_item(action, action_index, result, result_index) for action_index, action in enumerate(actions))
@@ -1201,6 +1233,7 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
         + "</div>"
         + params_block
         + flow_context_block
+        + executed_script_block
         + '<div class="trace-section">'
         '<div class="trace-head">'
         '<div class="trace-title">Execution Trace</div>'
@@ -1657,6 +1690,38 @@ body::before{
 .trace-head{display:grid;gap:6px}
 .trace-title{font-size:22px;font-weight:800;letter-spacing:-.02em}
 .trace-subtitle{font-size:14px;color:var(--text-dim);line-height:1.8}
+.executed-script-details{
+  background:var(--s1);
+  border:1px solid var(--border);
+  border-radius:var(--r2);
+  overflow:hidden;
+}
+.executed-script-summary{
+  list-style:none;
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  padding:16px 18px;
+}
+.executed-script-summary::-webkit-details-marker{display:none}
+.executed-script-summary:hover{background:var(--s2)}
+.executed-script-summary-main{display:grid;gap:6px;min-width:0}
+.executed-script-body{padding:0 18px 18px}
+.executed-script-chevron{
+  width:10px;
+  height:10px;
+  border-right:1.5px solid var(--text-dim);
+  border-bottom:1.5px solid var(--text-dim);
+  transform:rotate(45deg);
+  transition:transform .18s;
+  flex:0 0 auto;
+  margin-right:4px;
+}
+.executed-script-details[open] .executed-script-chevron{
+  transform:rotate(-135deg);
+}
 .steps-outer{
   background:var(--s1);
   border:1px solid var(--border);

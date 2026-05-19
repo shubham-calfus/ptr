@@ -1,7 +1,9 @@
 import json
 import os
+import sys
 from itertools import chain, repeat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -182,15 +184,52 @@ class _OracleHomePage:
 class _FakeChromium:
     def __init__(self) -> None:
         self.launch_kwargs = None
+        self.connect_calls: list[dict[str, object]] = []
 
     def launch(self, **kwargs):
         self.launch_kwargs = kwargs
         return kwargs
 
+    def connect_over_cdp(self, url: str, **kwargs):
+        payload = {"url": url, "kwargs": kwargs}
+        self.connect_calls.append(payload)
+        return payload
+
 
 class _FakePlaywright:
     def __init__(self) -> None:
         self.chromium = _FakeChromium()
+
+
+class _FakeSteelSessions:
+    def __init__(self) -> None:
+        self.created: list[dict[str, object]] = []
+        self.retrieved: list[str] = []
+        self.released: list[str] = []
+
+    def create(self, **kwargs):
+        self.created.append(kwargs)
+        return SimpleNamespace(id="steel-session-created")
+
+    def retrieve(self, session_id: str):
+        self.retrieved.append(session_id)
+        return SimpleNamespace(id=session_id)
+
+    def release(self, session_id: str) -> None:
+        self.released.append(session_id)
+
+
+class _FakeSteelClient:
+    instances: list["_FakeSteelClient"] = []
+
+    def __init__(self, steel_api_key: str | None = None) -> None:
+        self.steel_api_key = steel_api_key
+        self.sessions = _FakeSteelSessions()
+        type(self).instances.append(self)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances.clear()
 
 
 class _DateLocator:
@@ -697,6 +736,103 @@ def test_select_combobox_option_retries_when_value_does_not_stick(monkeypatch) -
     assert processing_waits == ["done", "done"]
 
 
+def test_select_option_postcondition_accepts_matching_selected_value() -> None:
+    assert helpers_v2._ptr_select_option_postcondition(
+        {
+            "value": "",
+            "selected_values": [],
+            "selected_labels": [],
+            "selected_indexes": [],
+        },
+        {
+            "value": "3",
+            "selected_values": ["3"],
+            "selected_labels": ["Credit Memo"],
+            "selected_indexes": [2],
+        },
+        ["3"],
+        {},
+    )
+
+
+def test_select_option_target_waits_for_processing_after_success(monkeypatch) -> None:
+    locator = object()
+    page = _NavigationPage()
+    waited: list[str] = []
+    states = iter(
+        [
+            {
+                "value": "",
+                "selected_values": [],
+                "selected_labels": [],
+                "selected_indexes": [],
+            },
+            {
+                "value": "3",
+                "selected_values": ["3"],
+                "selected_labels": ["Credit Memo"],
+                "selected_indexes": [2],
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_apply_select_option", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_field_processing",
+        lambda *args, **kwargs: waited.append("done"),
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: [])
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: [])
+
+    helpers_v2._ptr_select_option_target(locator, page, "Type", ["3"], {})
+
+    assert waited == ["done"]
+
+
+def test_fill_textbox_waits_for_processing_before_validating(monkeypatch) -> None:
+    locator = object()
+    page = _NavigationPage()
+    waited: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_fill", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_field_processing",
+        lambda *args, **kwargs: waited.append("done"),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_locator_value",
+        lambda current_locator: "-10.00" if waited else "",
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_text", lambda *args, **kwargs: "")
+
+    helpers_v2._ptr_fill_textbox(locator, page, "Amount", "-10")
+
+    assert waited == ["done"]
+
+
+def test_combobox_trigger_reflects_option_reads_descendant_input_value(monkeypatch) -> None:
+    trigger = object()
+
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_value", lambda locator: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_text", lambda locator: "Business Unit")
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_safe_locator_eval",
+        lambda locator, expression, arg=None: ["Business Unit", "Test Solutions"],
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_extract_locator_metadata",
+        lambda locator: {"text": "Business Unit", "oracle_host_text": "Business Unit", "title": ""},
+    )
+
+    assert helpers_v2._ptr_combobox_trigger_reflects_option(trigger, "Test Solutions") is True
+
+
 def test_enter_search_value_uses_keyboard_events_for_oracle_autosuggest() -> None:
     locator = _KeyboardEntryLocator()
 
@@ -922,6 +1058,53 @@ def test_select_search_trigger_option_preserves_exact_text_matching_when_request
     assert clicked[-1] == "text:Wan Fu:True"
 
 
+def test_select_search_trigger_option_fails_clearly_on_oracle_no_matches(monkeypatch) -> None:
+    trigger = _SearchOptionLocator("search")
+    option = _SearchOptionLocator("raw-option")
+    page = _SearchOptionPage()
+    experience_calls: list[str] = []
+    ai_calls: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_enter_search_value", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_oracle_searchselect_state",
+        lambda current_page: {
+            "open": True,
+            "no_matches": True,
+            "live_text": "No matches found",
+            "filter_value": "su",
+        },
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: experience_calls.append("called") or [],
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: ai_calls.append("called") or [],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match='Oracle search-select "Candidate Selection Process" returned no matches for query "su"',
+    ):
+        helpers_v2._ptr_select_search_trigger_option(
+            trigger,
+            option,
+            page,
+            "Candidate Selection Process",
+            "Supremo Candidate Selection",
+            fill_value="su",
+        )
+
+    assert experience_calls == []
+    assert ai_calls == []
+
+
 def test_click_combobox_uses_oracle_keyboard_open_when_label_intercepts_pointer_events(monkeypatch) -> None:
     page = _NavigationPage()
     locator = _OracleKeyboardComboboxLocator()
@@ -1042,12 +1225,68 @@ def test_locator_value_and_text_use_fast_element_handle() -> None:
 
 
 def test_launch_chromium_defaults_to_headed_when_env_missing(monkeypatch) -> None:
+    monkeypatch.delenv("PTR_BROWSER_PROVIDER", raising=False)
+    monkeypatch.delenv("PTR_IS_LOCAL_ENV", raising=False)
+    monkeypatch.delenv("STEEL_API_KEY", raising=False)
     monkeypatch.delenv("PTR_HEADLESS", raising=False)
     playwright = _FakePlaywright()
 
     result = helpers_v2._ptr_launch_chromium(playwright)
 
     assert result["headless"] is False
+
+
+def test_launch_chromium_defaults_to_steel_when_api_key_is_present(monkeypatch) -> None:
+    monkeypatch.delenv("PTR_BROWSER_PROVIDER", raising=False)
+    monkeypatch.delenv("PTR_IS_LOCAL_ENV", raising=False)
+    monkeypatch.setenv("STEEL_API_KEY", "steel-key")
+    monkeypatch.delenv("PTR_HEADLESS", raising=False)
+    _FakeSteelClient.reset()
+    helpers_v2._PTR_STEEL_BROWSER_SESSION_IDS.clear()
+    helpers_v2._PTR_STEEL_RELEASE_SESSION_IDS.clear()
+    monkeypatch.setitem(sys.modules, "steel", SimpleNamespace(Steel=_FakeSteelClient))
+    playwright = _FakePlaywright()
+
+    result = helpers_v2._ptr_launch_chromium(playwright)
+
+    assert playwright.chromium.launch_kwargs is None
+    assert playwright.chromium.connect_calls == [result]
+    assert result["url"].startswith("wss://connect.steel.dev?")
+    assert "apiKey=steel-key" in result["url"]
+    assert "sessionId=steel-session-created" in result["url"]
+    assert _FakeSteelClient.instances[0].sessions.created == [{"api_timeout": 900000, "headless": False}]
+
+
+def test_launch_chromium_uses_local_when_ptr_is_local_env(monkeypatch) -> None:
+    monkeypatch.delenv("PTR_BROWSER_PROVIDER", raising=False)
+    monkeypatch.setenv("PTR_IS_LOCAL_ENV", "true")
+    monkeypatch.setenv("STEEL_API_KEY", "steel-key")
+    monkeypatch.delenv("PTR_HEADLESS", raising=False)
+    playwright = _FakePlaywright()
+
+    result = helpers_v2._ptr_launch_chromium(playwright)
+
+    assert result["headless"] is False
+    assert playwright.chromium.launch_kwargs is not None
+    assert playwright.chromium.connect_calls == []
+
+
+def test_launch_chromium_explicit_steel_overrides_local_env(monkeypatch) -> None:
+    monkeypatch.setenv("PTR_BROWSER_PROVIDER", "steel")
+    monkeypatch.setenv("PTR_IS_LOCAL_ENV", "true")
+    monkeypatch.setenv("STEEL_API_KEY", "steel-key")
+    monkeypatch.delenv("PTR_HEADLESS", raising=False)
+    _FakeSteelClient.reset()
+    helpers_v2._PTR_STEEL_BROWSER_SESSION_IDS.clear()
+    helpers_v2._PTR_STEEL_RELEASE_SESSION_IDS.clear()
+    monkeypatch.setitem(sys.modules, "steel", SimpleNamespace(Steel=_FakeSteelClient))
+    playwright = _FakePlaywright()
+
+    result = helpers_v2._ptr_launch_chromium(playwright)
+
+    assert playwright.chromium.launch_kwargs is None
+    assert result["url"].startswith("wss://connect.steel.dev?")
+    assert "apiKey=steel-key" in result["url"]
 
 
 def test_runtime_exports_legacy_failure_hooks_for_generated_wrapper() -> None:
@@ -1267,6 +1506,65 @@ def test_click_table_row_requires_selection_postcondition(monkeypatch) -> None:
 
     assert clicked == [(locator, None)]
     assert page.waits == [250]
+
+
+def test_click_table_field_accepts_already_focused_target(monkeypatch) -> None:
+    page = _OracleQuickActionPage()
+    locator = _DateLocator("field")
+    observed_states = iter(
+        [
+            {
+                "active_element": {"id": "desc-input", "name": "description", "tag": "input"},
+                "target_meta": {"id": "desc-input", "name": "description", "tag": "input"},
+                "body_marker": "same",
+            },
+            {
+                "active_element": {"id": "desc-input", "name": "description", "tag": "input"},
+                "target_meta": {"id": "desc-input", "name": "description", "tag": "input"},
+                "body_marker": "same",
+            },
+        ]
+    )
+    clicked: list[tuple[object, int | None]] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_register_page", lambda current_page: current_page)
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: next(observed_states))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_strict_click",
+        lambda target, timeout_ms=None: clicked.append((target, timeout_ms)),
+    )
+
+    helpers_v2._ptr_click_table_field(locator, page, "Description")
+
+    assert clicked == [(locator, None)]
+    assert page.waits == [250]
+
+
+def test_click_table_field_still_fails_when_target_never_becomes_active(monkeypatch) -> None:
+    page = _OracleQuickActionPage()
+    locator = _DateLocator("field")
+    observed_states = iter(
+        [
+            {
+                "active_element": {"id": "other-input", "name": "other", "tag": "input"},
+                "target_meta": {"id": "desc-input", "name": "description", "tag": "input"},
+                "body_marker": "same",
+            },
+            {
+                "active_element": {"id": "other-input", "name": "other", "tag": "input"},
+                "target_meta": {"id": "desc-input", "name": "description", "tag": "input"},
+                "body_marker": "same",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_register_page", lambda current_page: current_page)
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: next(observed_states))
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match='Table field "Description" did not change focus or control state.'):
+        helpers_v2._ptr_click_table_field(locator, page, "Description")
 
 
 def test_collect_ai_dom_candidates_ranks_label_relevant_action_card_first() -> None:

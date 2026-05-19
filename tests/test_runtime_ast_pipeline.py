@@ -1,5 +1,6 @@
 import pytest
 
+from src.runtime import helpers_v2
 from src.runtime.parser import ParseCoverageError, parse_script
 from src.runtime.script_generator import CoverageError, generate_full_script
 from src.tools.tools import _prepare_script_via_ast
@@ -121,7 +122,25 @@ def run(playwright):
     assert 'page.locator(".mystery-target").click()' in message
 
 
-def test_prepare_script_via_ast_fails_fast_for_raw_select_option_gap() -> None:
+def test_prepare_script_via_ast_supports_select_option_actions() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_label("Type").select_option("3")
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('select_option', 'Type', _ptr_select_option_target, "
+        "page.get_by_label('Type'), page, 'Type', ['3'], {})"
+    ) in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
+def test_prepare_script_via_ast_supports_generic_locator_select_option_actions() -> None:
     script = _full_recording(
         """    browser = playwright.chromium.launch(headless=False)
     context = browser.new_context()
@@ -130,12 +149,13 @@ def test_prepare_script_via_ast_fails_fast_for_raw_select_option_gap() -> None:
     browser.close()"""
     )
 
-    with pytest.raises(RuntimeError) as excinfo:
-        _prepare_script_via_ast(script)
+    prepared = _prepare_script_via_ast(script)
 
-    message = str(excinfo.value)
-    assert "does not safely support yet" in message
-    assert 'Action "select_option" still relies on a raw Playwright call.' in message
+    assert (
+        "_ptr_tracked_action('select_option', 'select', _ptr_select_option_target, "
+        "page.locator('select'), page, 'select', ['Approved'], {})"
+    ) in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
 
 
 def test_prepare_script_via_ast_supports_checkbox_check_actions() -> None:
@@ -154,6 +174,85 @@ def test_prepare_script_via_ast_supports_checkbox_check_actions() -> None:
         "page.get_by_role('checkbox', name='Create a job application on'), page, 'Create a job application on')"
     ) in prepared
     assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
+def test_prepare_script_via_ast_uses_inner_label_for_nested_fill_actions() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("row", name="1 Item Type Amount").get_by_label("Amount").fill("-10")
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('fill_textbox', 'Amount', _ptr_fill_textbox, "
+        "page.get_by_role('row', name='1 Item Type Amount').get_by_label('Amount'), page, 'Amount', '-10')"
+    ) in prepared
+
+
+def test_prepare_script_via_ast_supports_text_dblclick_actions() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_text("10008").dblclick()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('dblclick_text', '10008', _ptr_dblclick_text_target, "
+        "page.get_by_text('10008'), page, '10008')"
+    ) in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
+def test_prepare_script_via_ast_supports_table_scoped_label_click_actions() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("table", name="Invoice Lines").get_by_label("Amount").click()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('click_table_field', 'Amount', _ptr_click_table_field, "
+        "page.get_by_role('table', name='Invoice Lines').get_by_label('Amount'), page, 'Amount')"
+    ) in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
+def test_generate_full_script_still_rejects_non_text_dblclick_actions() -> None:
+    script = """
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("button", name="Open").dblclick()
+    browser.close()
+"""
+
+    actions = parse_script(script)
+
+    with pytest.raises(CoverageError) as excinfo:
+        generate_full_script(actions)
+
+    message = str(excinfo.value)
+    assert "line 6" in message
+    assert "Double-click target does not map to a resilient helper" in message
+    assert 'page.get_by_role("button", name="Open").dblclick()' in message
+
+
+def test_helpers_v2_exports_new_ast_click_helpers() -> None:
+    assert "_ptr_dblclick_text_target" in helpers_v2.__all__
+    assert "_ptr_click_table_field" in helpers_v2.__all__
 
 
 def test_generate_full_script_supports_named_secondary_pages() -> None:
@@ -209,6 +308,25 @@ def test_prepare_script_via_ast_supports_role_row_clicks() -> None:
         "_ptr_tracked_action('click_row', 'Academic', "
         "_ptr_click_table_row, page.get_by_role('row', name='Academic'), page, 'Academic')"
     ) in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
+def test_prepare_script_via_ast_maps_row_scoped_label_clicks_to_table_field_helper() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("row", name="1 Item Type 100.00 Amount").get_by_label("Description").click()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('click_table_field', 'Description', _ptr_click_table_field, "
+        "page.get_by_role('row', name='1 Item Type 100.00 Amount').get_by_label('Description'), page, 'Description')"
+    ) in prepared
+    assert "_ptr_tracked_action('click_row', '1 Item Type 100.00 Amount'" not in prepared
     assert "Recording contains actions the AST runner does not safely support yet." not in prepared
 
 

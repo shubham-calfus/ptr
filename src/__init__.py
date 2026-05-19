@@ -1,1 +1,1 @@
-"""playwright_test_runner package."""
+"""test_runner package."""
