@@ -802,11 +802,13 @@ def _ptr_safe_locator_eval(locator: Locator, expression: str, arg: Any | None = 
         return None
 
 
-def _ptr_safe_page_eval(page: Page | None, expression: str) -> Any:
+def _ptr_safe_page_eval(page: Page | None, expression: str, arg: Any | None = None) -> Any:
     if page is None:
         return None
     try:
-        return page.evaluate(expression)
+        if arg is None:
+            return page.evaluate(expression)
+        return page.evaluate(expression, arg)
     except Exception:
         return None
 
@@ -1428,6 +1430,392 @@ def _ptr_value_matches(expected: str, observed: str) -> bool:
     return normalized_expected in normalized_observed or normalized_observed in normalized_expected
 
 
+def _ptr_recorded_locator_roles(script_data: dict[str, Any] | None = None) -> list[str]:
+    current = script_data if isinstance(script_data, dict) else _ptr_current_script_data()
+    steps: list[dict[str, Any]] = []
+    for key in ("primary_locator_steps", "secondary_locator_steps"):
+        value = current.get(key)
+        if isinstance(value, list):
+            steps.extend(item for item in value if isinstance(item, dict))
+    parsed_action = current.get("parsed_action")
+    if isinstance(parsed_action, dict):
+        locator_steps = parsed_action.get("locator_steps")
+        if isinstance(locator_steps, list):
+            steps.extend(item for item in locator_steps if isinstance(item, dict))
+
+    roles: list[str] = []
+    for step in steps:
+        if _ptr_normalize_text(step.get("method")) != "get_by_role":
+            continue
+        args = step.get("args") or []
+        role = _ptr_normalize_text(args[0] if args else "")
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def _ptr_recorded_locator_is_table_scoped(script_data: dict[str, Any] | None = None) -> bool:
+    return any(role in {"row", "table", "cell", "gridcell"} for role in _ptr_recorded_locator_roles(script_data))
+
+
+_PTR_ORACLE_TABLE_EDITOR_ID_PATTERNS = (
+    re.compile(r"(?P<table_id>.*?:at\d+:_ATp:ta\d+):\d+:i\d+(?:::[A-Za-z0-9_-]+)?$", re.IGNORECASE),
+    re.compile(r"(?P<table_id>.*?:_ATp:ta\d+):\d+:i\d+(?:::[A-Za-z0-9_-]+)?$", re.IGNORECASE),
+)
+
+
+def _ptr_oracle_table_editor_table_id(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        for pattern in _PTR_ORACLE_TABLE_EDITOR_ID_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return str(match.group("table_id") or "").strip()
+    return ""
+
+
+def _ptr_active_oracle_table_editor(page: Page | None) -> dict[str, str]:
+    result = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const node = document.activeElement;
+            const text = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const table = node?.closest?.(".oj-table-scroller, table.oj-table-element, [role='grid'], [role='table'], [id*=':_ATp:ta']");
+            if (!node) return {};
+            const row = node?.closest?.("[role='row'], tr, .oj-table-body-row");
+            return {
+                tag: String(node?.tagName || "").toLowerCase(),
+                role: text(node?.getAttribute?.("role")),
+                id: text(node?.id),
+                name: text(node?.getAttribute?.("name")),
+                aria_label: text(node?.getAttribute?.("aria-label")),
+                title: text(node?.getAttribute?.("title")),
+                value: text(("value" in node ? node.value : "") || node?.getAttribute?.("value")),
+                row_text: text(row?.innerText || row?.textContent).slice(0, 400),
+                table_id: text(table?.id),
+            };
+        }""",
+    )
+    active_info = result if isinstance(result, dict) else {}
+    if not active_info:
+        return {}
+
+    inferred_table_id = _ptr_oracle_table_editor_table_id(
+        active_info.get("id"),
+        active_info.get("name"),
+    )
+    if inferred_table_id and not str(active_info.get("table_id") or "").strip():
+        active_info["table_id"] = inferred_table_id
+
+    if not _ptr_normalize_text(active_info.get("row_text")) and not _ptr_normalize_text(active_info.get("table_id")):
+        return {}
+    return active_info
+
+
+def _ptr_active_oracle_table_editor_locator(page: Page | None) -> tuple[dict[str, str], Locator | None]:
+    active_info = _ptr_active_oracle_table_editor(page)
+    if page is None or not active_info:
+        return active_info, None
+
+    tag = _ptr_normalize_text(active_info.get("tag"))
+    role = _ptr_normalize_text(active_info.get("role"))
+    if tag not in {"input", "textarea"} and role not in {"textbox", "spinbutton"}:
+        return active_info, None
+
+    locator = None
+    active_id = str(active_info.get("id") or "").strip()
+    if active_id:
+        escaped_id = active_id.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            locator = page.locator(f'[id="{escaped_id}"]').first
+        except Exception:
+            try:
+                locator = page.locator(f'[id="{escaped_id}"]')
+            except Exception:
+                locator = None
+    if locator is None:
+        active_name = str(active_info.get("name") or "").strip()
+        if active_name:
+            escaped_name = active_name.replace("\\", "\\\\").replace('"', '\\"')
+            try:
+                locator = page.locator(f'[name="{escaped_name}"]').first
+            except Exception:
+                try:
+                    locator = page.locator(f'[name="{escaped_name}"]')
+                except Exception:
+                    locator = None
+    return active_info, locator
+
+
+def _ptr_fill_locator_via_keyboard(locator: Locator, value: str) -> None:
+    timeout = _ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000)
+    locator.wait_for(state="visible", timeout=timeout)
+    try:
+        locator.scroll_into_view_if_needed(timeout=min(timeout, 1000))
+    except Exception:
+        pass
+    try:
+        locator.click(timeout=min(timeout, 1000))
+    except Exception:
+        pass
+    try:
+        locator.press("ControlOrMeta+A", timeout=timeout)
+    except Exception:
+        pass
+    try:
+        locator.press("Backspace", timeout=timeout)
+    except Exception:
+        pass
+
+    entry_delay = max(0, min(200, _ptr_int_env("PTR_TEXT_ENTRY_KEY_DELAY_MS", 40)))
+    try:
+        locator.press_sequentially(str(value), delay=entry_delay, timeout=timeout)
+        return
+    except Exception:
+        pass
+    try:
+        locator.type(str(value), delay=entry_delay, timeout=timeout)
+        return
+    except Exception:
+        pass
+    locator.fill(str(value), timeout=timeout)
+
+
+def _ptr_oracle_table_fill_postcondition(locator: Locator, active_locator: Locator | None, value: str) -> bool:
+    candidates = [active_locator, locator]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        observed = _ptr_locator_value(candidate) or _ptr_locator_text(candidate)
+        if _ptr_value_matches(value, observed):
+            return True
+    return False
+
+
+def _ptr_try_oracle_table_active_editor_fill(
+    current_page: Page,
+    locator: Locator,
+    label: str,
+    value: str,
+) -> dict[str, Any] | None:
+    if not _ptr_recorded_locator_is_table_scoped():
+        return None
+
+    active_info, active_locator = _ptr_active_oracle_table_editor_locator(current_page)
+    if active_locator is None:
+        return None
+
+    if _ptr_oracle_table_fill_postcondition(locator, active_locator, value):
+        strategy_name = "oracle_table_active_editor_reflects_value"
+        _ptr_record_strategy_attempt(strategy_name)
+        return {
+            "strategy_name": strategy_name,
+            "active_element_id": str(active_info.get("id") or "").strip(),
+            "table_id": str(active_info.get("table_id") or "").strip(),
+            "row_text": str(active_info.get("row_text") or "").strip(),
+            "used_keyboard_entry": False,
+        }
+
+    strategy_name = "oracle_table_active_editor_fill"
+    _ptr_record_strategy_attempt(strategy_name)
+    _ptr_fill_locator_via_keyboard(active_locator, value)
+    _ptr_wait_for_field_processing(
+        current_page,
+        env_name="PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS",
+        default_ms=500,
+    )
+    if _ptr_oracle_table_fill_postcondition(locator, active_locator, value):
+        return {
+            "strategy_name": strategy_name,
+            "active_element_id": str(active_info.get("id") or "").strip(),
+            "table_id": str(active_info.get("table_id") or "").strip(),
+            "row_text": str(active_info.get("row_text") or "").strip(),
+            "used_keyboard_entry": True,
+        }
+    raise RuntimeError(f'Oracle table editor for "{label}" did not reflect the requested value.')
+
+
+def _ptr_page_visible_text(page: Page | None) -> str:
+    result = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const body = document?.body;
+            if (!body) return "";
+            return String(body.innerText || body.textContent || "").replace(/\s+/g, " ").trim();
+        }""",
+    )
+    return _ptr_normalize_text(result)
+
+
+def _ptr_oracle_invoice_shows_not_validated(page: Page | None) -> bool:
+    visible_text = _ptr_page_visible_text(page)
+    return "not validated" in visible_text or "never validated" in visible_text
+
+
+def _ptr_oracle_menu_trigger_requires_option_visibility(trigger_label: str) -> bool:
+    return _ptr_normalize_text(trigger_label) == "invoice actions"
+
+
+def _ptr_menu_panel_option_candidates(
+    current_page: Page,
+    option: Locator,
+    option_name: str,
+) -> list[tuple[str, Locator]]:
+    return [
+        ("raw_option", option),
+        ("role_menuitem", current_page.get_by_role("menuitem", name=option_name)),
+        ("role_option", current_page.get_by_role("option", name=option_name)),
+        ("text_option", current_page.get_by_text(option_name, exact=True)),
+    ]
+
+
+def _ptr_wait_for_oracle_menu_trigger_option_visibility(
+    page: Page | None,
+    option_candidates: Sequence[tuple[str, Locator]],
+    trigger_label: str,
+) -> bool:
+    if not _ptr_oracle_menu_trigger_requires_option_visibility(trigger_label):
+        return True
+    if page is None:
+        return False
+
+    def _condition() -> bool:
+        for _, candidate in option_candidates:
+            if _ptr_locator_is_actionable(candidate, timeout_ms=250):
+                return True
+        return False
+
+    if _condition():
+        return True
+
+    timeout_ms = max(0, _ptr_wait_ms("PTR_MENU_TRIGGER_OPTION_TIMEOUT_MS", 3000))
+    if timeout_ms <= 0:
+        return _condition()
+
+    poll_ms = max(100, _ptr_wait_ms("PTR_MENU_TRIGGER_OPTION_POLL_MS", 250))
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        page.wait_for_timeout(poll_ms)
+        if _condition():
+            return True
+    return _condition()
+
+
+def _ptr_oracle_invoice_accounting_ready(page: Page | None) -> bool:
+    result = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+            const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                if (!style) return false;
+                if (style.display === "none" || style.visibility === "hidden") return false;
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const hasExactInteractiveText = (selector, expected) => {
+                for (const node of document.querySelectorAll(selector)) {
+                    if (!isVisible(node)) continue;
+                    if (normalize(node.innerText || node.textContent) === expected) return true;
+                }
+                return false;
+            };
+            return {
+                has_view_accounting: hasExactInteractiveText('button, [role="button"], a, [role="link"]', "view accounting"),
+                has_accounting_link: hasExactInteractiveText('a, [role="link"]', "accounting"),
+            };
+        }""",
+    )
+    if isinstance(result, dict):
+        return bool(result.get("has_view_accounting") or result.get("has_accounting_link"))
+    return False
+
+
+def _ptr_wait_for_menu_option_semantic_condition(
+    page: Page | None,
+    predicate,
+    *,
+    timeout_env_name: str,
+    default_timeout_ms: int,
+) -> bool:
+    if page is None:
+        return False
+
+    def _condition() -> bool:
+        try:
+            return bool(predicate())
+        except Exception:
+            return False
+
+    if _condition():
+        return True
+
+    timeout_ms = max(0, _ptr_wait_ms(timeout_env_name, default_timeout_ms))
+    if timeout_ms <= 0:
+        return _condition()
+
+    poll_ms = max(100, _ptr_wait_ms("PTR_MENU_OPTION_SEMANTIC_POLL_MS", 250))
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        page.wait_for_timeout(poll_ms)
+        if _condition():
+            return True
+    return _condition()
+
+
+def _ptr_oracle_menu_option_requires_semantic_validation(trigger_label: str, option_name: str) -> bool:
+    normalized_trigger = _ptr_normalize_text(trigger_label)
+    normalized_option = _ptr_normalize_text(option_name)
+    if normalized_trigger != "invoice actions":
+        return False
+    return normalized_option in {"validate", "account in final"}
+
+
+def _ptr_oracle_menu_option_semantic_postcondition(
+    page: Page | None,
+    trigger_label: str,
+    option_name: str,
+) -> bool | None:
+    if not _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
+        return None
+
+    normalized_option = _ptr_normalize_text(option_name)
+    if normalized_option == "validate":
+        return _ptr_wait_for_menu_option_semantic_condition(
+            page,
+            lambda: not _ptr_oracle_invoice_shows_not_validated(page),
+            timeout_env_name="PTR_INVOICE_VALIDATE_POSTCONDITION_TIMEOUT_MS",
+            default_timeout_ms=20000,
+        )
+    if normalized_option == "account in final":
+        return _ptr_wait_for_menu_option_semantic_condition(
+            page,
+            lambda: _ptr_oracle_invoice_accounting_ready(page),
+            timeout_env_name="PTR_INVOICE_ACCOUNTING_POSTCONDITION_TIMEOUT_MS",
+            default_timeout_ms=10000,
+        )
+    return None
+
+
+def _ptr_menu_option_failure_message(trigger_label: str, option_name: str) -> str:
+    if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
+        normalized_option = _ptr_normalize_text(option_name)
+        if normalized_option == "validate":
+            return 'Invoice Actions "Validate" did not clear the "Not validated" status.'
+        if normalized_option == "account in final":
+            return 'Invoice Actions "Account in Final" did not expose the Accounting action.'
+    return f'Menu panel "{trigger_label}" did not apply option "{option_name}".'
+
+
+def _ptr_menu_trigger_failure_message(trigger_label: str, option_name: str) -> str:
+    if _ptr_oracle_menu_trigger_requires_option_visibility(trigger_label):
+        return f'{trigger_label} did not expose menu option "{option_name}".'
+    return f'Menu panel "{trigger_label}" did not expose option "{option_name}".'
+
+
 def _ptr_checkbox_state(locator: Locator) -> str:
     metadata = _ptr_extract_locator_metadata(locator)
     if isinstance(metadata, dict):
@@ -1525,7 +1913,13 @@ def _ptr_option_selection_postcondition(
     trigger: Locator,
     option_locator: Locator,
     option_name: str,
+    *,
+    page: Page | None = None,
+    trigger_label: str = "",
 ) -> bool:
+    semantic_result = _ptr_oracle_menu_option_semantic_postcondition(page, trigger_label, option_name)
+    if semantic_result is not None:
+        return semantic_result
     observed = _ptr_locator_value(trigger) or _ptr_locator_text(trigger)
     if _ptr_value_matches(option_name, observed):
         return True
@@ -1657,6 +2051,8 @@ def _ptr_guided_flow_advanced(before: dict[str, Any], after: dict[str, Any]) -> 
     if before_footer != after_footer:
         if "continue" in before_footer and "continue" not in after_footer:
             return True
+        if "submit" in before_footer and "submit" not in after_footer:
+            return True
         if "submit" not in before_footer and "submit" in after_footer:
             return True
 
@@ -1782,6 +2178,138 @@ def _ptr_oracle_surface_type(page: Page | None, observation: dict[str, Any] | No
     if title:
         return "oracle_page"
     return "unknown"
+
+
+def _ptr_oracle_warning_dialog_state(page: Page | None) -> dict[str, Any]:
+    default_state = {
+        "dialog_count": 0,
+        "warning_visible": False,
+        "warning_title": "",
+        "warning_text": "",
+        "ok_button_visible": False,
+        "any_ok_button_visible": False,
+    }
+    result = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const selectors = ['[role="dialog"]', '[aria-modal="true"]', '.oj-dialog', '.oj-popup'];
+            const normalize = (value, limit = 1200) => String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+            const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                if (!style) return false;
+                if (style.display === "none" || style.visibility === "hidden") return false;
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const seen = new Set();
+            const dialogs = [];
+            for (const selector of selectors) {
+                for (const node of document.querySelectorAll(selector)) {
+                    if (!isVisible(node) || seen.has(node)) continue;
+                    seen.add(node);
+                    const titleNode = node.querySelector("[role='heading'], h1, h2, h3, .oj-dialog-title");
+                    const title = normalize(titleNode?.innerText || titleNode?.textContent, 160);
+                    const text = normalize(node.innerText || node.textContent, 1200);
+                    const buttonTexts = Array.from(node.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
+                        .filter(isVisible)
+                        .map((button) => normalize(
+                            button.innerText
+                            || button.textContent
+                            || button.getAttribute?.("aria-label")
+                            || button.getAttribute?.("value"),
+                            80,
+                        ).toLowerCase())
+                        .filter(Boolean);
+                    const lowerTitle = title.toLowerCase();
+                    const lowerText = text.toLowerCase();
+                    const warningLike = lowerTitle.includes("warning")
+                        || lowerText.startsWith("warning ")
+                        || lowerText.includes(" warning ")
+                        || lowerText.includes("duplicate");
+                    dialogs.push({
+                        title,
+                        text,
+                        has_ok_button: buttonTexts.includes("ok"),
+                        warning_like: warningLike,
+                    });
+                }
+            }
+            const warningDialog = dialogs.find((entry) => entry.warning_like) || null;
+            return {
+                dialog_count: dialogs.length,
+                warning_visible: Boolean(warningDialog),
+                warning_title: warningDialog ? warningDialog.title : "",
+                warning_text: warningDialog ? warningDialog.text : "",
+                ok_button_visible: Boolean(warningDialog && warningDialog.has_ok_button),
+                any_ok_button_visible: dialogs.some((entry) => entry.has_ok_button),
+            };
+        }""",
+    )
+    if not isinstance(result, dict):
+        return default_state
+    return {
+        "dialog_count": int(result.get("dialog_count") or 0),
+        "warning_visible": bool(result.get("warning_visible")),
+        "warning_title": str(result.get("warning_title") or "").strip(),
+        "warning_text": str(result.get("warning_text") or "").strip(),
+        "ok_button_visible": bool(result.get("ok_button_visible")),
+        "any_ok_button_visible": bool(result.get("any_ok_button_visible")),
+    }
+
+
+def _ptr_error_looks_like_missing_button(error: Any) -> bool:
+    error_text = _ptr_normalize_text(error)
+    if not error_text:
+        return False
+    if any(
+        snippet in error_text
+        for snippet in (
+            "strict mode violation",
+            "pointer events",
+            "intercepts",
+            "another element",
+        )
+    ):
+        return False
+    return (
+        ("waiting for" in error_text and "to be visible" in error_text)
+        or "not actionable" in error_text
+        or "resolved to 0 elements" in error_text
+        or "timeout" in error_text
+    )
+
+
+def _ptr_try_skip_optional_oracle_warning_ok(
+    page: Page | None,
+    locator: Locator | None,
+    label: str,
+    error: Any,
+    observation: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if _ptr_normalize_text(label) != "ok":
+        return None
+    current_observation = observation or _ptr_observe(page, locator)
+    try:
+        url = str(page.url or "").strip().lower() if page is not None else ""
+    except Exception:
+        url = ""
+    title = str((current_observation or {}).get("title") or "").strip().lower()
+    if not ("/faces/" in url or "fscmui" in url or "oracle" in title):
+        return None
+    if locator is not None and _ptr_locator_is_actionable(locator, timeout_ms=250):
+        return None
+    if not _ptr_error_looks_like_missing_button(error):
+        return None
+    warning_state = _ptr_oracle_warning_dialog_state(page)
+    if int(warning_state.get("dialog_count") or 0) > 0:
+        return None
+    return {
+        "label": label,
+        "surface_type": _ptr_oracle_surface_type(page, current_observation),
+        "dialog_count": 0,
+        "reason": "optional_warning_dialog_not_present",
+    }
 
 
 def _ptr_page_signature(page: Page | None, observation: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2634,13 +3162,21 @@ def _ptr_try_expand_oracle_quick_actions(page: Page, label: str) -> bool:
     return False
 
 
-def _ptr_try_oracle_quick_action_exact_match(page: Page, label: str, error: Any, postcondition) -> str:
+def _ptr_try_oracle_quick_action_exact_match(
+    page: Page,
+    label: str,
+    error: Any,
+    postcondition,
+    *,
+    allow_after_expand: bool = False,
+) -> str:
     error_text = str(error or "")
     lowered_error = error_text.lower()
-    if "strict mode violation" not in lowered_error:
-        return ""
-    if "get_by_role(\"link\"" not in error_text and "get_by_role('link'" not in error_text:
-        return ""
+    if not allow_after_expand:
+        if "strict mode violation" not in lowered_error:
+            return ""
+        if "get_by_role(\"link\"" not in error_text and "get_by_role('link'" not in error_text:
+            return ""
 
     label_text = str(label or "").strip()
     if not label_text:
@@ -3043,11 +3579,13 @@ def _ptr_tracked_action(action_type: str, label: str, fn, *args, **kwargs):
         )
         return result
     except Exception as exc:
+        current_page = _PTR_LAST_PAGE or page
+        _ptr_capture_step(action_type)
         _ptr_capture_failure_screenshot()
         _ptr_store_experience_episode(
             action_type=_ptr_normalize_runtime_action_name(getattr(fn, "__name__", action_type)),
             label=label,
-            page=page,
+            page=current_page,
             locator=primary_locator,
             error=exc,
             status="failed",
@@ -3060,7 +3598,7 @@ def _ptr_tracked_action(action_type: str, label: str, fn, *args, **kwargs):
             "failed",
             int((time.time() - start) * 1000),
             error=exc,
-            page=page,
+            page=current_page,
         )
         raise
 
@@ -3075,7 +3613,9 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
         raise RuntimeError(f'Action "{label}" completed but no postcondition changed.')
     except Exception as direct_exc:
         last_error: Exception = direct_exc
+        quick_actions_expanded = False
         if _ptr_try_expand_oracle_quick_actions(page, label):
+            quick_actions_expanded = True
             try:
                 _ptr_strict_click(locator)
                 after = _ptr_observe(page, locator)
@@ -3101,7 +3641,13 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
             except Exception as exc:
                 last_error = exc
 
-        quick_action_strategy = _ptr_try_oracle_quick_action_exact_match(page, label, last_error, postcondition)
+        quick_action_strategy = _ptr_try_oracle_quick_action_exact_match(
+            page,
+            label,
+            last_error,
+            postcondition,
+            allow_after_expand=quick_actions_expanded,
+        )
         if quick_action_strategy:
             _ptr_set_recovery_record(
                 "oracle_handler",
@@ -3158,6 +3704,32 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                 postcondition_passed=True,
             )
             return
+
+        if helper == "click_button_target":
+            optional_warning_skip = _ptr_try_skip_optional_oracle_warning_ok(
+                page,
+                locator,
+                label,
+                last_error,
+            )
+            if optional_warning_skip:
+                _ptr_set_recovery_record(
+                    "oracle_handler",
+                    "optional_warning_ok_absent",
+                    "oracle_optional_warning_ok_absent",
+                    optional_warning_skip,
+                )
+                _ptr_store_experience_episode(
+                    action_type=helper,
+                    label=label,
+                    page=page,
+                    locator=locator,
+                    error=last_error,
+                    status="success",
+                    postcondition_kind="dialog_absent",
+                    postcondition_passed=True,
+                )
+                return
 
         for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(page, helper, label, last_error, locator=locator):
             try:
@@ -3255,6 +3827,28 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
         raise RuntimeError(f'Textbox "{label}" did not reflect the requested value.')
     except Exception as direct_exc:
         last_error: Exception = direct_exc
+        try:
+            oracle_recovery = _ptr_try_oracle_table_active_editor_fill(current_page, locator, label, value)
+            if oracle_recovery:
+                _ptr_set_recovery_record(
+                    "oracle_handler",
+                    "oracle_table_active_editor_fill",
+                    "oracle_table_active_editor_fill",
+                    oracle_recovery,
+                )
+                _ptr_store_experience_episode(
+                    action_type="fill_textbox",
+                    label=label,
+                    page=current_page,
+                    locator=locator,
+                    error=direct_exc,
+                    status="success",
+                    postcondition_kind="field_value_changed",
+                    postcondition_passed=True,
+                )
+                return
+        except Exception as exc:
+            last_error = exc
         for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(current_page, "fill_textbox", label, direct_exc, locator=locator):
             try:
                 _ptr_record_strategy_attempt(strategy_name)
@@ -4030,6 +4624,35 @@ def _ptr_oracle_searchselect_state(page: Page | None) -> dict[str, Any]:
     return state if isinstance(state, dict) else {}
 
 
+def _ptr_oracle_searchselect_query_matches(state: dict[str, Any], requested_query: str) -> bool:
+    desired = _ptr_normalize_text(requested_query)
+    if not desired:
+        return True
+    actual = _ptr_normalize_text((state or {}).get("filter_value"))
+    return bool(actual) and actual == desired
+
+
+def _ptr_wait_for_oracle_searchselect_query(
+    page: Page | None,
+    requested_query: str,
+    *,
+    timeout_ms: int | None = None,
+) -> tuple[dict[str, Any], bool]:
+    timeout = timeout_ms or _ptr_wait_ms("PTR_SEARCH_QUERY_REFLECT_TIMEOUT_MS", 1500)
+    deadline = time.time() + max(timeout, 0) / 1000.0
+    last_state: dict[str, Any] = {}
+
+    while True:
+        last_state = _ptr_oracle_searchselect_state(page)
+        if _ptr_oracle_searchselect_query_matches(last_state, requested_query):
+            return last_state, True
+        if time.time() >= deadline:
+            return last_state, False
+        if page is None:
+            return last_state, False
+        page.wait_for_timeout(min(100, max(1, int((deadline - time.time()) * 1000))))
+
+
 def _ptr_select_search_trigger_option(
     trigger: Locator,
     option: Locator,
@@ -4042,11 +4665,12 @@ def _ptr_select_search_trigger_option(
     fill_value: str | None = None,
 ) -> None:
     _ptr_register_page(current_page)
+    search_timeout_ms = _ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000)
     if fill_value is not None:
         _ptr_enter_search_value(
             trigger,
             fill_value,
-            timeout_ms=_ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000),
+            timeout_ms=search_timeout_ms,
             current_page=current_page,
             label=title,
         )
@@ -4054,6 +4678,34 @@ def _ptr_select_search_trigger_option(
         _ptr_strict_click(trigger)
     current_page.wait_for_timeout(_ptr_wait_ms("PTR_SEARCH_RESULTS_WAIT_MS", 750))
     oracle_search_state = _ptr_oracle_searchselect_state(current_page)
+    if fill_value is not None:
+        oracle_search_state, query_reflected = _ptr_wait_for_oracle_searchselect_query(
+            current_page,
+            fill_value,
+            timeout_ms=_ptr_wait_ms("PTR_SEARCH_QUERY_REFLECT_TIMEOUT_MS", 1500),
+        )
+        if not query_reflected:
+            _ptr_enter_search_value(
+                trigger,
+                fill_value,
+                timeout_ms=search_timeout_ms,
+                current_page=current_page,
+                label=title,
+            )
+            current_page.wait_for_timeout(_ptr_wait_ms("PTR_SEARCH_RESULTS_WAIT_MS", 750))
+            oracle_search_state, query_reflected = _ptr_wait_for_oracle_searchselect_query(
+                current_page,
+                fill_value,
+                timeout_ms=_ptr_wait_ms("PTR_SEARCH_QUERY_REFLECT_TIMEOUT_MS", 1500),
+            )
+            if not query_reflected:
+                visible_query = (
+                    str(oracle_search_state.get("filter_value") or "").strip() or "unknown"
+                )
+                raise RuntimeError(
+                    f'Oracle search-select "{title}" did not reflect requested query "{fill_value}". '
+                    f'Visible query: "{visible_query}"'
+                )
     if bool(oracle_search_state.get("no_matches")):
         query_text = str(oracle_search_state.get("filter_value") or fill_value or option_name or "").strip()
         visible_state = str(oracle_search_state.get("live_text") or "No matches found").strip() or "No matches found"
@@ -4218,34 +4870,44 @@ def _ptr_select_adf_menu_panel_option(
     _ptr_register_page(current_page)
     _ptr_strict_click(trigger)
     current_page.wait_for_timeout(_ptr_wait_ms("PTR_MENU_OPEN_WAIT_MS", 350))
+    option_candidates = _ptr_menu_panel_option_candidates(current_page, option, option_name)
+    if not _ptr_wait_for_oracle_menu_trigger_option_visibility(current_page, option_candidates, trigger_label):
+        raise RuntimeError(_ptr_menu_trigger_failure_message(trigger_label, option_name))
     last_error: Exception | None = None
+    semantic_failure_after_click = False
     option_target = str(option_name or "").strip()
-    option_candidates = [
-        ("raw_option", option),
-        ("role_menuitem", current_page.get_by_role("menuitem", name=option_name)),
-        ("role_option", current_page.get_by_role("option", name=option_name)),
-        ("text_option", current_page.get_by_text(option_name, exact=True)),
-    ]
     for strategy_name, candidate in option_candidates:
         try:
-            resolved = candidate.first if hasattr(candidate, "first") else candidate
             _ptr_record_strategy_attempt(strategy_name)
-            before = _ptr_observe(current_page, resolved)
-            _ptr_strict_click(resolved)
+            before = _ptr_observe(current_page, candidate)
+            _ptr_strict_click(candidate)
             current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
-            after = _ptr_observe(current_page, resolved)
-            if _ptr_option_selection_postcondition(before, after, trigger, resolved, option_name):
+            after = _ptr_observe(current_page, candidate)
+            if _ptr_option_selection_postcondition(
+                before,
+                after,
+                trigger,
+                candidate,
+                option_name,
+                page=current_page,
+                trigger_label=trigger_label,
+            ):
                 _ptr_wait_for_field_processing(
                     current_page,
                     env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
                     default_ms=5000,
                 )
                 return
-            last_error = RuntimeError(f'Menu panel "{trigger_label}" did not apply option "{option_name}".')
+            last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
+            if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
+                semantic_failure_after_click = True
+                break
         except Exception as exc:
             last_error = exc
     if last_error is None:
-        last_error = RuntimeError(f'Menu panel "{trigger_label}" did not apply option "{option_name}".')
+        last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
+    if semantic_failure_after_click:
+        raise last_error
 
     for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(
         current_page,
@@ -4260,7 +4922,15 @@ def _ptr_select_adf_menu_panel_option(
             _ptr_strict_click(experience_locator)
             current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
             after_experience = _ptr_observe(current_page, experience_locator)
-            if _ptr_option_selection_postcondition(before_experience, after_experience, trigger, experience_locator, option_name):
+            if _ptr_option_selection_postcondition(
+                before_experience,
+                after_experience,
+                trigger,
+                experience_locator,
+                option_name,
+                page=current_page,
+                trigger_label=trigger_label,
+            ):
                 _ptr_wait_for_field_processing(
                     current_page,
                     env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
@@ -4289,9 +4959,14 @@ def _ptr_select_adf_menu_panel_option(
                     postcondition_passed=True,
                 )
                 return
-            last_error = RuntimeError(f'Experience strategy "{strategy_name}" did not apply menu option "{option_name}".')
+            last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
+            if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
+                semantic_failure_after_click = True
+                break
         except Exception as exc:
             last_error = exc
+    if semantic_failure_after_click:
+        raise last_error
 
     ai_candidates = _ptr_ai_repair_locators(
         current_page,
@@ -4309,7 +4984,15 @@ def _ptr_select_adf_menu_panel_option(
             _ptr_strict_click(ai_locator)
             current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
             after_ai = _ptr_observe(current_page, ai_locator)
-            if _ptr_option_selection_postcondition(before_ai, after_ai, trigger, ai_locator, option_name):
+            if _ptr_option_selection_postcondition(
+                before_ai,
+                after_ai,
+                trigger,
+                ai_locator,
+                option_name,
+                page=current_page,
+                trigger_label=trigger_label,
+            ):
                 _ptr_wait_for_field_processing(
                     current_page,
                     env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
@@ -4342,9 +5025,14 @@ def _ptr_select_adf_menu_panel_option(
                     postcondition_kind="option_selected",
                 )
                 return
-            last_error = RuntimeError(f'AI strategy "{strategy_name}" did not apply menu option "{option_name}".')
+            last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
+            if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
+                semantic_failure_after_click = True
+                break
         except Exception as exc:
-                last_error = exc
+            last_error = exc
+    if semantic_failure_after_click:
+        raise last_error
     if ai_candidates:
         _ptr_finalize_last_ai_interaction(
             repair_outcome="execution_failed",

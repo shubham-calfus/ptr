@@ -22,9 +22,15 @@ _AETHERION_HEADER_ICON = (
 
 
 def _get_bucket_name() -> str:
-    bucket_name = os.getenv("STORAGE_ACTIVITIES_BUCKET", "").strip()
+    # Match the rest of the runner (tools._get_bucket_name): TENANT_ID is the
+    # per-tenant bucket and wins when set; STORAGE_ACTIVITIES_BUCKET is the
+    # legacy fallback.
+    bucket_name = (
+        os.getenv("TENANT_ID", "").strip()
+        or os.getenv("STORAGE_ACTIVITIES_BUCKET", "").strip()
+    )
     if not bucket_name:
-        raise RuntimeError("STORAGE_ACTIVITIES_BUCKET is not configured.")
+        raise RuntimeError("Neither TENANT_ID nor STORAGE_ACTIVITIES_BUCKET is configured.")
     return bucket_name
 
 
