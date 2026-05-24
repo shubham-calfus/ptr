@@ -813,6 +813,15 @@ def _ptr_safe_page_eval(page: Page | None, expression: str, arg: Any | None = No
         return None
 
 
+def _ptr_locator_visible(locator: Locator, timeout_ms: int | None = None) -> bool:
+    timeout = max(50, int(timeout_ms or _ptr_int_env("PTR_LOCATOR_SNAPSHOT_TIMEOUT_MS", 250)))
+    try:
+        locator.wait_for(state="visible", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
 def _ptr_locator_value(locator: Locator) -> str:
     try:
         handle = _ptr_locator_element_handle(locator)
@@ -4585,6 +4594,18 @@ def _ptr_oracle_searchselect_state(page: Page | None) -> dict[str, Any]:
                 const rect = node.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
             };
+            const searchInputSelector = [
+                "input[role='combobox']",
+                "input.oj-inputtext-input",
+                "input.oj-searchselect-input",
+                "input.oj-searchselect-filter-text-field"
+            ].join(", ");
+            const inferHostIdFromFilterInput = (node) => {
+                const id = normalize(node?.id);
+                if (!id) return "";
+                const match = id.match(/^oj-searchselect-filter-(.+?)(?:\|input)?$/);
+                return normalize(match?.[1]);
+            };
 
             const hosts = Array.from(document.querySelectorAll("oj-select-single, oj-c-select-single"))
                 .filter((host) => {
@@ -4592,27 +4613,37 @@ def _ptr_oracle_searchselect_state(page: Page | None) -> dict[str, Any]:
                     return (
                         host.classList?.contains("oj-listbox-dropdown-open")
                         || Boolean(host.querySelector?.(".oj-searchselect-filter"))
+                        || Boolean(host.querySelector?.(".oj-searchselect-filter-text-field"))
                         || Boolean(host.querySelector?.("input[role='combobox'][aria-expanded='true']"))
                     );
                 });
 
-            let host = document.activeElement?.closest?.("oj-select-single, oj-c-select-single");
-            if (!host && hosts.length === 1) host = hosts[0];
-            if (!host || !isVisible(host)) return {};
+            const activeElement = document.activeElement;
+            const activeFilterInput = activeElement?.matches?.(searchInputSelector) ? activeElement : null;
+            const inferredHostId = inferHostIdFromFilterInput(activeFilterInput);
 
-            const liveRegion = host.querySelector?.(".oj-listbox-liveregion");
-            const filterInput = host.querySelector?.(
-                "input[role='combobox'], input.oj-inputtext-input, input.oj-searchselect-input"
-            );
+            let host = activeElement?.closest?.("oj-select-single, oj-c-select-single");
+            if (!host && inferredHostId) {
+                const inferredHost = document.getElementById(inferredHostId);
+                if (inferredHost?.matches?.("oj-select-single, oj-c-select-single")) {
+                    host = inferredHost;
+                }
+            }
+            if (!host && hosts.length === 1) host = hosts[0];
+            if (!host && !activeFilterInput) return {};
+            if (host && !isVisible(host) && !activeFilterInput) return {};
+
+            const liveRegion = host?.querySelector?.(".oj-listbox-liveregion");
+            const filterInput = activeFilterInput || host?.querySelector?.(searchInputSelector);
             const liveText = normalize(liveRegion?.innerText || liveRegion?.textContent);
-            const hostText = normalize(host.innerText || host.textContent);
+            const hostText = normalize(host?.innerText || host?.textContent);
             const filterValue = normalize(
                 (filterInput && "value" in filterInput ? filterInput.value : "")
                 || filterInput?.getAttribute?.("value")
             );
 
             return {
-                host_id: normalize(host.id),
+                host_id: normalize(host?.id || inferredHostId),
                 open: true,
                 no_matches: /no matches found/i.test(liveText || hostText),
                 live_text: liveText,
@@ -4666,6 +4697,8 @@ def _ptr_select_search_trigger_option(
 ) -> None:
     _ptr_register_page(current_page)
     search_timeout_ms = _ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000)
+    raw_option_timeout_ms = _ptr_wait_ms("PTR_SEARCH_RESULT_TIMEOUT_MS", 6000)
+    option_already_visible = False
     if fill_value is not None:
         _ptr_enter_search_value(
             trigger,
@@ -4699,6 +4732,8 @@ def _ptr_select_search_trigger_option(
                 timeout_ms=_ptr_wait_ms("PTR_SEARCH_QUERY_REFLECT_TIMEOUT_MS", 1500),
             )
             if not query_reflected:
+                option_already_visible = _ptr_locator_visible(option, timeout_ms=raw_option_timeout_ms)
+            if not query_reflected and not option_already_visible:
                 visible_query = (
                     str(oracle_search_state.get("filter_value") or "").strip() or "unknown"
                 )
@@ -4706,7 +4741,9 @@ def _ptr_select_search_trigger_option(
                     f'Oracle search-select "{title}" did not reflect requested query "{fill_value}". '
                     f'Visible query: "{visible_query}"'
                 )
-    if bool(oracle_search_state.get("no_matches")):
+    if bool(oracle_search_state.get("no_matches")) and not option_already_visible:
+        option_already_visible = _ptr_locator_visible(option, timeout_ms=min(raw_option_timeout_ms, 750))
+    if bool(oracle_search_state.get("no_matches")) and not option_already_visible:
         query_text = str(oracle_search_state.get("filter_value") or fill_value or option_name or "").strip()
         visible_state = str(oracle_search_state.get("live_text") or "No matches found").strip() or "No matches found"
         raise RuntimeError(
@@ -4715,7 +4752,6 @@ def _ptr_select_search_trigger_option(
         )
     last_error: Exception | None = None
     option_target = str(option_name or "").strip()
-    raw_option_timeout_ms = _ptr_wait_ms("PTR_SEARCH_RESULT_TIMEOUT_MS", 6000)
     option_candidates = [
         ("raw_option", option),
         ("role_option", current_page.get_by_role("option", name=option_name)),

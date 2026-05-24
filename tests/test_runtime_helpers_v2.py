@@ -1461,6 +1461,7 @@ def test_select_search_trigger_option_fails_clearly_when_oracle_query_never_refl
             "filter_value": "Supremo Candidate Selection Process",
         },
     )
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_visible", lambda *args, **kwargs: False)
 
     with pytest.raises(
         RuntimeError,
@@ -1476,6 +1477,130 @@ def test_select_search_trigger_option_fails_clearly_when_oracle_query_never_refl
         )
 
     assert entered == [("search", "Can"), ("search", "Can")]
+
+
+def test_select_search_trigger_option_proceeds_when_oracle_query_is_unknown_but_exact_option_is_visible(
+    monkeypatch,
+) -> None:
+    trigger = _SearchOptionLocator("search")
+    option = _SearchOptionLocator("raw-option")
+    page = _SearchOptionPage()
+    entered: list[tuple[str, str]] = []
+    clicked: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_enter_search_value",
+        lambda locator, value, timeout_ms=None, current_page=None, label="": entered.append((locator.name, value)),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_oracle_searchselect_query",
+        lambda *args, **kwargs: (
+            {
+                "open": True,
+                "no_matches": False,
+                "filter_value": "",
+            },
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_oracle_searchselect_state",
+        lambda current_page: {
+            "open": True,
+            "no_matches": False,
+            "filter_value": "",
+        },
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_visible", lambda locator, timeout_ms=None: locator.name == "raw-option")
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_strict_click",
+        lambda locator, timeout_ms=None: clicked.append(locator.name),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_observe",
+        lambda *args, **kwargs: {"dialog_count": 1, "body_marker": "state"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_option_selection_postcondition", lambda *args, **kwargs: True)
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+
+    helpers_v2._ptr_select_search_trigger_option(
+        trigger,
+        option,
+        page,
+        "Business Unit",
+        "US1 Business Unit",
+        option_exact=True,
+        fill_value="US1 Business Unit",
+    )
+
+    assert entered == [("search", "US1 Business Unit"), ("search", "US1 Business Unit")]
+    assert clicked == ["raw-option"]
+
+
+def test_select_search_trigger_option_proceeds_when_oracle_no_matches_state_is_stale_but_exact_option_is_visible(
+    monkeypatch,
+) -> None:
+    trigger = _SearchOptionLocator("search")
+    option = _SearchOptionLocator("raw-option")
+    page = _SearchOptionPage()
+    clicked: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_enter_search_value", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_oracle_searchselect_query",
+        lambda *args, **kwargs: (
+            {
+                "open": True,
+                "no_matches": True,
+                "live_text": "No matches found",
+                "filter_value": "US1 Business Unit",
+            },
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_oracle_searchselect_state",
+        lambda current_page: {
+            "open": True,
+            "no_matches": True,
+            "live_text": "No matches found",
+            "filter_value": "US1 Business Unit",
+        },
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_visible", lambda locator, timeout_ms=None: locator.name == "raw-option")
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_strict_click",
+        lambda locator, timeout_ms=None: clicked.append(locator.name),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_observe",
+        lambda *args, **kwargs: {"dialog_count": 1, "body_marker": "state"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_option_selection_postcondition", lambda *args, **kwargs: True)
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+
+    helpers_v2._ptr_select_search_trigger_option(
+        trigger,
+        option,
+        page,
+        "Business Unit",
+        "US1 Business Unit",
+        option_exact=True,
+        fill_value="US1 Business Unit",
+    )
+
+    assert clicked == ["raw-option"]
 
 
 def test_select_adf_menu_panel_option_fails_clearly_after_invoice_validate_semantic_failure(monkeypatch) -> None:
@@ -1640,6 +1765,7 @@ def test_select_search_trigger_option_fails_clearly_on_oracle_no_matches(monkeyp
         "_ptr_ai_repair_locators",
         lambda *args, **kwargs: ai_calls.append("called") or [],
     )
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_visible", lambda *args, **kwargs: False)
 
     with pytest.raises(
         RuntimeError,
