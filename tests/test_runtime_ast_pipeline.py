@@ -2,7 +2,7 @@ import pytest
 
 from src.runtime import helpers_v2
 from src.runtime.parser import ParseCoverageError, parse_script
-from src.runtime.script_generator import CoverageError, generate_full_script
+from src.runtime.script_generator import generate_full_script
 from src.tools.tools import _prepare_script_via_ast
 
 
@@ -101,7 +101,7 @@ def test_prepare_script_via_ast_tracks_goto_and_press_actions() -> None:
     ) in prepared
 
 
-def test_generate_full_script_rejects_unsafe_generic_locator_click() -> None:
+def test_generate_full_script_inlines_raw_fallback_for_unsafe_generic_locator_click() -> None:
     script = """
 def run(playwright):
     browser = playwright.chromium.launch(headless=False)
@@ -111,15 +111,27 @@ def run(playwright):
     browser.close()
 """
 
-    actions = parse_script(script)
+    generated = generate_full_script(parse_script(script))
 
-    with pytest.raises(CoverageError) as excinfo:
-        generate_full_script(actions)
+    assert "_ptr_tracked_raw_action('click', '.mystery-target'" in generated
+    assert "raw_inline_reason" in generated
+    assert "Click target does not map to a resilient helper" in generated
+    assert 'page.locator(".mystery-target").click()' in generated
 
-    message = str(excinfo.value)
-    assert "line 6" in message
-    assert "Click target does not map to a resilient helper" in message
-    assert 'page.locator(".mystery-target").click()' in message
+
+def test_prepare_script_via_ast_keeps_generic_locator_click_inline_in_ast_path() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.locator(".mystery-target").click()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert "_ptr_tracked_raw_action('click', '.mystery-target'" in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
 
 
 def test_prepare_script_via_ast_supports_select_option_actions() -> None:
@@ -229,7 +241,7 @@ def test_prepare_script_via_ast_supports_table_scoped_label_click_actions() -> N
     assert "Recording contains actions the AST runner does not safely support yet." not in prepared
 
 
-def test_generate_full_script_still_rejects_non_text_dblclick_actions() -> None:
+def test_generate_full_script_inlines_raw_fallback_for_non_text_dblclick_actions() -> None:
     script = """
 def run(playwright):
     browser = playwright.chromium.launch(headless=False)
@@ -239,20 +251,18 @@ def run(playwright):
     browser.close()
 """
 
-    actions = parse_script(script)
+    generated = generate_full_script(parse_script(script))
 
-    with pytest.raises(CoverageError) as excinfo:
-        generate_full_script(actions)
-
-    message = str(excinfo.value)
-    assert "line 6" in message
-    assert "Double-click target does not map to a resilient helper" in message
-    assert 'page.get_by_role("button", name="Open").dblclick()' in message
+    assert "_ptr_tracked_raw_action('dblclick', 'Open'" in generated
+    assert "raw_inline_reason" in generated
+    assert "Double-click target does not map to a resilient helper" in generated
+    assert 'page.get_by_role("button", name="Open").dblclick()' in generated
 
 
 def test_helpers_v2_exports_new_ast_click_helpers() -> None:
     assert "_ptr_dblclick_text_target" in helpers_v2.__all__
     assert "_ptr_click_table_field" in helpers_v2.__all__
+    assert "_ptr_tracked_raw_action" in helpers_v2.__all__
 
 
 def test_generate_full_script_supports_named_secondary_pages() -> None:

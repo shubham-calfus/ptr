@@ -449,6 +449,69 @@ def test_generate_html_report_content_renders_executed_script_from_artifact_key(
     report_generator._load_text_object.cache_clear()
 
 
+def test_generate_html_report_content_marks_raw_script_fallback_runs(monkeypatch) -> None:
+    script_key = "playwright-test-results/demo-suite/run-raw/demo-recording/executed_script.py"
+
+    def _fake_load_bytes(object_key: str | None) -> bytes | None:
+        if object_key == script_key:
+            return b"page.locator('.xen').first.click()\n"
+        return None
+
+    monkeypatch.setattr(report_generator, "_load_bytes", _fake_load_bytes)
+    report_generator._load_text_object.cache_clear()
+
+    html = generate_html_report_content(
+        test_suite_id="HCM_Raw_Fallback",
+        parent_run_id="run-raw-fallback",
+        results=[
+            _result(
+                recording_name="PO_Process_Requisitions",
+                status="failed",
+                duration_seconds=5,
+                executed_script_s3_key=script_key,
+                execution_mode="raw_script_fallback",
+                preparation_warning="AST generator found actions outside resilient helper coverage.",
+            )
+        ],
+    )
+
+    assert "Execution Mode" in html
+    assert "Raw Script Fallback" in html
+    assert "Preparation Fallback" in html
+    assert "Substituted raw recording executed after AST coverage fallback." in html
+
+    report_generator._load_text_object.cache_clear()
+
+
+def test_generate_html_report_content_counts_raw_inline_action_as_fallback() -> None:
+    html = generate_html_report_content(
+        test_suite_id="HCM_Raw_Inline",
+        parent_run_id="run-raw-inline",
+        results=[
+            _result(
+                recording_name="PO_Process_Requisitions",
+                status="failed",
+                duration_seconds=12,
+                action_log=[
+                    _action(
+                        step=1,
+                        action="click",
+                        label=".xen",
+                        status="failed",
+                        strategy="raw_inline",
+                        error="Locator.click: Timeout 30000ms exceeded.",
+                        script_data={"raw": 'page.locator(".xen").first.click()', "parsed_action": {}},
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert "Raw Inline" in html
+    assert '<span class="spill spill-fb">Fallback</span>' in html
+    assert '<span class="label">Fallback Steps</span><span class="value ">1</span>' in html
+
+
 def test_generate_html_report_content_masks_password_literals_in_execution_trace_and_script(monkeypatch) -> None:
     secret = "Abc&123!"
     script_key = "playwright-test-results/demo-suite/run-mask/HCM_Login/executed_script.py"

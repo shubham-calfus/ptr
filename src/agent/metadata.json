@@ -35,6 +35,21 @@
             "description": "Optional replacement Playwright script files.",
             "friendly_name": "Upload Script Files",
             "accepts": ".py"
+          },
+          {
+            "name": "resume_from_run_id",
+            "type": "string",
+            "field": "text",
+            "required": false,
+            "description": "Sequential mode only — paste a previous run ID to resume from its first failed recording. Leave empty to start fresh.",
+            "friendly_name": "Resume from run ID"
+          },
+          {
+            "name": "after_action_wait_ms",
+            "type": "number",
+            "required": false,
+            "description": "Milliseconds to wait after each action (settle time) before capturing the step. Leave empty to use the runner default. A per-recording value overrides this suite default.",
+            "friendly_name": "After-action wait (ms)"
           }
         ]
       }

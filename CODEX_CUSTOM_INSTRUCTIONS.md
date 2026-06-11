@@ -93,7 +93,8 @@ Script preparation rules:
 - The runner executes Python Playwright recordings only.
 - Keep generated recordings read-only.
 - Put resilience in the AST pipeline, optimizer, script generator, and runtime helpers, not in stored scripts.
-- Fail fast on unsupported action coverage instead of silently falling back to a legacy path.
+- If a single parsed action lacks AST helper coverage, allow one explicit inline raw-step fallback at that exact point and keep the rest of the recording on the AST/helper path.
+- If preparation fails before an action-level fallback is possible, allow one explicit fallback to the substituted raw recording and label that run clearly instead of reviving broad legacy fallback chains.
 
 Suite/data rules:
 - Parameter values can come from script defaults, workbook/CSV params files, and inline overrides.

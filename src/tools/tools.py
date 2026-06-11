@@ -140,6 +140,27 @@ def _env_flag(value: str | None, default: bool) -> bool:
     return raw_value.lower() not in ("false", "0", "no", "off")
 
 
+def _resolve_after_action_wait_ms(recording: dict[str, Any]) -> int | None:
+    """Optional per-recording override for the post-action settle wait (milliseconds).
+
+    Returns a non-negative int when the recording payload supplies a usable value
+    (key ``after_action_wait_ms``), otherwise ``None`` so the runtime helper falls
+    back to its built-in default.
+    """
+    raw_value = recording.get("after_action_wait_ms")
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+        return None
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid after_action_wait_ms=%r for recording %s",
+            raw_value,
+            recording.get("file") or recording.get("name") or "unknown",
+        )
+        return None
+
+
 def _split_storage_object_ref(object_ref: str) -> tuple[str, str]:
     raw = str(object_ref or "").strip()
     if not raw:
@@ -1954,18 +1975,22 @@ def _inject_runtime_helpers_v2(script_text: str) -> str:
     return _insert_after_future_imports(script_text, helper_import)
 
 
-def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] | None = None) -> str:
-    """AST-based script preparation pipeline.
+class UnsupportedActionCoverageError(RuntimeError):
+    """Raised when AST preparation cannot cover a recording safely."""
 
-    Uses the AST pipeline to:
-      1. AST parse → structured action list (catches ALL locator patterns)
-      2. Optimize → detect compound patterns (combobox+option, fill+enter, etc.)
-      3. Generate → produce script where every action routes through _ptr_* helpers
-      4. Import the clean runtime helper module used by prepared recordings
 
-    Known coverage gaps fail fast with an explicit error so we do not silently
-    replay unsupported raw actions through the old fallback-heavy runtime.
-    """
+def _normalize_script_for_execution_input(
+    script_text: str,
+    parameters: dict[str, Any] | None = None,
+) -> str:
+    _validate_python_playwright_script(script_text)
+    if parameters:
+        script_text = _substitute_parameters(script_text, parameters)
+    return script_text
+
+
+def _prepare_normalized_script_for_execution(script_text: str) -> str:
+    """Prepare an already validated/substituted Playwright script via AST."""
     try:
         from runtime.optimizer import optimize
         from runtime.parser import ParseCoverageError, parse_script
@@ -1974,10 +1999,6 @@ def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] |
         from src.runtime.optimizer import optimize
         from src.runtime.parser import ParseCoverageError, parse_script
         from src.runtime.script_generator import CoverageError, generate_full_script
-
-    _validate_python_playwright_script(script_text)
-    if parameters:
-        script_text = _substitute_parameters(script_text, parameters)
 
     try:
         actions = parse_script(script_text)
@@ -1993,7 +2014,7 @@ def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] |
             "AST pipeline rejected recording due to unsupported coverage: %s",
             exc,
         )
-        raise RuntimeError(
+        raise UnsupportedActionCoverageError(
             "Recording contains actions the AST runner does not safely support yet. "
             "Add helper coverage or adjust the recording before replaying it.\n"
             f"{exc}"
@@ -2011,6 +2032,35 @@ def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] |
     # Import the clean runtime helper module instead of embedding the legacy
     # helper blob into every prepared script.
     return _inject_runtime_helpers_v2(generated_script)
+
+
+def _resolve_executable_script(
+    script_text: str,
+    parameters: dict[str, Any] | None = None,
+) -> tuple[str, str, str | None]:
+    """Return the script that should execute plus the chosen execution mode."""
+    normalized_script = _normalize_script_for_execution_input(script_text, parameters)
+    try:
+        return _prepare_normalized_script_for_execution(normalized_script), "ast_prepared", None
+    except UnsupportedActionCoverageError as exc:
+        return normalized_script, "raw_script_fallback", str(exc)
+
+
+def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] | None = None) -> str:
+    """AST-based script preparation pipeline.
+
+    Uses the AST pipeline to:
+      1. AST parse → structured action list (catches ALL locator patterns)
+      2. Optimize → detect compound patterns (combobox+option, fill+enter, etc.)
+      3. Generate → produce script where supported actions route through _ptr_* helpers
+         and unsupported parsed actions get one inline raw-step fallback
+      4. Import the clean runtime helper module used by prepared recordings
+
+    Statement-level prep gaps still fail fast with an explicit error so we do
+    not silently revive the old fallback-heavy runtime.
+    """
+    normalized_script = _normalize_script_for_execution_input(script_text, parameters)
+    return _prepare_normalized_script_for_execution(normalized_script)
 
 
 def _prepare_script_via_ast(script_text: str, parameters: dict[str, Any] | None = None) -> str:
@@ -2102,6 +2152,8 @@ def _base_recording_result(recording: dict[str, Any]) -> dict[str, Any]:
         "page_semantics": {},
         "screenshot_s3_key": None,
         "executed_script_s3_key": None,
+        "execution_mode": None,
+        "preparation_warning": None,
         "video_s3_key": None,
         "video_s3_keys": [],
         "step_artifacts": [],
@@ -2275,14 +2327,22 @@ async def execute_recording_script(
                 + " | ".join(error_parts)
             )
 
-        prepared_script = _prepare_script_for_execution(
+        executable_script, execution_mode, preparation_warning = _resolve_executable_script(
             parameterised_script,
             execution_parameters or None,
         )
+        result["execution_mode"] = execution_mode
+        result["preparation_warning"] = preparation_warning
+        if preparation_warning:
+            logger.warning(
+                "Falling back to substituted raw script execution for %s due to unsupported AST coverage: %s",
+                file_key,
+                preparation_warning,
+            )
         try:
             result["executed_script_s3_key"] = _store_executed_script_artifact(
                 artifact_prefix,
-                prepared_script,
+                executable_script,
             )
         except Exception as exc:
             logger.warning("Failed to store executed script artifact for %s: %s", file_key, exc)
@@ -2294,7 +2354,7 @@ async def execute_recording_script(
     with tempfile.TemporaryDirectory(prefix="test-runner-") as temp_dir:
         working_dir = Path(temp_dir)
         script_path = working_dir / f"{_safe_segment(Path(file_key).stem)}.py"
-        script_path.write_text(prepared_script, encoding="utf-8")
+        script_path.write_text(executable_script, encoding="utf-8")
 
         diagnostics_path = working_dir / "diagnostics.json"
         failure_screenshot_path = working_dir / "failure.png"
@@ -2310,6 +2370,14 @@ async def execute_recording_script(
         env["PTR_EXPERIENCE_STORE_PATH"] = str(experience_store_path)
         env.setdefault("PTR_EXPERIENCE_ENABLED", "true")
         env.setdefault("PTR_RUNNER_VERSION", "ptr-v2")
+        after_action_wait_ms = _resolve_after_action_wait_ms(recording)
+        if after_action_wait_ms is not None:
+            env["PTR_AFTER_ACTION_WAIT_MS"] = str(after_action_wait_ms)
+            logger.info(
+                "Using per-recording after-action wait of %d ms for %s",
+                after_action_wait_ms,
+                file_key,
+            )
         if _env_flag(env.get("PTR_CAPTURE_STEPS"), True):
             step_artifacts_dir.mkdir(parents=True, exist_ok=True)
             env["PTR_STEP_ARTIFACTS_DIR"] = str(step_artifacts_dir)

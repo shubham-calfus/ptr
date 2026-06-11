@@ -34,6 +34,7 @@ __all__ = [
     "_ptr_capture_failure",
     "_ptr_write_diagnostics",
     "_ptr_tracked_action",
+    "_ptr_tracked_raw_action",
     "_ptr_goto_page",
     "_ptr_raw_click",
     "_ptr_raw_fill",
@@ -84,6 +85,9 @@ _PTR_EXPERIENCE_STORE_PATH = os.getenv("PTR_EXPERIENCE_STORE_PATH", "")
 _PTR_RUNNER_VERSION = str(os.getenv("PTR_RUNNER_VERSION", "ptr-v2")).strip() or "ptr-v2"
 _PTR_SUPPRESS_PATCH_CAPTURE = 0
 _PTR_LAST_PAGE_SNAPSHOT: dict[str, Any] = {}
+# Default settle wait applied after every tracked action. Overridable per run via the
+# PTR_AFTER_ACTION_WAIT_MS env var (set by the tool from the recording payload); this
+# literal is only the fallback when the caller does not provide a value.
 _PTR_HARDCODED_AFTER_ACTION_WAIT_MS = 10_000
 _PTR_STEEL_BROWSER_SESSION_IDS: dict[int, str] = {}
 _PTR_STEEL_RELEASE_SESSION_IDS: set[str] = set()
@@ -128,9 +132,12 @@ def _ptr_clone_json_value(value: Any) -> Any:
 def _ptr_set_script_data(payload: dict[str, Any] | None = None) -> None:
     global _PTR_SCRIPT_DATA
     if isinstance(payload, dict) and payload:
-        _PTR_SCRIPT_DATA = _ptr_clone_json_value(payload) or {}
+        cloned = _ptr_clone_json_value(payload) or {}
+        _PTR_SCRIPT_DATA = cloned
+        _PTR_CURRENT_STRATEGY["script_data"] = _ptr_clone_json_value(cloned) or {}
     else:
         _PTR_SCRIPT_DATA = {}
+        _PTR_CURRENT_STRATEGY["script_data"] = {}
 
 
 def _ptr_current_script_data() -> dict[str, Any]:
@@ -3559,8 +3566,9 @@ def _ptr_wait_after_interaction(page: Page | None) -> None:
     current_page = page or _PTR_LAST_PAGE
     if current_page is None:
         return
+    wait_ms = _ptr_wait_ms("PTR_AFTER_ACTION_WAIT_MS", _PTR_HARDCODED_AFTER_ACTION_WAIT_MS)
     try:
-        current_page.wait_for_timeout(_PTR_HARDCODED_AFTER_ACTION_WAIT_MS)
+        current_page.wait_for_timeout(wait_ms)
     except Exception:
         pass
     _ptr_capture_page_snapshot(current_page)
@@ -3596,6 +3604,59 @@ def _ptr_tracked_action(action_type: str, label: str, fn, *args, **kwargs):
             label=label,
             page=current_page,
             locator=primary_locator,
+            error=exc,
+            status="failed",
+            postcondition_kind="none",
+            postcondition_passed=False,
+        )
+        _ptr_finalize_action_log(
+            action_type,
+            label,
+            "failed",
+            int((time.time() - start) * 1000),
+            error=exc,
+            page=current_page,
+        )
+        raise
+
+
+def _ptr_tracked_raw_action(
+    action_type: str,
+    label: str,
+    raw_source: str,
+    global_scope: dict[str, Any],
+    local_scope: dict[str, Any],
+    *,
+    page: Page | None = None,
+    locator: Locator | None = None,
+):
+    current_page = page or _PTR_LAST_PAGE
+    if current_page is not None:
+        _ptr_register_page(current_page)
+    _ptr_reset_strategy_tracking(action_type, label)
+    _ptr_record_strategy_attempt("raw_inline")
+    start = time.time()
+    try:
+        exec(str(raw_source or ""), global_scope, local_scope)
+        current_page = _PTR_LAST_PAGE or current_page
+        _ptr_wait_after_interaction(current_page)
+        _ptr_capture_step(action_type)
+        _ptr_finalize_action_log(
+            action_type,
+            label,
+            "success",
+            int((time.time() - start) * 1000),
+            page=current_page,
+        )
+    except Exception as exc:
+        current_page = _PTR_LAST_PAGE or current_page
+        _ptr_capture_step(action_type)
+        _ptr_capture_failure_screenshot()
+        _ptr_store_experience_episode(
+            action_type=_ptr_normalize_runtime_action_name(action_type),
+            label=label,
+            page=current_page,
+            locator=locator,
             error=exc,
             status="failed",
             postcondition_kind="none",

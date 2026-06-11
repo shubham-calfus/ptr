@@ -48,6 +48,25 @@ def _merge_suite_context_into_recording(recording: dict[str, Any], suite_context
     return merged
 
 
+def _apply_suite_after_action_wait(
+    recording: dict[str, Any],
+    suite_after_action_wait_ms: Any,
+) -> dict[str, Any]:
+    """Apply a suite-level post-action settle wait to a recording.
+
+    A per-recording ``after_action_wait_ms`` always wins; the suite-level value is
+    only a default for recordings that do not set their own. The value is passed
+    through to the tool, which validates it (``_resolve_after_action_wait_ms``).
+    """
+    if suite_after_action_wait_ms is None:
+        return recording
+    if recording.get("after_action_wait_ms") is not None:
+        return recording
+    merged = dict(recording)
+    merged["after_action_wait_ms"] = suite_after_action_wait_ms
+    return merged
+
+
 def _merge_recording_outputs_into_suite_context(
     suite_context: dict[str, str],
     recording: dict[str, Any],
@@ -109,7 +128,9 @@ def _blocked_dependency_reason(
     return reason
 
 
-def _extract_trigger_payload(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str, str]:
+def _extract_trigger_payload(
+    payload: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], str, str, Any]:
     if isinstance(payload.get("0"), dict):
         trigger_data = payload["0"]
     elif isinstance(payload.get("triggers"), list) and payload["triggers"]:
@@ -125,7 +146,10 @@ def _extract_trigger_payload(payload: dict[str, Any]) -> tuple[str, list[dict[st
     if execution_mode not in {"parallel", "sequential"}:
         execution_mode = "parallel"
     resume_from_run_id = str(trigger_data.get("resume_from_run_id", "") or "").strip()
-    return test_suite_id, recordings, execution_mode, resume_from_run_id
+    # Optional suite-level post-action settle wait (ms). Validated downstream by the
+    # tool; a per-recording after_action_wait_ms overrides this suite default.
+    after_action_wait_ms = trigger_data.get("after_action_wait_ms")
+    return test_suite_id, recordings, execution_mode, resume_from_run_id, after_action_wait_ms
 
 
 async def _expand_recordings_for_parameter_rows(
@@ -203,7 +227,13 @@ async def _persist_child_failure_manifest(
 async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
     logger.info("Starting TestRunnerAgent with payload: %s", payload)
 
-    test_suite_id, recordings, execution_mode, resume_from_run_id = _extract_trigger_payload(payload)
+    (
+        test_suite_id,
+        recordings,
+        execution_mode,
+        resume_from_run_id,
+        suite_after_action_wait_ms,
+    ) = _extract_trigger_payload(payload)
 
     if not test_suite_id:
         return [{"type": "error", "message": "test_suite_id is required."}]
@@ -263,6 +293,7 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
         for idx, recording in enumerate(ordered_recordings, start=resume_offset):
             child_recording = _merge_suite_context_into_recording(recording, suite_context)
+            child_recording = _apply_suite_after_action_wait(child_recording, suite_after_action_wait_ms)
             child_payload = {
                 "recording": child_recording,
                 "test_suite_id": test_suite_id,
@@ -350,7 +381,7 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
             agentExecutor.execute(
                 "TestRunnerChild",
                 {
-                    "recording": recording,
+                    "recording": _apply_suite_after_action_wait(recording, suite_after_action_wait_ms),
                     "test_suite_id": test_suite_id,
                     "parent_run_id": parent_run_id,
                 },

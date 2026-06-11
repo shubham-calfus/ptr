@@ -230,6 +230,20 @@ def _result_status(result: dict[str, Any]) -> str:
     return "passed" if raw in {"passed", "success", "completed"} else "failed"
 
 
+def _action_has_fallback(action: dict[str, Any]) -> bool:
+    strategy = _safe_text(action.get("strategy")).strip().lower()
+    return (action.get("fallback_strategy_count") or 1) > 1 or strategy == "raw_inline"
+
+
+def _execution_mode_label(mode: Any) -> str:
+    raw = _safe_text(mode)
+    if raw == "ast_prepared":
+        return "AST Prepared"
+    if raw == "raw_script_fallback":
+        return "Raw Script Fallback"
+    return ""
+
+
 def _is_result_failed(result: dict[str, Any]) -> bool:
     return _result_status(result) == "failed"
 
@@ -276,6 +290,7 @@ def _strategy_label(strategy: Any) -> str:
     raw = str(strategy or "").strip()
     mapping = {
         "direct": "Raw Locator",
+        "raw_inline": "Raw Inline",
         "experience_lookup": "Experience",
         "ai_self_repair_lookup": "AI Repair",
         "oracle_select_single_arrowdown": "Oracle Select Handler",
@@ -306,6 +321,8 @@ def _strategy_tone(strategy: Any, index: int, last_index: int, status: str) -> s
         return "failed" if status == "failed" else "success"
     if raw == "direct":
         return "direct"
+    if raw == "raw_inline":
+        return "fallback"
     if raw.startswith("ai_") or raw == "ai_self_repair_lookup":
         return "ai"
     if raw.startswith("oracle_"):
@@ -337,6 +354,13 @@ def _chain_icon(strategy: Any, tone: str) -> str:
             '<svg viewBox="0 0 24 24" aria-hidden="true">'
             '<path d="M12 3l1.7 4.7L18.5 9.5l-4.8 1.8L12 16l-1.7-4.7-4.8-1.8 4.8-1.8L12 3z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/>'
             '<path d="M18 4l.7 1.9L20.6 6.6l-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7L18 4z" fill="currentColor"/>'
+            "</svg>"
+        )
+    if raw == "raw_inline":
+        return (
+            '<svg viewBox="0 0 24 24" aria-hidden="true">'
+            '<path d="M8 8l-3 4 3 4M16 8l3 4-3 4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+            '<path d="M11 18l2-12" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>'
             "</svg>"
         )
     if raw.startswith("ai_css"):
@@ -755,12 +779,16 @@ def _executed_script_block(result: dict[str, Any]) -> str:
     script_text = _load_text_object(script_key) if script_key else None
     if not script_text:
         return ""
+    execution_mode = _safe_text(result.get("execution_mode"))
+    subtitle = "Final prepared Python script for this run."
+    if execution_mode == "raw_script_fallback":
+        subtitle = "Substituted raw recording executed after AST coverage fallback."
     return (
         '<details class="recording-script-block executed-script-details">'
         '<summary class="executed-script-summary">'
         '<div class="executed-script-summary-main">'
         '<div class="trace-title">Executed Script</div>'
-        '<div class="trace-subtitle">Final prepared Python script for this run.</div>'
+        f'<div class="trace-subtitle">{escape(subtitle)}</div>'
         "</div>"
         '<span class="executed-script-chevron"></span>'
         "</summary>"
@@ -770,6 +798,19 @@ def _executed_script_block(result: dict[str, Any]) -> str:
         "</div>"
         "</div>"
         "</details>"
+    )
+
+
+def _preparation_warning_block(result: dict[str, Any]) -> str:
+    warning = _safe_text(result.get("preparation_warning"))
+    if not warning:
+        return ""
+    return (
+        '<div class="detail-card">'
+        '<div class="dc-title">Preparation Fallback</div>'
+        '<div class="dc-copy">AST coverage did not handle this recording, so the runner executed the substituted raw script instead.</div>'
+        f'<pre class="code-block">{escape(warning)}</pre>'
+        "</div>"
     )
 
 
@@ -1039,7 +1080,7 @@ def _step_item(action: dict[str, Any], action_index: int, result: dict[str, Any]
     label = _safe_text(action.get("label"))
     value = _safe_text(((action.get("script_data") or {}).get("parsed_action") or {}).get("value"))
     status = "failed" if action.get("status") == "failed" else "success"
-    has_fallback = (action.get("fallback_strategy_count") or 1) > 1
+    has_fallback = _action_has_fallback(action)
     has_ai = bool(action.get("ai_interactions"))
     has_recovery = bool(action.get("recovery"))
     step_image = _step_image_data_uri(result, action)
@@ -1179,8 +1220,9 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
     passed_actions = sum(1 for action in actions if action.get("status") == "success")
     failed_actions = len(actions) - passed_actions
     ai_repairs = sum(len(action.get("ai_interactions") or []) for action in actions)
-    fallback_actions = sum(1 for action in actions if (action.get("fallback_strategy_count") or 1) > 1)
+    fallback_actions = sum(1 for action in actions if _action_has_fallback(action))
     open_attr = " open" if status == "failed" else ""
+    execution_mode = _execution_mode_label(result.get("execution_mode"))
 
     meta_cards = [
         ("Status", escape(status), "r" if status == "failed" else "g", False),
@@ -1189,6 +1231,8 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
         ("AI Repairs", escape(str(ai_repairs)), "", False),
         ("Fallback Steps", escape(str(fallback_actions)), "", False),
     ]
+    if execution_mode:
+        meta_cards.append(("Execution Mode", escape(execution_mode), "", False))
 
     params_block = ""
     if parameters:
@@ -1205,6 +1249,7 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
 
     flow_context_block = _flow_context_block(result)
     executed_script_block = _executed_script_block(result)
+    preparation_warning_block = _preparation_warning_block(result)
 
     trace_body = (
         "".join(_step_item(action, action_index, result, result_index) for action_index, action in enumerate(actions))
@@ -1239,6 +1284,7 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
         + "</div>"
         + params_block
         + flow_context_block
+        + preparation_warning_block
         + executed_script_block
         + '<div class="trace-section">'
         '<div class="trace-head">'
@@ -1275,7 +1321,7 @@ def generate_html_report_content(
         1
         for result in normalized_results
         for action in (result.get("action_log") or [])
-        if (action.get("fallback_strategy_count") or 1) > 1
+        if _action_has_fallback(action)
     )
     total_duration = sum(float(result.get("duration_seconds") or 0) for result in normalized_results)
     suite_status = "failed" if failed_runs else "passed"

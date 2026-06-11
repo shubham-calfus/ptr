@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from src.tools.tools import (
+    UnsupportedActionCoverageError,
     _call_openai_failure_summary,
     _collect_unresolved_execution_parameters,
     _default_experience_store_path,
@@ -22,6 +23,7 @@ from src.tools.tools import (
     _parse_excel_parameter_sets,
     _parse_excel_parameters,
     _prepare_script_for_execution,
+    _resolve_executable_script,
     _run_python_script,
     _split_storage_object_ref,
     _store_executed_script_artifact,
@@ -125,6 +127,45 @@ def test_store_executed_script_artifact_uploads_prepared_script(monkeypatch) -> 
     assert captured["object_key"] == object_key
     assert captured["payload"] == b"print('ready to run')\n"
     assert captured["content_type"] == "text/x-python"
+
+
+def test_resolve_executable_script_falls_back_to_substituted_raw_script(monkeypatch) -> None:
+    script = """
+from playwright.sync_api import Playwright, sync_playwright
+
+
+def run(playwright: Playwright) -> None:
+    browser = playwright.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto("{{url}}")
+    page.locator(".xen").first.click()
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
+"""
+
+    def _raise_unsupported(script_text: str) -> str:
+        raise UnsupportedActionCoverageError(
+            "Recording contains actions the AST runner does not safely support yet.\n"
+            "page.locator(\".xen\").first.click()"
+        )
+
+    monkeypatch.setattr(
+        "src.tools.tools._prepare_normalized_script_for_execution",
+        _raise_unsupported,
+    )
+
+    executable_script, execution_mode, preparation_warning = _resolve_executable_script(
+        script,
+        {"url": "https://example.com/app"},
+    )
+
+    assert execution_mode == "raw_script_fallback"
+    assert preparation_warning is not None
+    assert 'page.goto("https://example.com/app")' in executable_script
+    assert 'page.locator(".xen").first.click()' in executable_script
 
 
 def test_load_resume_state_from_run_data_starts_from_first_failed_recording(monkeypatch) -> None:

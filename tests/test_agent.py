@@ -4,9 +4,11 @@ import pytest
 
 from src.agent.agent import (
     TestRunnerAgent,
+    _apply_suite_after_action_wait,
     _build_suite_context_from_previous_results,
     _blocked_dependency_reason,
     _expand_recordings_for_parameter_rows,
+    _extract_trigger_payload,
     _merge_recording_outputs_into_suite_context,
     _merge_suite_context_into_recording,
 )
@@ -82,6 +84,51 @@ def test_merge_suite_context_into_recording_keeps_context_available_for_downstre
 
     assert merged["parameters"]["requisition_id"] == "REQ-10025"
     assert merged["parameters"]["search_value"] == "{{requisition_id}}"
+
+
+def test_extract_trigger_payload_reads_suite_after_action_wait() -> None:
+    (
+        test_suite_id,
+        recordings,
+        execution_mode,
+        resume_from_run_id,
+        suite_after_action_wait_ms,
+    ) = _extract_trigger_payload(
+        {
+            "test_suite_id": "Suite",
+            "recordings": [{"file": "recordings/a.py"}],
+            "after_action_wait_ms": 3000,
+        }
+    )
+
+    assert test_suite_id == "Suite"
+    assert recordings == [{"file": "recordings/a.py"}]
+    assert execution_mode == "parallel"
+    assert resume_from_run_id == ""
+    assert suite_after_action_wait_ms == 3000
+
+
+def test_apply_suite_after_action_wait_sets_default_when_recording_has_none() -> None:
+    merged = _apply_suite_after_action_wait({"file": "recordings/a.py"}, 3000)
+
+    assert merged["after_action_wait_ms"] == 3000
+
+
+def test_apply_suite_after_action_wait_respects_per_recording_override() -> None:
+    recording = {"file": "recordings/a.py", "after_action_wait_ms": 1000}
+
+    merged = _apply_suite_after_action_wait(recording, 3000)
+
+    assert merged["after_action_wait_ms"] == 1000
+
+
+def test_apply_suite_after_action_wait_noop_when_suite_value_absent() -> None:
+    recording = {"file": "recordings/a.py"}
+
+    merged = _apply_suite_after_action_wait(recording, None)
+
+    assert "after_action_wait_ms" not in merged
+    assert merged is recording
 
 
 def test_merge_recording_outputs_into_suite_context_keeps_bare_and_namespaced_keys() -> None:

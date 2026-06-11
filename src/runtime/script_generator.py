@@ -3,8 +3,9 @@ Script generator for Playwright recordings.
 
 Takes an optimized action list and generates a Python script where supported
 actions are routed through the appropriate _ptr_* helper function. If a parsed
-action still falls outside resilient helper coverage, the generator raises a
-coverage error instead of emitting a silent raw fallback.
+action still falls outside resilient helper coverage, the generator emits one
+explicit inline raw-step fallback for that action instead of dropping the whole
+recording out of the AST path.
 
 The generated script is executed by subprocess.run() just like the old pipeline.
 The _ptr_* runtime helpers are imported by tools.py from the dedicated
@@ -153,6 +154,48 @@ def _tracked_action_lines(
     ]
 
 
+def _tracked_raw_action_lines(
+    action: Action,
+    label: str,
+    page_var: str,
+    *,
+    reason: str,
+    primary_locator_expr: str | None = None,
+) -> list[str]:
+    raw_source = str(action.raw or "").strip()
+    if not raw_source:
+        _raise_coverage_error(action, reason)
+
+    script_data = _build_script_data(
+        action,
+        f"raw_inline_{action.type}",
+        "_ptr_tracked_raw_action",
+        page_var,
+        primary_locator_expr=primary_locator_expr,
+        extra={
+            "raw_inline": True,
+            "raw_inline_reason": reason,
+        },
+    )
+
+    call_args = [
+        _escape(action.type),
+        _escape(label),
+        _escape(raw_source),
+        "globals()",
+        "locals()",
+    ]
+    if page_var:
+        call_args.append(f"page={page_var}")
+    if primary_locator_expr is not None:
+        call_args.append(f"locator={primary_locator_expr}")
+
+    return [
+        f"    _ptr_set_script_data({_escape(script_data)})",
+        f"    _ptr_tracked_raw_action({', '.join(call_args)})",
+    ]
+
+
 def _format_action_preview(action: Action) -> str:
     preview = " ".join(str(action.raw or "").split())
     if len(preview) > 160:
@@ -292,6 +335,15 @@ def _specific_locator_label(action: Action) -> str:
                 if value:
                     return value
     return str(action.name or action.selector or "").strip()
+
+
+def _raw_fallback_label(action: Action) -> str:
+    return (
+        _specific_locator_label(action)
+        or str(action.option_value or "").strip()
+        or str(action.key or "").strip()
+        or str(action.type or "raw_step").replace("_", " ").strip()
+    )
 
 
 def _is_table_label_click(action: Action) -> bool:
@@ -980,22 +1032,6 @@ def generate_run_body(actions: list[Action]) -> str:
     """
     lines: list[str] = []
     page_var = "page"
-    coverage_issues: list[str] = []
-
-    for action in actions:
-        reason = _unsupported_action_reason(action)
-        if reason is None:
-            continue
-        coverage_issues.append(
-            f"- line {action.line}: {reason}\n"
-            f"  source: {_format_action_preview(action)}"
-        )
-
-    if coverage_issues:
-        raise CoverageError(
-            "AST generator found actions outside resilient helper coverage:\n"
-            + "\n".join(coverage_issues)
-        )
 
     for i, action in enumerate(actions):
         next_action = actions[i + 1] if i + 1 < len(actions) else None
@@ -1005,6 +1041,22 @@ def generate_run_body(actions: list[Action]) -> str:
             "setup_browser", "setup_context", "close_context", "close_browser",
         ):
             page_var = action.page_var
+
+        reason = _unsupported_action_reason(action)
+        if reason is not None:
+            locator_expr = _build_locator_expr(page_var, action.locator_steps) if action.locator_steps else None
+            lines.extend(
+                _tracked_raw_action_lines(
+                    action,
+                    _raw_fallback_label(action),
+                    page_var,
+                    reason=reason,
+                    primary_locator_expr=locator_expr,
+                )
+            )
+            wait_lines = _gen_post_click_wait(action, next_action, page_var)
+            lines.extend(wait_lines)
+            continue
 
         generator = _GENERATORS.get(action.type)
         if generator is None:

@@ -597,6 +597,34 @@ def test_tracked_action_failure_captures_step_before_failure_screenshot(monkeypa
     assert events == ["step:click_button", "failure_screenshot"]
 
 
+def test_tracked_raw_action_records_raw_inline_strategy(monkeypatch) -> None:
+    page = _NavigationPage()
+    captured_steps: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE", page)
+    monkeypatch.setattr(helpers_v2, "_PTR_ACTION_LOG", [])
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_step", lambda action_type: captured_steps.append(action_type))
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_failure_screenshot", lambda: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: None)
+    helpers_v2._ptr_set_script_data({"raw": "calls.append('ran')"})
+
+    local_scope = {"calls": []}
+
+    helpers_v2._ptr_tracked_raw_action(
+        "click",
+        ".xen",
+        "calls.append('ran')",
+        {},
+        local_scope,
+        page=page,
+    )
+
+    assert local_scope["calls"] == ["ran"]
+    assert captured_steps == ["click"]
+    assert helpers_v2._PTR_ACTION_LOG[0]["strategy"] == "raw_inline"
+    assert helpers_v2._PTR_ACTION_LOG[0]["label"] == ".xen"
+
+
 def test_wait_after_interaction_captures_page_snapshot_with_hardcoded_delay(monkeypatch) -> None:
     page = _SnapshotPage()
 
@@ -609,6 +637,28 @@ def test_wait_after_interaction_captures_page_snapshot_with_hardcoded_delay(monk
     assert helpers_v2._PTR_LAST_PAGE_SNAPSHOT["page_title"] == "Create Job Requisition - Oracle Fusion Cloud Applications"
     assert helpers_v2._PTR_LAST_PAGE_SNAPSHOT["page_text"] == "Requisition REQ-10025 created successfully"
     assert helpers_v2._PTR_LAST_PAGE_SNAPSHOT["oracle_tables"][0]["rows"][0][1] == "1003"
+
+
+def test_wait_after_interaction_honors_env_override(monkeypatch) -> None:
+    page = _SnapshotPage()
+
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE_SNAPSHOT", {})
+    monkeypatch.setenv("PTR_AFTER_ACTION_WAIT_MS", "2000")
+
+    helpers_v2._ptr_wait_after_interaction(page)
+
+    assert page.waits == [2_000]
+
+
+def test_wait_after_interaction_falls_back_to_default_on_bad_override(monkeypatch) -> None:
+    page = _SnapshotPage()
+
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE_SNAPSHOT", {})
+    monkeypatch.setenv("PTR_AFTER_ACTION_WAIT_MS", "not-a-number")
+
+    helpers_v2._ptr_wait_after_interaction(page)
+
+    assert page.waits == [helpers_v2._PTR_HARDCODED_AFTER_ACTION_WAIT_MS]
 
 
 def test_write_diagnostics_persists_oracle_tables(tmp_path, monkeypatch) -> None:
@@ -1972,6 +2022,7 @@ def test_runtime_exports_legacy_failure_hooks_for_generated_wrapper() -> None:
     assert "_ptr_capture_failure" in helpers_v2.__all__
     assert "_ptr_write_diagnostics" in helpers_v2.__all__
     assert "_ptr_wait_after_interaction" in helpers_v2.__all__
+    assert "_ptr_tracked_raw_action" in helpers_v2.__all__
 
 
 def test_try_oracle_home_search_uses_search_box_before_ai(monkeypatch) -> None:

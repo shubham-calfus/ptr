@@ -26,14 +26,10 @@ Before publishing, validate it locally with:
 - The runner executes scripts directly in its own worker process; it does not proxy execution through Phantom.
 - Script execution uses `python3` by default.
 - You can override the interpreter with `PLAYWRIGHT_TEST_PYTHON_BIN`.
-- Set `PTR_BROWSER_PROVIDER=steel` to require Steel explicitly and fail fast if the API key is missing.
-- Set `PTR_BROWSER_PROVIDER=local` to require local Chromium explicitly.
-- If `PTR_BROWSER_PROVIDER` is unset, `PTR_IS_LOCAL_ENV=true` forces local Chromium for local development.
-- If `PTR_BROWSER_PROVIDER` is unset and `PTR_IS_LOCAL_ENV` is not true, the runner uses Steel whenever `STEEL_API_KEY` is present; otherwise it falls back to local Chromium.
-- Local Chromium launch honors `PTR_CHROMIUM_EXECUTABLE_PATH` first, then `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`, then Playwright's `channel="chromium"` fallback.
-- `STEEL_SESSION_ID` optionally reuses an existing Steel session instead of creating a new one.
-- `STEEL_CONNECT_URL` optionally overrides the Steel CDP endpoint.
-- `PTR_STEEL_CONNECT_RETRIES` and `PTR_STEEL_SESSION_TIMEOUT_MS` tune Steel connection retries and session lifetime.
+- The runner is pinned to local Chromium for replay; it does not select Steel for execution.
+- Local Chromium launch checks `PTR_CHROMIUM_EXECUTABLE_PATH`, `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`, `/usr/bin/chromium`, `/usr/bin/chromium-browser`, `/usr/lib/chromium/chrome`, and Playwright cache paths.
+- If Chromium is missing, the runner attempts `python -m playwright install chromium` once by default before failing.
+- Set `PTR_AUTO_INSTALL_CHROMIUM=false` to disable that install attempt and fail immediately.
 
 ## AI failure summaries
 
