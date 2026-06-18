@@ -88,6 +88,33 @@ def run(playwright):
     assert optimized[2].value == "Delete"
 
 
+def test_optimize_merges_oracle_compact_text_menu_trigger_with_following_text_click() -> None:
+    script = """
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.get_by_text("ActionsValidateReprice").click()
+    page.get_by_text("Edit Additional Information").click()
+    browser.close()
+"""
+
+    optimized = optimize(parse_script(script))
+
+    assert [action.type for action in optimized] == [
+        "setup_browser",
+        "setup_page",
+        "adf_menu_select",
+        "close_browser",
+    ]
+    assert optimized[2].name == "ActionsValidateReprice"
+    assert optimized[2].value == "Edit Additional Information"
+    assert optimized[2].action_kwargs == {
+        "trigger_kind": "text",
+        "option_name": "Edit Additional Information",
+        "option_exact": None,
+    }
+
+
 def test_optimize_preserves_exact_day_match_for_date_pick() -> None:
     script = """
 def run(playwright):

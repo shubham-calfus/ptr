@@ -4,10 +4,12 @@ from typing import Any
 
 from src.tools.tools import (
     UnsupportedActionCoverageError,
+    _apply_recording_debug_env_overrides,
     _call_openai_failure_summary,
     _collect_unresolved_execution_parameters,
     _default_experience_store_path,
     _derive_parameters_file_candidates,
+    _effective_debug_settings,
     _extract_table_parameter_sets,
     _load_resume_state_from_run_data,
     _extract_flow_context_outputs,
@@ -508,6 +510,41 @@ def test_merge_runner_env_defaults_keeps_explicit_env_values(tmp_path) -> None:
     assert merged["PTR_RECORD_VIDEO"] == "false"
     assert merged["PTR_POST_CLICK_WAIT_MS"] == "900"
     assert merged["CUSTOM_VALUE"] == "present"
+
+
+def test_apply_recording_debug_env_overrides_and_collect_effective_debug_settings() -> None:
+    env = {
+        "PTR_CAPTURE_STEPS": "true",
+        "PTR_RECORD_VIDEO": "false",
+        "PTR_STEP_SCREENSHOT_FULL_PAGE": "false",
+        "PTR_AFTER_ACTION_WAIT_MS": "10000",
+        "PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS": "12000",
+        "PTR_DEBUG_TRACE": "false",
+    }
+
+    merged = _apply_recording_debug_env_overrides(
+        env,
+        {
+            "file": "recordings/demo.py",
+            "debug_trace": True,
+            "debug_record_video": True,
+            "debug_full_page_steps": True,
+            "debug_page_text_max_chars": 24000,
+        },
+    )
+
+    assert merged["PTR_DEBUG_TRACE"] == "true"
+    assert merged["PTR_RECORD_VIDEO"] == "true"
+    assert merged["PTR_STEP_SCREENSHOT_FULL_PAGE"] == "true"
+    assert merged["PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS"] == "24000"
+    assert _effective_debug_settings(merged) == {
+        "after_action_wait_ms": 10000,
+        "capture_steps": True,
+        "record_video": True,
+        "step_screenshot_full_page": True,
+        "page_text_snapshot_max_chars": 24000,
+        "debug_trace": True,
+    }
 
 
 def test_run_python_script_uses_xvfb_when_available(monkeypatch, tmp_path: Path) -> None:
@@ -1217,7 +1254,7 @@ def test_extract_flow_context_outputs_falls_back_to_ai_when_needed(monkeypatch) 
         return {
             "status": "success",
             "feature": "flow_context_extraction",
-            "model": "gpt-4.1-mini",
+            "model": "gpt-5.4-mini",
             "system_prompt": "system",
             "user_prompt": "user",
             "response_text": '{"value":"1004","reason":"Found in confirmation banner","source":"page_text","confidence":"high"}',
@@ -1257,4 +1294,4 @@ def test_extract_flow_context_outputs_falls_back_to_ai_when_needed(monkeypatch) 
     assert errors == []
     assert details[0]["source"] == "ai"
     assert details[0]["attempts"][-1]["source"] == "ai"
-    assert details[0]["ai_interaction"]["model"] == "gpt-4.1-mini"
+    assert details[0]["ai_interaction"]["model"] == "gpt-5.4-mini"

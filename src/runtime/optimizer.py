@@ -65,6 +65,10 @@ def _normalize(value: str) -> str:
     return " ".join(str(value or "").lower().split())
 
 
+def _normalize_compact(value: str) -> str:
+    return "".join(ch for ch in _normalize(value) if ch.isalnum())
+
+
 def _is_login_field(name: str | None) -> bool:
     if not name:
         return False
@@ -89,6 +93,25 @@ def _is_menu_like_link(action: Action | None) -> bool:
         return False
     normalized = _normalize(action.name)
     return any(keyword in normalized for keyword in _MENU_TRIGGER_LINK_KEYWORDS)
+
+
+def _is_menu_like_text_trigger(action: Action | None) -> bool:
+    if not (
+        action
+        and action.type == "click"
+        and action.locator_method == "get_by_text"
+        and action.name
+    ):
+        return False
+    normalized = _normalize(action.name)
+    compact = _normalize_compact(action.name)
+    if any(keyword == normalized or keyword in normalized for keyword in _MENU_TRIGGER_LINK_KEYWORDS):
+        return True
+    if any(compact.startswith(keyword) for keyword in _MENU_TRIGGER_LINK_KEYWORDS):
+        # Oracle ADF menu triggers sometimes flatten visible trigger text and menu item
+        # text into a single get_by_text target, e.g. "ActionsValidateReprice".
+        return compact != "search"
+    return False
 
 
 def _is_navigation_button_click(action: Action | None) -> bool:
@@ -450,16 +473,17 @@ def optimize(actions: list[Action]) -> list[Action]:
             i += 2
             continue
 
-        # --- Pattern: ADF menu trigger (get_by_title / menu-like link) + text option ---
+        # --- Pattern: ADF menu trigger (get_by_title / menu-like link / Oracle text trigger) + text option ---
         if (
             action.type == "click"
-            and action.locator_method in ("get_by_title", "get_by_role")
+            and action.locator_method in ("get_by_title", "get_by_role", "get_by_text")
             and action.name
             and not (action.name or "").lower().startswith("search:")
             and "select date" not in (action.name or "").lower()
             and (
                 action.locator_method == "get_by_title"
                 or _is_menu_like_link(action)
+                or _is_menu_like_text_trigger(action)
             )
             and i + 1 < n
             and actions[i + 1].type == "click"
@@ -467,6 +491,8 @@ def optimize(actions: list[Action]) -> list[Action]:
         ):
             option_action = actions[i + 1]
             trigger_kind = "title" if action.locator_method == "get_by_title" else "link"
+            if action.locator_method == "get_by_text":
+                trigger_kind = "text"
             merged = Action(
                 type="adf_menu_select",
                 line=action.line,

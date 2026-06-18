@@ -303,6 +303,28 @@ def test_prepare_script_via_ast_keeps_home_navigation_and_followup_click_separat
     assert "_ptr_tracked_action('adf_menu_select', 'Home'" not in prepared
 
 
+def test_prepare_script_via_ast_merges_oracle_compact_text_menu_trigger_with_option() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.get_by_text("ActionsValidateReprice").click()
+    page.get_by_text("Edit Additional Information").click()
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert (
+        "_ptr_tracked_action('adf_menu_select', 'ActionsValidateReprice', "
+        "_ptr_select_adf_menu_panel_option, page.get_by_text('ActionsValidateReprice'), "
+        "page.get_by_text('Edit Additional Information'), page, 'ActionsValidateReprice', "
+        "'Edit Additional Information', trigger_kind='text')"
+    ) in prepared
+    assert "_ptr_tracked_action('click_text', 'ActionsValidateReprice'" not in prepared
+    assert "_ptr_tracked_action('click_text', 'Edit Additional Information'" not in prepared
+    assert "Recording contains actions the AST runner does not safely support yet." not in prepared
+
+
 def test_prepare_script_via_ast_supports_role_row_clicks() -> None:
     script = _full_recording(
         """    browser = playwright.chromium.launch(headless=False)

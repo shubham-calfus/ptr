@@ -5,6 +5,7 @@ import pytest
 from src.agent.agent import (
     TestRunnerAgent,
     _apply_suite_after_action_wait,
+    _apply_suite_debug_options,
     _build_suite_context_from_previous_results,
     _blocked_dependency_reason,
     _expand_recordings_for_parameter_rows,
@@ -93,11 +94,16 @@ def test_extract_trigger_payload_reads_suite_after_action_wait() -> None:
         execution_mode,
         resume_from_run_id,
         suite_after_action_wait_ms,
+        suite_debug_options,
     ) = _extract_trigger_payload(
         {
             "test_suite_id": "Suite",
             "recordings": [{"file": "recordings/a.py"}],
             "after_action_wait_ms": 3000,
+            "debug_trace": True,
+            "debug_record_video": True,
+            "debug_full_page_steps": False,
+            "debug_page_text_max_chars": 24000,
         }
     )
 
@@ -106,6 +112,12 @@ def test_extract_trigger_payload_reads_suite_after_action_wait() -> None:
     assert execution_mode == "parallel"
     assert resume_from_run_id == ""
     assert suite_after_action_wait_ms == 3000
+    assert suite_debug_options == {
+        "debug_trace": True,
+        "debug_record_video": True,
+        "debug_full_page_steps": False,
+        "debug_page_text_max_chars": 24000,
+    }
 
 
 def test_apply_suite_after_action_wait_sets_default_when_recording_has_none() -> None:
@@ -129,6 +141,26 @@ def test_apply_suite_after_action_wait_noop_when_suite_value_absent() -> None:
 
     assert "after_action_wait_ms" not in merged
     assert merged is recording
+
+
+def test_apply_suite_debug_options_sets_defaults_without_overriding_recording() -> None:
+    merged = _apply_suite_debug_options(
+        {
+            "file": "recordings/a.py",
+            "debug_record_video": False,
+        },
+        {
+            "debug_trace": True,
+            "debug_record_video": True,
+            "debug_full_page_steps": True,
+            "debug_page_text_max_chars": 24000,
+        },
+    )
+
+    assert merged["debug_trace"] is True
+    assert merged["debug_record_video"] is False
+    assert merged["debug_full_page_steps"] is True
+    assert merged["debug_page_text_max_chars"] == 24000
 
 
 def test_merge_recording_outputs_into_suite_context_keeps_bare_and_namespaced_keys() -> None:

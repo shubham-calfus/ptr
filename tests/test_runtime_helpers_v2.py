@@ -90,6 +90,26 @@ class _FakeLocator:
         return None
 
 
+class _TimeoutRecordingLocator:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int]] = []
+
+    def wait_for(self, *, state: str, timeout: int) -> None:
+        self.events.append(("wait_for", timeout))
+
+    def scroll_into_view_if_needed(self, *, timeout: int) -> None:
+        self.events.append(("scroll", timeout))
+
+    def click(self, *, timeout: int) -> None:
+        self.events.append(("click", timeout))
+
+    def dblclick(self, *, timeout: int) -> None:
+        self.events.append(("dblclick", timeout))
+
+    def fill(self, value: str, *, timeout: int) -> None:
+        self.events.append(("fill", timeout))
+
+
 class _CheckboxLocator:
     def __init__(self, *, checked: bool = False, check_raises: bool = False) -> None:
         self.checked = checked
@@ -281,6 +301,48 @@ class _OracleQuickActionPage:
         self.waits.append(ms)
 
 
+class _OracleNotificationBadgePage:
+    def __init__(self) -> None:
+        self.notification_role = _DateLocator("notification_role")
+        self.notification_text = _DateLocator("notification_text")
+        self.waits: list[int] = []
+
+    def get_by_role(self, role: str, name=None, exact: bool | None = None):
+        pattern = getattr(name, "pattern", "")
+        if role == "link" and "notifications" in str(pattern).lower() and "unread" in str(pattern).lower():
+            return self.notification_role
+        return _NamedLocator(f"{role}:{name}:{exact}")
+
+    def get_by_text(self, text, exact: bool | None = None):
+        pattern = getattr(text, "pattern", "")
+        if "notifications" in str(pattern).lower() and "unread" in str(pattern).lower():
+            return self.notification_text
+        return _NamedLocator(f"text:{text}:{exact}")
+
+    def wait_for_timeout(self, ms: int) -> None:
+        self.waits.append(ms)
+
+
+class _RecordedButtonContextPage:
+    def __init__(self) -> None:
+        self.title_button = _DateLocator("title_button")
+        self.id_button = _DateLocator("id_button")
+        self.waits: list[int] = []
+
+    def title(self) -> str:
+        return "Notifications - Oracle Fusion Cloud Applications"
+
+    def locator(self, selector: str):
+        if selector == 'button[title="Approve Job Requisition Medical Office Administrator - 1269 Requires Approval"]':
+            return _FilteredLocatorCollection(self.title_button)
+        if selector == 'button[id="_FOpt1:_FOr1:0:_FONSr2:0:MAnt2:0:up1:UPsp1:r1:0:lv4:2:cb2"]':
+            return _FilteredLocatorCollection(self.id_button)
+        return _FilteredLocatorCollection(_DateLocator(f"locator:{selector}"))
+
+    def wait_for_timeout(self, ms: int) -> None:
+        self.waits.append(ms)
+
+
 class _KeyboardEntryLocator:
     def __init__(self) -> None:
         self.events: list[tuple[object, ...]] = []
@@ -367,6 +429,19 @@ class _OracleKeyboardComboboxLocator:
             self.expanded = True
 
 
+class _OracleKeyboardSelectLocator:
+    def __init__(self) -> None:
+        self.focused = False
+        self.events: list[tuple[str, object | None]] = []
+
+    def focus(self, timeout: int | None = None) -> None:
+        self.focused = True
+        self.events.append(("focus", timeout))
+
+    def press(self, key: str, *, timeout: int | None = None) -> None:
+        self.events.append(("press", key))
+
+
 class _DatePage:
     def __init__(self, attr_locator: _DateLocator, label_locator: _DateLocator | None = None) -> None:
         self.attr_locator = attr_locator
@@ -439,6 +514,16 @@ class _PromptPage:
 
     def title(self) -> str:
         return "Change Manager - Oracle Fusion Cloud Applications"
+
+
+class _AIScreenshotPage(_PromptPage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.screenshot_calls: list[dict[str, object]] = []
+
+    def screenshot(self, **kwargs):
+        self.screenshot_calls.append(dict(kwargs))
+        return b"fake-jpeg-bytes"
 
 
 class _NavigationPage:
@@ -524,6 +609,17 @@ class _SearchOptionPage:
         self.waits.append(ms)
 
 
+class _CompletionPage(_SearchOptionPage):
+    def __init__(self, *, title_text: str) -> None:
+        super().__init__()
+        self.url = "https://example.com/fscmUI/ar/edit-transaction"
+        self.title_text = title_text
+        self.current_step = "Edit Transaction"
+
+    def title(self) -> str:
+        return self.title_text
+
+
 def test_tracked_action_failure_records_normalized_runtime_action_name(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -597,6 +693,85 @@ def test_tracked_action_failure_captures_step_before_failure_screenshot(monkeypa
     assert events == ["step:click_button", "failure_screenshot"]
 
 
+def test_tracked_action_uses_universal_ai_repair_for_failed_checkbox_helper(monkeypatch) -> None:
+    page = _NavigationPage()
+    original_locator = object()
+    ai_locator = object()
+    captured_steps: list[str] = []
+    failure_events: list[str] = []
+    finalized: dict[str, object] = {}
+    stored_episodes: list[dict[str, object]] = []
+
+    def _ptr_check_target(locator, current_page, step_label):
+        if locator is original_locator:
+            raise RuntimeError("boom")
+        assert locator is ai_locator
+        assert current_page is page
+        assert step_label == "Items"
+        return "ai-ok"
+
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE", page)
+    monkeypatch.setattr(helpers_v2, "_ptr_resolve_page", lambda args: page)
+    monkeypatch.setattr(helpers_v2, "_ptr_resolve_primary_locator", lambda args: original_locator)
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_step", lambda action_type: captured_steps.append(action_type))
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_failure_screenshot", lambda: failure_events.append("failure"))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_finalize_action_log",
+        lambda *args, **kwargs: finalized.update({"args": args, "kwargs": kwargs}),
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: stored_episodes.append(kwargs))
+    monkeypatch.setattr(helpers_v2, "_ptr_set_recovery_record", lambda *args, **kwargs: None)
+
+    def _fake_execute_ai_repair_rounds(**kwargs):
+        assert kwargs["helper"] == "check_target"
+        assert kwargs["label"] == "Items"
+        assert kwargs["postcondition_kind"] == "checkbox_state_changed"
+        assert kwargs["execute_locator"]("ai_css_1", ai_locator, {"selector": "#ai"}) is True
+        return (("ai_css_1", ai_locator, {"selector": "#ai"}), kwargs["last_error"])
+
+    monkeypatch.setattr(helpers_v2, "_ptr_execute_ai_repair_rounds", _fake_execute_ai_repair_rounds)
+
+    result = helpers_v2._ptr_tracked_action("check", "Items", _ptr_check_target, original_locator, page, "Items")
+
+    assert result == "ai-ok"
+    assert page.waits == [10_000]
+    assert captured_steps == ["check"]
+    assert failure_events == []
+    assert finalized["args"][2] == "success"
+    assert stored_episodes and stored_episodes[-1]["status"] == "success"
+    assert stored_episodes[-1]["action_type"] == "check_target"
+
+
+def test_tracked_action_does_not_run_universal_ai_when_helper_already_used_ai(monkeypatch) -> None:
+    page = _NavigationPage()
+    original_locator = object()
+    events: list[str] = []
+
+    def _ptr_check_target(locator, current_page, step_label):
+        helpers_v2._PTR_CURRENT_STRATEGY["ai_interactions"] = [{"status": "requested"}]
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE", page)
+    monkeypatch.setattr(helpers_v2, "_ptr_resolve_page", lambda args: page)
+    monkeypatch.setattr(helpers_v2, "_ptr_resolve_primary_locator", lambda args: original_locator)
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_step", lambda action_type: events.append(f"step:{action_type}"))
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_failure_screenshot", lambda: events.append("failure"))
+    monkeypatch.setattr(helpers_v2, "_ptr_finalize_action_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_execute_ai_repair_rounds",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("universal AI should not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        helpers_v2._ptr_tracked_action("check", "Items", _ptr_check_target, original_locator, page, "Items")
+
+    assert page.waits == []
+    assert events == ["step:check", "failure"]
+
+
 def test_tracked_raw_action_records_raw_inline_strategy(monkeypatch) -> None:
     page = _NavigationPage()
     captured_steps: list[str] = []
@@ -625,6 +800,31 @@ def test_tracked_raw_action_records_raw_inline_strategy(monkeypatch) -> None:
     assert helpers_v2._PTR_ACTION_LOG[0]["label"] == ".xen"
 
 
+def test_tracked_raw_action_exec_scope_includes_re_module(monkeypatch) -> None:
+    page = _NavigationPage()
+
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE", page)
+    monkeypatch.setattr(helpers_v2, "_PTR_ACTION_LOG", [])
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_step", lambda action_type: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_failure_screenshot", lambda: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: None)
+    helpers_v2._ptr_set_script_data({"raw": "calls.append(bool(re.compile('^Sales Territory').match('Sales TerritoryAutocompletes on TAB')))"})
+
+    local_scope = {"calls": []}
+
+    helpers_v2._ptr_tracked_raw_action(
+        "click",
+        "tr",
+        "calls.append(bool(re.compile('^Sales Territory').match('Sales TerritoryAutocompletes on TAB')))",
+        {},
+        local_scope,
+        page=page,
+    )
+
+    assert local_scope["calls"] == [True]
+    assert helpers_v2._PTR_ACTION_LOG[0]["strategy"] == "raw_inline"
+
+
 def test_wait_after_interaction_captures_page_snapshot_with_hardcoded_delay(monkeypatch) -> None:
     page = _SnapshotPage()
 
@@ -648,6 +848,17 @@ def test_wait_after_interaction_honors_env_override(monkeypatch) -> None:
     helpers_v2._ptr_wait_after_interaction(page)
 
     assert page.waits == [2_000]
+
+
+def test_wait_after_interaction_honors_zero_env_override(monkeypatch) -> None:
+    page = _SnapshotPage()
+
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE_SNAPSHOT", {})
+    monkeypatch.setenv("PTR_AFTER_ACTION_WAIT_MS", "0")
+
+    helpers_v2._ptr_wait_after_interaction(page)
+
+    assert page.waits == [0]
 
 
 def test_wait_after_interaction_falls_back_to_default_on_bad_override(monkeypatch) -> None:
@@ -865,6 +1076,83 @@ def test_check_target_falls_back_to_click_when_raw_check_is_unsupported(monkeypa
     assert waits == ["done", "done"]
 
 
+def test_checkbox_semantic_postcondition_accepts_matching_active_checkbox_after_rerender() -> None:
+    before = {
+        "target_meta": {
+            "tag": "input",
+            "id": "ui-id-427|cb",
+            "name": "ui-id-426",
+        }
+    }
+    after = {
+        "target_meta": {},
+        "active_element": {
+            "tag": "input",
+            "id": "ui-id-427|cb",
+            "name": "ui-id-426",
+            "checked": "true",
+        },
+    }
+
+    assert helpers_v2._ptr_checkbox_semantic_postcondition(before, after, True) is True
+    assert helpers_v2._ptr_checkbox_semantic_postcondition(before, after, False) is False
+
+
+def test_set_checkbox_state_accepts_matching_active_checkbox_when_locator_rerenders(monkeypatch) -> None:
+    locator = _CheckboxLocator(checked=False)
+    page = _NavigationPage()
+    waits: list[str] = []
+    click_attempts: list[int] = []
+    observe_calls = iter(
+        [
+            {
+                "target_meta": {
+                    "tag": "input",
+                    "id": "ui-id-427|cb",
+                    "name": "ui-id-426",
+                },
+                "active_element": {},
+            },
+            {
+                "target_meta": {},
+                "active_element": {
+                    "tag": "input",
+                    "id": "ui-id-427|cb",
+                    "name": "ui-id-426",
+                    "checked": "true",
+                },
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_field_processing",
+        lambda *args, **kwargs: waits.append("done"),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_checkbox_matches",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_observe",
+        lambda *args, **kwargs: next(observe_calls),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_strict_click",
+        lambda _locator, timeout_ms=None: click_attempts.append(int(timeout_ms or 0)),
+    )
+
+    helpers_v2._ptr_set_checkbox_state(locator, page, "Items", True)
+
+    assert ("check", 3000) in locator.events
+    assert click_attempts == []
+    assert waits == ["done"]
+
+
 def test_combobox_open_postcondition_accepts_aria_expanded_transition() -> None:
     assert helpers_v2._ptr_combobox_open_postcondition(
         {"dialog_count": 0, "target_meta": {"aria_expanded": "false"}},
@@ -960,6 +1248,77 @@ def test_select_option_postcondition_accepts_matching_selected_value() -> None:
     )
 
 
+def test_select_option_postcondition_fails_when_adf_commit_markers_reflect_old_value() -> None:
+    # Transaction Class selectOneChoice: Playwright forced "Credit memo" into the
+    # native <select>, but ADF never committed it -> title/_afov still "Invoice"/"0"
+    # and the dependent header stays "Create Transaction: Invoice".
+    before_state = {
+        "value": "0",
+        "selected_values": ["0"],
+        "selected_labels": ["Invoice"],
+        "selected_indexes": [0],
+        "title": "Invoice",
+        "afov": "0",
+        "is_adf": True,
+    }
+    after_state = {
+        "value": "1",
+        "selected_values": ["1"],
+        "selected_labels": ["Credit memo"],
+        "selected_indexes": [1],
+        "title": "Invoice",
+        "afov": "0",
+        "is_adf": True,
+    }
+
+    assert (
+        helpers_v2._ptr_select_option_postcondition(before_state, after_state, ["1"], {})
+        is False
+    )
+
+
+def test_select_option_postcondition_accepts_adf_commit_when_title_reflects_selection() -> None:
+    before_state = {
+        "value": "0",
+        "selected_values": ["0"],
+        "selected_labels": ["Invoice"],
+        "selected_indexes": [0],
+        "title": "Invoice",
+        "afov": "0",
+        "is_adf": True,
+    }
+    after_state = {
+        "value": "1",
+        "selected_values": ["1"],
+        "selected_labels": ["Credit memo"],
+        "selected_indexes": [1],
+        "title": "Credit memo",
+        "afov": "1",
+        "is_adf": True,
+    }
+
+    assert helpers_v2._ptr_select_option_postcondition(before_state, after_state, ["1"], {})
+
+
+def test_adf_select_commit_gate_ignores_plain_html_select_without_markers() -> None:
+    # Plain HTML <select> (not ADF): no is_adf flag, so the existing DOM-state
+    # postcondition stands and the change is accepted.
+    after_state = {
+        "value": "1",
+        "selected_values": ["1"],
+        "selected_labels": ["Credit memo"],
+        "selected_indexes": [1],
+    }
+
+    assert helpers_v2._ptr_adf_select_commit_contradicted(after_state) is False
+    assert helpers_v2._ptr_select_option_postcondition(
+        {"value": "0", "selected_values": ["0"], "selected_labels": ["Invoice"], "selected_indexes": [0]},
+        after_state,
+        ["1"],
+        {},
+    )
+
+
 def test_select_option_target_waits_for_processing_after_success(monkeypatch) -> None:
     locator = object()
     page = _NavigationPage()
@@ -994,6 +1353,410 @@ def test_select_option_target_waits_for_processing_after_success(monkeypatch) ->
     helpers_v2._ptr_select_option_target(locator, page, "Type", ["3"], {})
 
     assert waited == ["done"]
+
+
+def test_try_commit_oracle_adf_select_uses_keyboard_commit(monkeypatch) -> None:
+    locator = _OracleKeyboardSelectLocator()
+    page = _NavigationPage()
+    waited: list[str] = []
+    states = iter(
+        [
+            {
+                "value": "1",
+                "selected_values": ["1"],
+                "selected_labels": ["Credit memo"],
+                "selected_indexes": [1],
+                "title": "Invoice",
+                "afov": "0",
+                "is_adf": True,
+            },
+            {
+                "value": "1",
+                "selected_values": ["1"],
+                "selected_labels": ["Credit memo"],
+                "selected_indexes": [1],
+                "title": "Credit memo",
+                "afov": "1",
+                "is_adf": True,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_target",
+        lambda *args, **kwargs: {"index": 1, "value": "1", "label": "Credit memo"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_reset_select_to_index", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_field_processing",
+        lambda *args, **kwargs: waited.append("done"),
+    )
+
+    details = helpers_v2._ptr_try_commit_oracle_adf_select(
+        locator,
+        page,
+        {
+            "value": "0",
+            "selected_values": ["0"],
+            "selected_labels": ["Invoice"],
+            "selected_indexes": [0],
+            "title": "Invoice",
+            "afov": "0",
+            "is_adf": True,
+        },
+        ["1"],
+        {},
+    )
+
+    assert details == {
+        "strategy_name": "oracle_adf_select_keyboard_commit",
+        "target_index": 1,
+        "target_value": "1",
+        "target_label": "Credit memo",
+    }
+    assert locator.focused is True
+    assert locator.events == [("focus", 3000), ("press", "ArrowDown"), ("press", "Tab")]
+    assert waited == ["done"]
+    assert page.waits == [250]
+
+
+def test_select_option_target_uses_oracle_adf_commit_before_ai(monkeypatch) -> None:
+    locator = object()
+    page = _NavigationPage()
+    recovery: dict[str, object] = {}
+    stored: dict[str, object] = {}
+    states = iter(
+        [
+            {
+                "value": "0",
+                "selected_values": ["0"],
+                "selected_labels": ["Invoice"],
+                "selected_indexes": [0],
+                "title": "Invoice",
+                "afov": "0",
+                "is_adf": True,
+            },
+            {
+                "value": "1",
+                "selected_values": ["1"],
+                "selected_labels": ["Credit memo"],
+                "selected_indexes": [1],
+                "title": "Invoice",
+                "afov": "0",
+                "is_adf": True,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_apply_select_option", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_try_commit_oracle_adf_select",
+        lambda *args, **kwargs: {
+            "strategy_name": "oracle_adf_select_keyboard_commit",
+            "target_index": 1,
+            "target_value": "1",
+            "target_label": "Credit memo",
+        },
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: pytest.fail("experience should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: pytest.fail("ai should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: stored.update(kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+
+    helpers_v2._ptr_select_option_target(locator, page, "Transaction Class", ["1"], {})
+
+    assert recovery == {
+        "source": "oracle_handler",
+        "kind": "oracle_adf_select_commit",
+        "handler_name": "oracle_adf_select_commit",
+        "details": {
+            "strategy_name": "oracle_adf_select_keyboard_commit",
+            "target_index": 1,
+            "target_value": "1",
+            "target_label": "Credit memo",
+        },
+    }
+    assert stored["status"] == "success"
+    assert stored["postcondition_kind"] == "option_selected"
+
+
+def test_select_option_target_accepts_oracle_semantic_label_value_when_field_already_selected(monkeypatch) -> None:
+    locator = object()
+    page = _NavigationPage()
+    recovery: dict[str, object] = {}
+    stored: dict[str, object] = {}
+    states = iter(
+        [
+            {
+                "value": "",
+                "selected_values": [],
+                "selected_labels": [],
+                "selected_indexes": [],
+            },
+            {
+                "value": "",
+                "selected_values": [],
+                "selected_labels": [],
+                "selected_indexes": [],
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_apply_select_option", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_target",
+        lambda *args, **kwargs: {"index": 3, "value": "3", "label": "Test Solutions"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_oracle_label_value_matches", lambda *args, **kwargs: True)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_commit_oracle_adf_select", lambda *args, **kwargs: pytest.fail("adf commit should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_searchselect_select_option_recovery", lambda *args, **kwargs: pytest.fail("searchselect recovery should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: pytest.fail("experience should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: pytest.fail("ai should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: stored.update(kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+
+    helpers_v2._ptr_select_option_target(locator, page, "Business Unit", ["3"], {})
+
+    assert recovery == {
+        "source": "oracle_handler",
+        "kind": "oracle_label_value_already_selected",
+        "handler_name": "oracle_label_value_already_selected",
+        "details": {
+            "target_value": "3",
+            "target_label": "Test Solutions",
+        },
+    }
+    assert stored["status"] == "success"
+    assert stored["postcondition_kind"] == "option_selected"
+
+
+def test_resolve_select_target_maps_oracle_one_based_value_to_zero_based_option(monkeypatch) -> None:
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_safe_locator_eval",
+        lambda *args, **kwargs: {
+            "is_adf": True,
+            "options": [
+                {"index": 0, "value": "0", "label": "Connectors"},
+                {"index": 1, "value": "1", "label": "Corporate"},
+                {"index": 2, "value": "2", "label": "Test Solutions"},
+            ],
+        },
+    )
+
+    assert helpers_v2._ptr_resolve_select_target(object(), ["3"], {}) == {
+        "index": 2,
+        "value": "2",
+        "label": "Test Solutions",
+    }
+
+
+def test_select_option_target_reuses_precomputed_target_when_control_goes_stale(monkeypatch) -> None:
+    locator = object()
+    page = _NavigationPage()
+    recovery: dict[str, object] = {}
+    stored: dict[str, object] = {}
+    states = iter(
+        [
+            {
+                "value": "0",
+                "selected_values": ["0"],
+                "selected_labels": [],
+                "selected_indexes": [0],
+                "text": "Connectors Corporate Test Solutions",
+                "title": "",
+                "afov": "0",
+                "is_adf": True,
+            },
+            {},
+        ]
+    )
+    resolve_calls = {"count": 0}
+
+    def _resolve_once(*args, **kwargs):
+        resolve_calls["count"] += 1
+        if resolve_calls["count"] > 1:
+            pytest.fail("target should be reused after the control goes stale")
+        return {"index": 2, "value": "2", "label": "Test Solutions"}
+
+    monkeypatch.setattr(helpers_v2, "_ptr_apply_select_option", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_resolve_select_target", _resolve_once)
+    monkeypatch.setattr(helpers_v2, "_ptr_oracle_label_value_matches", lambda *args, **kwargs: True)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_commit_oracle_adf_select", lambda *args, **kwargs: pytest.fail("adf commit should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_searchselect_select_option_recovery", lambda *args, **kwargs: pytest.fail("searchselect recovery should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: pytest.fail("experience should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: pytest.fail("ai should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: stored.update(kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+
+    helpers_v2._ptr_select_option_target(locator, page, "Business Unit", ["3"], {})
+
+    assert resolve_calls["count"] == 1
+    assert recovery == {
+        "source": "oracle_handler",
+        "kind": "oracle_label_value_already_selected",
+        "handler_name": "oracle_label_value_already_selected",
+        "details": {
+            "target_value": "2",
+            "target_label": "Test Solutions",
+        },
+    }
+    assert stored["status"] == "success"
+    assert stored["postcondition_kind"] == "option_selected"
+
+
+def test_try_oracle_searchselect_select_option_recovery_uses_resolved_target_label(monkeypatch) -> None:
+    locator = object()
+    page = _SearchOptionPage()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_extract_locator_metadata",
+        lambda current: {"tag": "select", "role": "", "oracle_host_tag": ""},
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_target",
+        lambda *args, **kwargs: {"index": 3, "value": "3", "label": "Vision Operations"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_locator_matches_label", lambda locator, label: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_select_search_trigger_option",
+        lambda trigger, option, current_page, title, option_name, **kwargs: captured.update(
+            {
+                "trigger": getattr(trigger, "name", ""),
+                "option": getattr(option, "name", ""),
+                "title": title,
+                "option_name": option_name,
+                "kwargs": kwargs,
+            }
+        ),
+    )
+
+    details = helpers_v2._ptr_try_oracle_searchselect_select_option_recovery(
+        locator,
+        page,
+        "Business Unit",
+        ["3"],
+        {},
+    )
+
+    assert details == {
+        "strategy_name": "oracle_searchselect_role_combobox",
+        "target_index": 3,
+        "target_value": "3",
+        "target_label": "Vision Operations",
+        "option_name": "Vision Operations",
+        "fill_value": "Vision Operations",
+    }
+    assert captured["trigger"] == "combobox:Business Unit"
+    assert captured["option"] == "text:Vision Operations:True"
+    assert captured["title"] == "Business Unit"
+    assert captured["option_name"] == "Vision Operations"
+    assert captured["kwargs"] == {
+        "option_exact": True,
+        "fill_value": "Vision Operations",
+        "allow_repair": False,
+    }
+
+
+def test_select_option_target_uses_oracle_searchselect_recovery_before_experience_ai(monkeypatch) -> None:
+    locator = object()
+    page = _NavigationPage()
+    recovery: dict[str, object] = {}
+    stored: dict[str, object] = {}
+    states = iter(
+        [
+            {
+                "value": "1",
+                "selected_values": ["1"],
+                "selected_labels": ["Operations"],
+                "selected_indexes": [1],
+            },
+            {
+                "value": "1",
+                "selected_values": ["1"],
+                "selected_labels": ["Operations"],
+                "selected_indexes": [1],
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_apply_select_option", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_commit_oracle_adf_select", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_try_oracle_searchselect_select_option_recovery",
+        lambda *args, **kwargs: {
+            "strategy_name": "oracle_searchselect_role_combobox",
+            "target_index": 3,
+            "target_value": "3",
+            "target_label": "Vision Operations",
+            "option_name": "Vision Operations",
+            "fill_value": "Vision Operations",
+        },
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: pytest.fail("experience should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: pytest.fail("ai should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: stored.update(kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+
+    helpers_v2._ptr_select_option_target(locator, page, "Business Unit", ["3"], {})
+
+    assert recovery == {
+        "source": "oracle_handler",
+        "kind": "oracle_searchselect_select_option",
+        "handler_name": "oracle_searchselect_select_option",
+        "details": {
+            "strategy_name": "oracle_searchselect_role_combobox",
+            "target_index": 3,
+            "target_value": "3",
+            "target_label": "Vision Operations",
+            "option_name": "Vision Operations",
+            "fill_value": "Vision Operations",
+        },
+    }
+    assert stored["status"] == "success"
+    assert stored["postcondition_kind"] == "option_selected"
 
 
 def test_fill_textbox_waits_for_processing_before_validating(monkeypatch) -> None:
@@ -1087,6 +1850,9 @@ def test_fill_textbox_uses_oracle_table_active_editor_when_row_scoped_locator_do
         assert ("press_sequentially", "-10", 40, 3000) in table_editor.events
         assert waited == ["done", "done"]
         assert helpers_v2._PTR_CURRENT_STRATEGY["recovery"]["handler_name"] == "oracle_table_active_editor_fill"
+        debug_trace = helpers_v2._PTR_CURRENT_STRATEGY["debug"]["fill_textbox"]
+        assert debug_trace["oracle_table_active_editor_fill"]["status"] == "validated"
+        assert debug_trace["resolved_by"] == "oracle_table_active_editor_fill"
         assert captured["status"] == "success"
         assert captured["postcondition_passed"] is True
     finally:
@@ -1245,6 +2011,166 @@ def test_build_ai_self_repair_prompt_includes_script_data_and_recorded_target_co
     helpers_v2._ptr_set_script_data({})
 
 
+def test_build_ai_self_repair_prompt_marks_select_actions_and_includes_retry_feedback(monkeypatch) -> None:
+    page = _PromptPage()
+    helpers_v2._ptr_set_script_data(
+        {
+            "tracked_action": "select_option",
+            "raw": 'page.get_by_label("Transaction Class").select_option("1")',
+            "primary_locator_expr": 'page.get_by_label("Transaction Class")',
+            "option_args": ["1"],
+            "option_kwargs": {},
+            "parsed_action": {
+                "type": "select_option",
+                "option_value": "1",
+            },
+        }
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_capture_locator_context",
+        lambda *args, **kwargs: {
+            "tag": "select",
+            "id": "transactionClass::content",
+            "aria_label": "Transaction Class",
+            "title": "Invoice",
+            "html": '<select id="transactionClass::content" title="Invoice" _afov="0"><option value="0">Invoice</option><option value="1">Credit Memo</option></select>',
+        },
+    )
+
+    prompt = helpers_v2._ptr_build_ai_self_repair_prompt(
+        page,
+        "select_option_target",
+        "Transaction Class",
+        RuntimeError('Select "Transaction Class" did not reflect the requested option selection {"args":["1"],"kwargs":{}}.'),
+        value='{"args":["1"],"kwargs":{}}',
+        locator=_DateLocator("recorded"),
+        dom_context={
+            "helper": "select_option_target",
+            "label": "Transaction Class",
+            "candidates": [
+                {
+                    "tag": "input",
+                    "id": "transactionSource::content",
+                    "aria_label": "Transaction Source",
+                    "text": "",
+                    "html": '<input id="transactionSource::content" aria-label="Transaction Source">',
+                }
+            ],
+        },
+        retry_feedback={
+            "round": 1,
+            "execution_error": 'AI strategy "ai_css_1" did not satisfy select_option for "Transaction Class".',
+            "attempted_locator_strategies": ["ai_css_1"],
+        },
+    )
+
+    assert "Intended action: select_option" in prompt
+    assert "Requested action value JSON" in prompt
+    assert '"parsed_option_value": "1"' in prompt
+    assert '"origin": "recorded_target"' in prompt
+    assert "Retry feedback JSON" in prompt
+    helpers_v2._ptr_set_script_data({})
+
+
+def test_execute_ai_repair_rounds_retries_with_failure_feedback(monkeypatch) -> None:
+    page = _PromptPage()
+    retry_payloads: list[dict[str, object] | None] = []
+
+    def _fake_ai_repair_locators(current_page, helper, label, last_error, value=None, locator=None, retry_feedback=None):
+        retry_payloads.append(retry_feedback)
+        round_index = len(retry_payloads)
+        return [(f"ai_round_{round_index}", _DateLocator(f"candidate-{round_index}"), {"kind": "css", "selector": f"#candidate-{round_index}"})]
+
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", _fake_ai_repair_locators)
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_finalize_last_ai_interaction", lambda **kwargs: None)
+
+    attempts: list[str] = []
+
+    result, last_error = helpers_v2._ptr_execute_ai_repair_rounds(
+        current_page=page,
+        helper="select_option_target",
+        label="Transaction Class",
+        last_error=RuntimeError("initial failure"),
+        locator=_DateLocator("recorded"),
+        value='{"args":["1"],"kwargs":{}}',
+        postcondition_kind="option_selected",
+        failure_message=lambda strategy_name: f'AI strategy "{strategy_name}" did not satisfy select_option for "Transaction Class".',
+        execute_locator=lambda strategy_name, ai_locator, ai_strategy: attempts.append(strategy_name) or strategy_name.endswith("_2"),
+    )
+
+    assert result is not None
+    assert result[0] == "ai_round_2"
+    assert attempts == ["ai_round_1", "ai_round_2"]
+    assert retry_payloads[0] is None
+    assert retry_payloads[1] is not None
+    assert retry_payloads[1]["round"] == 1
+    assert retry_payloads[1]["attempted_locator_strategies"] == ["ai_round_1"]
+    assert 'did not satisfy select_option for "Transaction Class"' in str(retry_payloads[1]["execution_error"])
+    assert isinstance(last_error, Exception)
+
+
+def test_request_ai_self_repair_attaches_full_page_screenshot_and_records_it(monkeypatch) -> None:
+    page = _AIScreenshotPage()
+    captured_request: dict[str, object] = {}
+
+    class _FakeAIResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"output_text":"{\\"strategies\\": []}"}'
+
+    def _fake_urlopen(request, timeout=0):
+        captured_request["payload"] = json.loads(request.data.decode("utf-8"))
+        captured_request["timeout"] = timeout
+        return _FakeAIResponse()
+
+    monkeypatch.setenv("PTR_AI_SELF_REPAIR_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-demo")
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_collect_ai_dom_candidates",
+        lambda *args, **kwargs: {
+            "helper": "click_button_target",
+            "label": "Approve",
+            "candidates": [{"tag": "button", "id": "approve-1269", "text": "Approve"}],
+        },
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_capture_locator_context",
+        lambda *args, **kwargs: {"id": "approve-1269", "title": "Approve Job Requisition 1269"},
+    )
+    monkeypatch.setattr(helpers_v2, "urlopen", _fake_urlopen)
+
+    helpers_v2._ptr_reset_strategy_tracking("click_button_target", "Approve")
+    strategies = helpers_v2._ptr_request_ai_self_repair(
+        page,
+        "click_button_target",
+        "Approve",
+        RuntimeError('Locator.wait_for: Error: strict mode violation: get_by_role("button", name="Approve") resolved to 9 elements'),
+        locator=_DateLocator("recorded"),
+    )
+
+    assert strategies == []
+    user_content = captured_request["payload"]["input"][1]["content"]
+    assert user_content[0]["type"] == "input_text"
+    assert "full-page screenshot is attached" in user_content[0]["text"]
+    assert user_content[1]["type"] == "input_image"
+    assert user_content[1]["image_url"].startswith("data:image/jpeg;base64,")
+    assert page.screenshot_calls == [{"full_page": True, "type": "jpeg", "quality": 45, "scale": "css"}]
+    interaction = helpers_v2._PTR_CURRENT_STRATEGY["ai_interactions"][-1]
+    assert interaction["page_screenshot"]["status"] == "captured"
+    assert interaction["page_screenshot"]["image_url"].startswith("data:image/jpeg;base64,")
+
+
 def test_ai_locator_matches_label_accepts_labelledby_text(monkeypatch) -> None:
     monkeypatch.setattr(
         helpers_v2,
@@ -1253,6 +2179,16 @@ def test_ai_locator_matches_label_accepts_labelledby_text(monkeypatch) -> None:
     )
 
     assert helpers_v2._ptr_ai_locator_matches_label(_DateLocator("recorded"), "Why are you changing the")
+
+
+def test_ai_locator_matches_label_accepts_oracle_notification_badge_count_changes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_extract_locator_metadata",
+        lambda *args, **kwargs: {"title": "Notifications (9 unread)"},
+    )
+
+    assert helpers_v2._ptr_ai_locator_matches_label(_DateLocator("recorded"), "Notifications (10 unread)")
 
 
 def test_select_search_trigger_option_enters_search_value_before_selecting(monkeypatch) -> None:
@@ -1403,6 +2339,34 @@ def test_wait_for_oracle_searchselect_query_polls_until_requested_value_reflects
     assert reflected is True
     assert state["filter_value"] == "Can"
     assert page.waits == [100]
+
+
+def test_strict_click_honors_explicit_zero_timeout(monkeypatch) -> None:
+    locator = _TimeoutRecordingLocator()
+    monkeypatch.setenv("PTR_ACTION_TIMEOUT_MS", "3000")
+
+    helpers_v2._ptr_strict_click(locator, timeout_ms=0)
+
+    assert locator.events == [("wait_for", 0), ("scroll", 0), ("click", 0)]
+
+
+def test_wait_for_oracle_searchselect_query_honors_explicit_zero_timeout(monkeypatch) -> None:
+    page = _SearchOptionPage()
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_oracle_searchselect_state",
+        lambda current_page: {"open": True, "no_matches": True, "filter_value": "Supremo Candidate Selection Process"},
+    )
+
+    state, reflected = helpers_v2._ptr_wait_for_oracle_searchselect_query(
+        page,
+        "Can",
+        timeout_ms=0,
+    )
+
+    assert reflected is False
+    assert state["filter_value"] == "Supremo Candidate Selection Process"
+    assert page.waits == []
 
 
 def test_select_search_trigger_option_retries_when_oracle_query_does_not_reflect_requested_value(
@@ -1786,6 +2750,389 @@ def test_select_adf_menu_panel_option_uses_strict_raw_validate_before_menuitem_f
     assert page.waits == [350, 250]
 
 
+def test_select_adf_menu_panel_option_skips_hidden_raw_text_candidate_before_click_timeout(monkeypatch) -> None:
+    trigger = _SearchOptionLocator("trigger")
+    option = _SearchOptionLocator("raw-option")
+    page = _SearchOptionPage()
+    clicked: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_oracle_menu_trigger_option_visibility",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_locator_is_actionable",
+        lambda locator, timeout_ms=None: getattr(locator, "name", "") == "menuitem:Edit Additional Information",
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_observe",
+        lambda *args, **kwargs: {"dialog_count": 1, "body_marker": "state"},
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_option_selection_postcondition",
+        lambda before, after, trigger_locator, option_locator, option_name, **kwargs: getattr(option_locator, "name", "") == "menuitem:Edit Additional Information",
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")),
+    )
+
+    def _strict_click(locator, timeout_ms=None):
+        clicked.append(locator.name)
+        if locator.name == "raw-option":
+            raise AssertionError("hidden raw text candidate should not be clicked")
+
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+
+    helpers_v2._ptr_select_adf_menu_panel_option(
+        trigger,
+        option,
+        page,
+        "ActionsValidateReprice",
+        "Edit Additional Information",
+        trigger_kind="text",
+    )
+
+    assert clicked == ["trigger", "menuitem:Edit Additional Information"]
+    assert page.waits == [350, 250]
+
+
+def test_requires_semantic_validation_covers_transaction_completion_split_buttons() -> None:
+    assert helpers_v2._ptr_oracle_menu_option_requires_semantic_validation(
+        "Complete and Create Another",
+        "Complete and Review",
+    )
+
+
+def test_oracle_transaction_completion_advanced_detects_navigation_and_step_change(monkeypatch) -> None:
+    baseline = {
+        "url": "https://example.com/fscmUI/ar/edit-transaction",
+        "title": "Edit Transaction: Invoice 58005",
+        "guided_step": "Edit Transaction",
+    }
+    stalled = _CompletionPage(title_text="Edit Transaction: Invoice 58005")
+    reviewed = _CompletionPage(title_text="Review Transaction: Invoice 58005")
+    reviewed.url = "https://example.com/fscmUI/ar/review-transaction"
+    same_title_new_step = _CompletionPage(title_text="Edit Transaction: Invoice 58005")
+    same_title_new_step.current_step = "Review Transaction"
+
+    monkeypatch.setattr(helpers_v2, "_ptr_current_guided_step", lambda page: page.current_step)
+
+    assert helpers_v2._ptr_oracle_transaction_completion_advanced(stalled, baseline) is False
+    assert helpers_v2._ptr_oracle_transaction_completion_advanced(reviewed, baseline) is True
+    assert helpers_v2._ptr_oracle_transaction_completion_advanced(same_title_new_step, baseline) is True
+
+
+def test_oracle_transaction_completion_advanced_detects_review_state_from_oracle_page_content(monkeypatch) -> None:
+    baseline = {
+        "url": "https://example.com/fscmUI/ar/edit-transaction",
+        "title": "Create Transaction - Billing - Oracle Fusion Cloud Applications",
+        "guided_step": "",
+        "guided_flow": {"primary_heading": "Edit Transaction: Invoice 58007"},
+        "body_marker": "Edit Transaction: Invoice 58007 Status Incomplete Payment Terms IMMEDIATE",
+    }
+    page = _CompletionPage(title_text="Create Transaction - Billing - Oracle Fusion Cloud Applications")
+    state = {
+        "primary_heading": "Review Transaction: Invoice 7005359",
+        "body_marker": "Review Transaction: Invoice 7005359 Status Complete Payment Terms IMMEDIATE",
+    }
+
+    monkeypatch.setattr(helpers_v2, "_ptr_current_guided_step", lambda current_page: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_guided_flow_state", lambda current_page: {"primary_heading": state["primary_heading"]})
+    monkeypatch.setattr(helpers_v2, "_ptr_body_marker", lambda current_page: state["body_marker"])
+
+    assert helpers_v2._ptr_oracle_transaction_completion_advanced(page, baseline) is True
+
+
+def test_oracle_transaction_completion_advanced_records_debug_trace_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("PTR_DEBUG_TRACE", "true")
+    helpers_v2._PTR_ACTION_LOG.clear()
+    helpers_v2._ptr_reset_strategy_tracking("_ptr_select_adf_menu_panel_option", "Complete and Create Another")
+
+    baseline = {
+        "url": "https://example.com/fscmUI/ar/edit-transaction",
+        "title": "Create Transaction - Billing - Oracle Fusion Cloud Applications",
+        "guided_step": "",
+        "guided_flow": {"primary_heading": "Edit Transaction: Invoice 58007"},
+        "body_marker": "Edit Transaction: Invoice 58007 Status Incomplete Payment Terms IMMEDIATE",
+    }
+    page = _CompletionPage(title_text="Create Transaction - Billing - Oracle Fusion Cloud Applications")
+    state = {
+        "primary_heading": "Review Transaction: Invoice 7005359",
+        "body_marker": "Review Transaction: Invoice 7005359 Status Complete Payment Terms IMMEDIATE",
+    }
+
+    monkeypatch.setattr(helpers_v2, "_ptr_current_guided_step", lambda current_page: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_guided_flow_state", lambda current_page: {"primary_heading": state["primary_heading"]})
+    monkeypatch.setattr(helpers_v2, "_ptr_body_marker", lambda current_page: state["body_marker"])
+
+    assert helpers_v2._ptr_oracle_transaction_completion_advanced(page, baseline) is True
+
+    helpers_v2._ptr_finalize_action_log(
+        "adf_menu_select",
+        "Complete and Create Another",
+        "success",
+        250,
+        page=page,
+    )
+
+    debug_payload = helpers_v2._PTR_ACTION_LOG[-1]["debug"]["oracle_completion_check"]
+    assert debug_payload["matched_signal"] == "heading_changed_to_review"
+    assert debug_payload["postcondition_passed"] is True
+
+
+def test_set_debug_detail_records_select_option_trace_without_global_debug(monkeypatch) -> None:
+    monkeypatch.delenv("PTR_DEBUG_TRACE", raising=False)
+    helpers_v2._ptr_reset_strategy_tracking("select_option_target", "Business Unit")
+
+    helpers_v2._ptr_set_debug_detail("select_option_target", {"status": "direct_failed"})
+
+    assert helpers_v2._PTR_CURRENT_STRATEGY["debug"]["select_option_target"] == {
+        "status": "direct_failed"
+    }
+
+
+def test_set_debug_detail_records_click_trace_without_global_debug(monkeypatch) -> None:
+    monkeypatch.delenv("PTR_DEBUG_TRACE", raising=False)
+    helpers_v2._ptr_reset_strategy_tracking("click_text_target", "Edit Additional Information")
+
+    helpers_v2._ptr_set_debug_detail("click_with_candidates", {"status": "direct_failed"})
+
+    assert helpers_v2._PTR_CURRENT_STRATEGY["debug"]["click_with_candidates"] == {
+        "status": "direct_failed"
+    }
+
+
+def test_rank_ai_dom_candidates_prioritizes_select_for_select_option() -> None:
+    ranked = helpers_v2._ptr_rank_ai_dom_candidates(
+        "select_option_target",
+        "Business Unit",
+        [
+            {
+                "tag": "input",
+                "role": "combobox",
+                "text": "",
+                "aria_label": "",
+                "labelledby_text": "",
+                "oracle_host_text": "",
+                "oracle_host_data_oj_field": "",
+                "title": "",
+                "label_hint": "",
+                "placeholder": "",
+                "name": "partyName",
+                "id": "partyNameId",
+                "html": '<input role="combobox" id="partyNameId" value="Intel">',
+                "data_oj_field": "",
+                "oracle_host_tag": "",
+            },
+            {
+                "tag": "select",
+                "role": "",
+                "text": "Test Solutions Vision Operations",
+                "aria_label": "Business Unit",
+                "labelledby_text": "Business Unit",
+                "oracle_host_text": "",
+                "oracle_host_data_oj_field": "",
+                "title": "",
+                "label_hint": "",
+                "placeholder": "",
+                "name": "businessUnit",
+                "id": "businessUnitId",
+                "html": '<select id="businessUnitId" aria-label="Business Unit"><option selected>Test Solutions</option></select>',
+                "data_oj_field": "",
+                "oracle_host_tag": "",
+            },
+        ],
+        2,
+    )
+
+    assert ranked[0]["tag"] == "select"
+    assert ranked[0]["id"] == "businessUnitId"
+
+
+def test_select_adf_menu_panel_option_fails_when_completion_action_does_not_advance_flow(monkeypatch) -> None:
+    monkeypatch.setenv("PTR_TRANSACTION_COMPLETE_POSTCONDITION_TIMEOUT_MS", "0")
+    trigger = _SearchOptionLocator("trigger")
+    option = _SearchOptionLocator("raw-option")
+    page = _CompletionPage(title_text="Edit Transaction: Invoice 58005")
+    clicked: list[str] = []
+    observations = iter(
+        [
+            {
+                "url": page.url,
+                "title": "Edit Transaction: Invoice 58005",
+                "guided_step": "Edit Transaction",
+                "dialog_count": 1,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: dict(next(observations, {
+        "url": page.url,
+        "title": "Edit Transaction: Invoice 58005",
+        "guided_step": "Edit Transaction",
+        "dialog_count": 1,
+    })))
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_is_actionable", lambda locator, timeout_ms=None: getattr(locator, "name", "") in {
+        "raw-option",
+        "menuitem:Complete and Review",
+    })
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")),
+    )
+
+    def _strict_click(locator, timeout_ms=None):
+        clicked.append(locator.name)
+
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+
+    with pytest.raises(RuntimeError, match="did not complete the transaction"):
+        helpers_v2._ptr_select_adf_menu_panel_option(
+            trigger,
+            option,
+            page,
+            "Complete and Create Another",
+            "Complete and Review",
+            trigger_kind="title",
+        )
+
+    assert clicked == ["trigger", "raw-option", "menuitem:Complete and Review"]
+
+
+def test_select_adf_menu_panel_option_completion_uses_menuitem_row_when_text_cell_advances_nothing(monkeypatch) -> None:
+    monkeypatch.setenv("PTR_TRANSACTION_COMPLETE_POSTCONDITION_TIMEOUT_MS", "0")
+    trigger = _SearchOptionLocator("trigger")
+    option = _SearchOptionLocator("raw-option")
+    page = _CompletionPage(title_text="Edit Transaction: Invoice 58005")
+    clicked: list[str] = []
+    state = {"title": "Edit Transaction: Invoice 58005"}
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_is_actionable", lambda locator, timeout_ms=None: getattr(locator, "name", "") in {
+        "raw-option",
+        "menuitem:Complete and Review",
+    })
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")),
+    )
+
+    def _observe(*args, **kwargs):
+        return {
+            "url": page.url,
+            "title": state["title"],
+            "guided_step": "Edit Transaction",
+            "dialog_count": 1,
+        }
+
+    def _strict_click(locator, timeout_ms=None):
+        clicked.append(locator.name)
+        if locator.name == "menuitem:Complete and Review":
+            state["title"] = "Review Transaction: Invoice 58005"
+            page.title_text = state["title"]
+
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", _observe)
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+
+    helpers_v2._ptr_select_adf_menu_panel_option(
+        trigger,
+        option,
+        page,
+        "Complete and Create Another",
+        "Complete and Review",
+        trigger_kind="title",
+    )
+
+    assert clicked == ["trigger", "raw-option", "menuitem:Complete and Review"]
+
+
+def test_select_adf_menu_panel_option_completion_accepts_review_page_when_browser_title_stays_stable(monkeypatch) -> None:
+    monkeypatch.setenv("PTR_TRANSACTION_COMPLETE_POSTCONDITION_TIMEOUT_MS", "0")
+    trigger = _SearchOptionLocator("trigger")
+    option = _SearchOptionLocator("raw-option")
+    page = _CompletionPage(title_text="Create Transaction - Billing - Oracle Fusion Cloud Applications")
+    clicked: list[str] = []
+    state = {
+        "primary_heading": "Edit Transaction: Invoice 58007",
+        "body_marker": "Edit Transaction: Invoice 58007 Status Incomplete Payment Terms IMMEDIATE",
+    }
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_is_actionable", lambda locator, timeout_ms=None: getattr(locator, "name", "") == "raw-option")
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")),
+    )
+
+    def _observe(*args, **kwargs):
+        return {
+            "url": page.url,
+            "title": page.title_text,
+            "guided_step": "",
+            "guided_flow": {"primary_heading": state["primary_heading"]},
+            "dialog_count": 1,
+            "body_marker": state["body_marker"],
+        }
+
+    def _strict_click(locator, timeout_ms=None):
+        clicked.append(locator.name)
+        if locator.name == "raw-option":
+            state["primary_heading"] = "Review Transaction: Invoice 7005359"
+            state["body_marker"] = "Review Transaction: Invoice 7005359 Status Complete Payment Terms IMMEDIATE"
+
+    monkeypatch.setattr(helpers_v2, "_ptr_current_guided_step", lambda current_page: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_guided_flow_state", lambda current_page: {"primary_heading": state["primary_heading"]})
+    monkeypatch.setattr(helpers_v2, "_ptr_body_marker", lambda current_page: state["body_marker"])
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", _observe)
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+
+    helpers_v2._ptr_select_adf_menu_panel_option(
+        trigger,
+        option,
+        page,
+        "Complete and Create Another",
+        "Complete and Review",
+        trigger_kind="title",
+    )
+
+    assert clicked == ["trigger", "raw-option"]
+
+
 def test_select_search_trigger_option_fails_clearly_on_oracle_no_matches(monkeypatch) -> None:
     trigger = _SearchOptionLocator("search")
     option = _SearchOptionLocator("raw-option")
@@ -1793,6 +3140,7 @@ def test_select_search_trigger_option_fails_clearly_on_oracle_no_matches(monkeyp
     experience_calls: list[str] = []
     ai_calls: list[str] = []
 
+    helpers_v2._ptr_reset_strategy_tracking("select_search_trigger_option", "Candidate Selection Process")
     monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
     monkeypatch.setattr(helpers_v2, "_ptr_enter_search_value", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -1832,6 +3180,10 @@ def test_select_search_trigger_option_fails_clearly_on_oracle_no_matches(monkeyp
 
     assert experience_calls == []
     assert ai_calls == []
+    debug_trace = helpers_v2._PTR_CURRENT_STRATEGY["debug"]["select_search_trigger_option"]
+    assert debug_trace["status"] == "failed"
+    assert debug_trace["oracle_search_state"]["no_matches"] is True
+    assert "no matches" in debug_trace["final_error"].lower()
 
 
 def test_click_combobox_uses_oracle_keyboard_open_when_label_intercepts_pointer_events(monkeypatch) -> None:
@@ -1892,6 +3244,9 @@ def test_click_combobox_uses_oracle_keyboard_open_when_label_intercepts_pointer_
             "strategy_name": "oracle_select_single_arrowdown",
         },
     }
+    debug_trace = helpers_v2._PTR_CURRENT_STRATEGY["debug"]["click_combobox"]
+    assert debug_trace["oracle_select_single_keyboard_open"]["status"] == "validated"
+    assert debug_trace["resolved_by"] == "oracle_select_single_keyboard_open"
     assert stored["status"] == "success"
     assert stored["postcondition_kind"] == "dialog_opened"
 
@@ -1902,6 +3257,8 @@ def test_click_combobox_marks_ai_interaction_failed_when_locator_does_not_valida
     repaired = _DateLocator("repaired")
     observations = iter(
         [
+            {"dialog_count": 0, "body_marker": "same"},
+            {"dialog_count": 0, "body_marker": "same"},
             {"dialog_count": 0, "body_marker": "same"},
             {"dialog_count": 0, "body_marker": "same"},
             {"dialog_count": 0, "body_marker": "same"},
@@ -1922,7 +3279,7 @@ def test_click_combobox_marks_ai_interaction_failed_when_locator_does_not_valida
 
     monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: next(observations))
     monkeypatch.setattr(helpers_v2, "_ptr_strict_click", lambda *args, **kwargs: None)
-    monkeypatch.setattr(helpers_v2, "_ptr_generic_click_postcondition", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_combobox_open_postcondition", lambda *args, **kwargs: False)
     monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         helpers_v2,
@@ -1939,6 +3296,61 @@ def test_click_combobox_marks_ai_interaction_failed_when_locator_does_not_valida
     assert interaction["postcondition_kind"] == "dialog_opened"
     assert interaction["postcondition_passed"] is False
     assert 'did not open combobox "Search for people to add as"' in interaction["repair_error"]
+
+
+def test_click_with_candidates_records_debug_trace_on_failure(monkeypatch) -> None:
+    page = _NavigationPage()
+    locator = _DateLocator("recorded")
+
+    helpers_v2._ptr_reset_strategy_tracking("click_text_target", "Edit Additional Information")
+
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_observe",
+        lambda *args, **kwargs: {
+            "url": page.url,
+            "title": "Work Area",
+            "guided_step": "",
+            "guided_flow": {},
+            "dialog_count": 0,
+            "active_element": {},
+            "body_marker": "body",
+            "target_value": "",
+            "target_text": "Edit Additional Information",
+            "target_visible": True,
+            "target_meta": {"role": "link"},
+        },
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_strict_click",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("strict click failed")),
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_try_expand_oracle_quick_actions", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_quick_action_exact_match", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_home_search", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_guided_action_card", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_execute_ai_repair_rounds",
+        lambda **kwargs: (None, RuntimeError('AI strategy "text_option" did not satisfy postcondition')),
+    )
+
+    with pytest.raises(RuntimeError, match='Unable to click target "Edit Additional Information"'):
+        helpers_v2._ptr_click_with_candidates(
+            page,
+            "Edit Additional Information",
+            locator,
+            "click_text_target",
+            helpers_v2._ptr_generic_click_postcondition,
+        )
+
+    debug_trace = helpers_v2._PTR_CURRENT_STRATEGY["debug"]["click_with_candidates"]
+    assert debug_trace["status"] == "failed"
+    assert debug_trace["direct_attempt"]["status"] == "failed"
+    assert debug_trace["experience_attempts"] == [{"status": "no_candidates"}]
+    assert debug_trace["ai_repair"]["status"] == "failed"
 
 
 def test_control_family_recognizes_menu_panel_helpers() -> None:
@@ -2261,6 +3673,116 @@ def test_click_with_candidates_uses_oracle_quick_action_exact_match_after_expand
     assert recovery["handler_name"] == "oracle_quick_action_exact_match"
     assert recovery["kind"] == "quick_action_exact_match"
     assert recovery["details"] == {"label": "View Accounting", "strategy_name": "oracle_quick_action_exact_link"}
+
+
+def test_click_with_candidates_uses_oracle_notification_badge_before_ai(monkeypatch) -> None:
+    page = _OracleNotificationBadgePage()
+    locator = _DateLocator("primary")
+    clicked: list[str] = []
+    recovery: dict[str, object] = {}
+
+    def _strict_click(target, timeout_ms=None):
+        if target is locator:
+            raise RuntimeError(
+                'Locator.wait_for: Timeout 30000ms exceeded.\n'
+                'Call log:\n'
+                '  - waiting for get_by_role("link", name="Notifications (10 unread)") to be visible'
+            )
+        clicked.append(target.name)
+
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: {"clicked": tuple(clicked)})
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_locator_is_actionable",
+        lambda target, timeout_ms=None: target is page.notification_role,
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_try_expand_oracle_quick_actions", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_quick_action_exact_match", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_home_search", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("home search should not run")))
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_guided_action_card", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("guided action card should not run")))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: recovery.setdefault("experience", kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")))
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")))
+
+    helpers_v2._ptr_click_with_candidates(
+        page,
+        "Notifications (10 unread)",
+        locator,
+        "click_text_target",
+        lambda before, after: before.get("clicked") != after.get("clicked"),
+    )
+
+    assert clicked == ["notification_role"]
+    assert recovery["handler_name"] == "oracle_notification_badge"
+    assert recovery["kind"] == "notification_badge"
+    assert recovery["details"] == {"label": "Notifications (10 unread)", "strategy_name": "oracle_notification_badge_role"}
+
+
+def test_click_with_candidates_uses_oracle_recorded_button_context_before_ai(monkeypatch) -> None:
+    page = _RecordedButtonContextPage()
+    locator = _DateLocator("primary")
+    clicked: list[str] = []
+    recovery: dict[str, object] = {}
+
+    def _strict_click(target, timeout_ms=None):
+        if target is locator:
+            raise RuntimeError(
+                'Locator.wait_for: Error: strict mode violation: get_by_role("button", name="Approve") resolved to 9 elements'
+            )
+        clicked.append(target.name)
+
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: {"clicked": tuple(clicked)})
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_capture_locator_context",
+        lambda *args, **kwargs: {
+            "id": "_FOpt1:_FOr1:0:_FONSr2:0:MAnt2:0:up1:UPsp1:r1:0:lv4:2:cb2",
+            "title": "Approve Job Requisition Medical Office Administrator - 1269 Requires Approval",
+            "class_name": "homebutton-primary x7j p_AFTextOnly",
+        },
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_locator_is_actionable",
+        lambda target, timeout_ms=None: target is page.title_button,
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_try_expand_oracle_quick_actions", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_quick_action_exact_match", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_notification_badge", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_home_search", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("home search should not run")))
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_guided_action_card", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("guided action card should not run")))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: recovery.setdefault("experience", kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")))
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")))
+
+    helpers_v2._ptr_click_with_candidates(
+        page,
+        "Approve",
+        locator,
+        "click_button_target",
+        lambda before, after: before.get("clicked") != after.get("clicked"),
+    )
+
+    assert clicked == ["title_button"]
+    assert recovery["handler_name"] == "oracle_recorded_button_context"
+    assert recovery["kind"] == "recorded_button_context"
+    assert recovery["details"] == {"label": "Approve", "strategy_name": "oracle_recorded_button_title"}
 
 
 def test_click_with_candidates_skips_optional_oracle_warning_ok_when_dialog_is_absent(monkeypatch) -> None:

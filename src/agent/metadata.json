@@ -1,6 +1,6 @@
 {
   "name": "test_runner",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Executes Playwright-generated Python scripts as a test suite and returns an HTML report.",
   "component": "agent",
   "config": {
@@ -50,6 +50,34 @@
             "required": false,
             "description": "Milliseconds to wait after each action (settle time) before capturing the step. Leave empty to use the runner default. A per-recording value overrides this suite default.",
             "friendly_name": "After-action wait (ms)"
+          },
+          {
+            "name": "debug_trace",
+            "type": "boolean",
+            "required": false,
+            "description": "Capture extra per-step runtime debug details in the action log and report.",
+            "friendly_name": "Debug trace"
+          },
+          {
+            "name": "debug_record_video",
+            "type": "boolean",
+            "required": false,
+            "description": "Record Playwright video for the run and include it in the manifest when available.",
+            "friendly_name": "Debug record video"
+          },
+          {
+            "name": "debug_full_page_steps",
+            "type": "boolean",
+            "required": false,
+            "description": "Capture full-page step screenshots instead of viewport-only images.",
+            "friendly_name": "Debug full-page step screenshots"
+          },
+          {
+            "name": "debug_page_text_max_chars",
+            "type": "number",
+            "required": false,
+            "description": "Maximum page-text snapshot length to persist for diagnostics and report debugging.",
+            "friendly_name": "Debug page-text max chars"
           }
         ]
       }

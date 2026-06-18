@@ -26,6 +26,7 @@ try:
         parameterise_script as _parameterise_script,
         substitute_parameters as _substitute_parameters,
     )
+    from utils.runtime_env import get_runner_env_value, load_runner_local_env
     from utils.html_report_generator import generate_html_report_content
 except ImportError:  # pragma: no cover - published/runtime fallback
     from src.runtime.parameterization import (
@@ -33,9 +34,11 @@ except ImportError:  # pragma: no cover - published/runtime fallback
         parameterise_script as _parameterise_script,
         substitute_parameters as _substitute_parameters,
     )
+    from src.utils.runtime_env import get_runner_env_value, load_runner_local_env
     from src.utils.html_report_generator import generate_html_report_content
 
 logger = setup_logger(__name__)
+load_runner_local_env()
 
 _MAX_AI_LOG_CHARS = 3_000
 
@@ -140,6 +143,22 @@ def _env_flag(value: str | None, default: bool) -> bool:
     return raw_value.lower() not in ("false", "0", "no", "off")
 
 
+def _resolve_recording_nonnegative_int(recording: dict[str, Any], key: str) -> int | None:
+    raw_value = recording.get(key)
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+        return None
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid %s=%r for recording %s",
+            key,
+            raw_value,
+            recording.get("file") or recording.get("name") or "unknown",
+        )
+        return None
+
+
 def _resolve_after_action_wait_ms(recording: dict[str, Any]) -> int | None:
     """Optional per-recording override for the post-action settle wait (milliseconds).
 
@@ -147,18 +166,57 @@ def _resolve_after_action_wait_ms(recording: dict[str, Any]) -> int | None:
     (key ``after_action_wait_ms``), otherwise ``None`` so the runtime helper falls
     back to its built-in default.
     """
-    raw_value = recording.get("after_action_wait_ms")
+    return _resolve_recording_nonnegative_int(recording, "after_action_wait_ms")
+
+
+def _resolve_recording_bool_override(recording: dict[str, Any], key: str) -> str | None:
+    raw_value = recording.get(key)
     if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
         return None
+    normalized = str(raw_value).strip().lower()
+    return "false" if normalized in ("false", "0", "no", "off") else "true"
+
+
+def _apply_recording_debug_env_overrides(
+    env: dict[str, str],
+    recording: dict[str, Any],
+) -> dict[str, str]:
+    updated = dict(env)
+    bool_mappings = {
+        "debug_trace": "PTR_DEBUG_TRACE",
+        "debug_record_video": "PTR_RECORD_VIDEO",
+        "debug_full_page_steps": "PTR_STEP_SCREENSHOT_FULL_PAGE",
+    }
+    for recording_key, env_key in bool_mappings.items():
+        resolved = _resolve_recording_bool_override(recording, recording_key)
+        if resolved is not None:
+            updated[env_key] = resolved
+
+    debug_page_text_max_chars = _resolve_recording_nonnegative_int(recording, "debug_page_text_max_chars")
+    if debug_page_text_max_chars is not None:
+        updated["PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS"] = str(debug_page_text_max_chars)
+    return updated
+
+
+def _resolve_env_nonnegative_int(value: Any, default: int) -> int:
     try:
-        return max(0, int(raw_value))
-    except (TypeError, ValueError):
-        logger.warning(
-            "Ignoring invalid after_action_wait_ms=%r for recording %s",
-            raw_value,
-            recording.get("file") or recording.get("name") or "unknown",
-        )
-        return None
+        return max(0, int(value))
+    except Exception:
+        return default
+
+
+def _effective_debug_settings(env: dict[str, str]) -> dict[str, Any]:
+    return {
+        "after_action_wait_ms": _resolve_env_nonnegative_int(env.get("PTR_AFTER_ACTION_WAIT_MS"), 10_000),
+        "capture_steps": _env_flag(env.get("PTR_CAPTURE_STEPS"), True),
+        "record_video": _env_flag(env.get("PTR_RECORD_VIDEO"), False),
+        "step_screenshot_full_page": _env_flag(env.get("PTR_STEP_SCREENSHOT_FULL_PAGE"), False),
+        "page_text_snapshot_max_chars": _resolve_env_nonnegative_int(
+            env.get("PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS"),
+            12_000,
+        ),
+        "debug_trace": _env_flag(env.get("PTR_DEBUG_TRACE"), False),
+    }
 
 
 def _split_storage_object_ref(object_ref: str) -> tuple[str, str]:
@@ -1399,7 +1457,7 @@ def _is_flow_context_ai_enabled() -> bool:
 
 
 def _get_flow_context_ai_model() -> str:
-    return os.getenv("PTR_FLOW_CONTEXT_AI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    return os.getenv("PTR_FLOW_CONTEXT_AI_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
 
 
 def _build_flow_context_ai_request_payload(
@@ -1472,7 +1530,7 @@ def _call_openai_flow_context_extraction(
     result: dict[str, Any],
     spec: dict[str, Any],
 ) -> dict[str, Any]:
-    api_key = str(os.getenv("OPENAI_API_KEY", "")).strip()
+    api_key = get_runner_env_value("OPENAI_API_KEY")
     model = _get_flow_context_ai_model()
     if not _is_flow_context_ai_enabled():
         return {
@@ -1663,7 +1721,7 @@ def _get_openai_base_url() -> str:
 
 
 def _get_openai_failure_summary_model() -> str:
-    return os.getenv("OPENAI_FAILURE_SUMMARY_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    return os.getenv("OPENAI_FAILURE_SUMMARY_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
 
 
 def _summarize_openai_error(raw_text: str) -> str:
@@ -1800,7 +1858,7 @@ def _call_openai_failure_summary(
     failure_screenshot_path: Path | None,
     step_image_paths: list[Path],
 ) -> dict[str, Any]:
-    api_key = str(os.getenv("OPENAI_API_KEY", "")).strip()
+    api_key = get_runner_env_value("OPENAI_API_KEY")
     if not _is_ai_failure_summary_enabled():
         return {
             "status": "skipped",
@@ -2157,6 +2215,7 @@ def _base_recording_result(recording: dict[str, Any]) -> dict[str, Any]:
         "video_s3_key": None,
         "video_s3_keys": [],
         "step_artifacts": [],
+        "debug_settings": {},
         "ai_failure_summary": None,
         "parameters_file_key": None,
         "resolved_parameter_count": 0,
@@ -2370,6 +2429,7 @@ async def execute_recording_script(
         env["PTR_EXPERIENCE_STORE_PATH"] = str(experience_store_path)
         env.setdefault("PTR_EXPERIENCE_ENABLED", "true")
         env.setdefault("PTR_RUNNER_VERSION", "ptr-v2")
+        env = _apply_recording_debug_env_overrides(env, recording)
         after_action_wait_ms = _resolve_after_action_wait_ms(recording)
         if after_action_wait_ms is not None:
             env["PTR_AFTER_ACTION_WAIT_MS"] = str(after_action_wait_ms)
@@ -2388,6 +2448,7 @@ async def execute_recording_script(
             env["PTR_VIDEO_DIR"] = str(video_dir)
         else:
             env.pop("PTR_VIDEO_DIR", None)
+        result["debug_settings"] = _effective_debug_settings(env)
 
         python_bin = str(env.get("PLAYWRIGHT_TEST_PYTHON_BIN") or "python3").strip() or "python3"
 

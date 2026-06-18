@@ -20,6 +20,15 @@ def _safe_segment(value: Any) -> str:
     return cleaned.strip("._") or "unknown"
 
 
+def _optional_trigger_value(payload: dict[str, Any], key: str) -> Any:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def _child_workflow_id(recording: dict[str, Any], parent_run_id: str, index: int) -> str:
     # Ensure uniqueness even when client sends duplicate recording IDs.
     recording_id = _safe_segment(recording.get("id") or f"idx-{index}")
@@ -65,6 +74,23 @@ def _apply_suite_after_action_wait(
     merged = dict(recording)
     merged["after_action_wait_ms"] = suite_after_action_wait_ms
     return merged
+
+
+def _apply_suite_debug_options(
+    recording: dict[str, Any],
+    suite_debug_options: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(suite_debug_options, dict) or not suite_debug_options:
+        return recording
+
+    merged: dict[str, Any] | None = None
+    for key, value in suite_debug_options.items():
+        if value is None or recording.get(key) is not None:
+            continue
+        if merged is None:
+            merged = dict(recording)
+        merged[key] = value
+    return merged if merged is not None else recording
 
 
 def _merge_recording_outputs_into_suite_context(
@@ -130,7 +156,7 @@ def _blocked_dependency_reason(
 
 def _extract_trigger_payload(
     payload: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]], str, str, Any]:
+) -> tuple[str, list[dict[str, Any]], str, str, Any, dict[str, Any]]:
     if isinstance(payload.get("0"), dict):
         trigger_data = payload["0"]
     elif isinstance(payload.get("triggers"), list) and payload["triggers"]:
@@ -148,8 +174,18 @@ def _extract_trigger_payload(
     resume_from_run_id = str(trigger_data.get("resume_from_run_id", "") or "").strip()
     # Optional suite-level post-action settle wait (ms). Validated downstream by the
     # tool; a per-recording after_action_wait_ms overrides this suite default.
-    after_action_wait_ms = trigger_data.get("after_action_wait_ms")
-    return test_suite_id, recordings, execution_mode, resume_from_run_id, after_action_wait_ms
+    after_action_wait_ms = _optional_trigger_value(trigger_data, "after_action_wait_ms")
+    suite_debug_options = {
+        key: value
+        for key in (
+            "debug_trace",
+            "debug_record_video",
+            "debug_full_page_steps",
+            "debug_page_text_max_chars",
+        )
+        if (value := _optional_trigger_value(trigger_data, key)) is not None
+    }
+    return test_suite_id, recordings, execution_mode, resume_from_run_id, after_action_wait_ms, suite_debug_options
 
 
 async def _expand_recordings_for_parameter_rows(
@@ -233,6 +269,7 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
         execution_mode,
         resume_from_run_id,
         suite_after_action_wait_ms,
+        suite_debug_options,
     ) = _extract_trigger_payload(payload)
 
     if not test_suite_id:
@@ -294,6 +331,7 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
         for idx, recording in enumerate(ordered_recordings, start=resume_offset):
             child_recording = _merge_suite_context_into_recording(recording, suite_context)
             child_recording = _apply_suite_after_action_wait(child_recording, suite_after_action_wait_ms)
+            child_recording = _apply_suite_debug_options(child_recording, suite_debug_options)
             child_payload = {
                 "recording": child_recording,
                 "test_suite_id": test_suite_id,
@@ -381,7 +419,10 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
             agentExecutor.execute(
                 "TestRunnerChild",
                 {
-                    "recording": _apply_suite_after_action_wait(recording, suite_after_action_wait_ms),
+                    "recording": _apply_suite_debug_options(
+                        _apply_suite_after_action_wait(recording, suite_after_action_wait_ms),
+                        suite_debug_options,
+                    ),
                     "test_suite_id": test_suite_id,
                     "parent_run_id": parent_run_id,
                 },

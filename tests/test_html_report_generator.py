@@ -129,6 +129,41 @@ def test_generate_html_report_content_uses_final_aetherion_layout() -> None:
     assert "https://example.test/should-not-show" not in html
 
 
+def test_generate_html_report_content_omits_suite_level_failure_callout_but_keeps_recording_failure_details() -> None:
+    html = generate_html_report_content(
+        test_suite_id="HCM_Failure_Callout",
+        parent_run_id="run-callout",
+        results=[
+            _result(
+                recording_name="HCM_Promote_and_change_position",
+                status="failed",
+                duration_seconds=257.2,
+                ai_failure_summary={
+                    "headline": "Unable to open control",
+                    "summary": "Oracle control did not become actionable.",
+                    "next_action": "Inspect deterministic handler.",
+                    "failure_category": "Failure",
+                },
+                action_log=[
+                    _action(
+                        step=1,
+                        action="click_button",
+                        label="Continue",
+                        status="failed",
+                        strategy="direct",
+                        duration_ms=900,
+                        error="Continue did not advance.",
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert 'class="failure-card suite-callout"' not in html
+    assert 'class="failure-card recording-callout"' in html
+    assert "Inspect deterministic handler." in html
+
+
 def test_generate_html_report_content_is_suite_aware_and_keeps_parameters_per_recording() -> None:
     html = generate_html_report_content(
         test_suite_id="HCM_Suite",
@@ -204,7 +239,7 @@ def test_generate_html_report_content_renders_flow_context_inputs_outputs_and_ai
                         "ai_interaction": {
                             "status": "success",
                             "feature": "flow_context_extraction",
-                            "model": "gpt-4.1-mini",
+                            "model": "gpt-5.4-mini",
                             "system_prompt": "Extract one field",
                             "user_prompt": "Find the requisition number",
                             "response_text": '{"value":"1003","reason":"Found in confirmation text"}',
@@ -241,17 +276,21 @@ def test_generate_html_report_content_renders_combined_ai_request_and_model_outp
         "label": "Notifications",
         "status": "success",
         "repair_outcome": "validated",
-        "model": "gpt-4.1-mini",
+        "model": "gpt-5.4-mini",
         "endpoint": "https://api.openai.com/v1/responses",
         "system_prompt": "You are a senior Playwright locator repair assistant. Return concise JSON only.",
         "user_prompt": (
             "Find the Notifications control.\n"
+            "Requested action value JSON:\n"
+            '{"type":"raw","value":"Notifications"}\n'
             "Recorded script data JSON:\n"
             '{"tracked_action":"click_text","helper_name":"_ptr_click_text_target"}\n'
             "Recorded target context JSON:\n"
             '{"text":"Notifications (7 unread)","tag":"title"}\n'
-            "DOM candidates JSON:\n"
+            "Relevant DOM candidates JSON:\n"
             '{"helper":"click_text_target","label":"Notifications","candidates":[{"tag":"a","id":"pt1:_UISatr:0:cil1","title":"Notifications (7 unread)","text":"Notifications (7 unread)"},{"tag":"a","id":"d1::skip","text":"Skip to main content"}]}'
+            "\nRetry feedback JSON:\n"
+            '{"round":1,"execution_error":"Timed out waiting for locator"}'
         ),
         "response_text": (
             '{"strategies":[{"kind":"css","selector":"#pt1\\\\:_UISatr\\\\:0\\\\:cil1",'
@@ -269,6 +308,15 @@ def test_generate_html_report_content_renders_combined_ai_request_and_model_outp
         "locator_strategies": ["ai_css_1", "ai_xpath_2", "ai_text_3"],
         "validated_locator_strategy": "ai_css_1",
         "last_locator_strategy": "ai_css_1",
+        "page_screenshot": {
+            "status": "captured",
+            "media_type": "image/jpeg",
+            "format": "jpeg",
+            "full_page": True,
+            "scale": "css",
+            "quality": 45,
+            "image_url": "data:image/jpeg;base64,BBBB",
+        },
         "usage": {"input_tokens": 4949, "output_tokens": 179, "total_tokens": 5128},
     }
 
@@ -305,14 +353,74 @@ def test_generate_html_report_content_renders_combined_ai_request_and_model_outp
     assert "AI self-repair details" in html
     assert "Request Sent to AI" in html
     assert "Model Output" in html
+    assert "Raw Prompt" in html
+    assert "requested_action_value" in html
     assert "recorded_script_data" in html
     assert "recorded_target_context" in html
     assert "dom_candidates" in html
+    assert "retry_feedback" in html
+    assert "page_screenshot" in html
+    assert "Screenshot Sent to AI" in html
+    assert 'src="data:image/jpeg;base64,BBBB"' in html
     assert "Validated" in html
     assert "Suggested" in html
     assert "Elements Sent to AI" not in html
     assert "Failure Sent to AI" not in html
     assert "json-pre" in html
+
+
+def test_generate_html_report_content_renders_ai_request_errors_readably() -> None:
+    interaction = {
+        "feature": "self_repair",
+        "helper": "select_search_trigger_option",
+        "label": "Search: Transaction Type",
+        "status": "request_error",
+        "model": "gpt-5.4-mini",
+        "endpoint": "https://api.openai.com/v1/responses",
+        "user_prompt": (
+            "Repair the Oracle selector.\n"
+            "Recorded script data JSON:\n"
+            '{"tracked_action":"search_and_select"}\n'
+            "Relevant DOM candidates JSON:\n"
+            '{"helper":"select_search_trigger_option","label":"Search: Transaction Type","candidates":[{"tag":"a","text":"Search..."}]}'
+        ),
+        "last_error": "Locator.wait_for: Timeout 30000ms exceeded.",
+        "error_type": "HTTPError",
+        "error": "HTTP Error 404: Not Found",
+        "http_status": 404,
+        "error_response_body": '{"error":{"message":"Unknown endpoint","type":"invalid_request_error"}}',
+    }
+
+    html = generate_html_report_content(
+        test_suite_id="AR_Credit_Memo",
+        parent_run_id="run-ai-error",
+        results=[
+            _result(
+                recording_name="AR_Credit_Memo",
+                status="failed",
+                action_log=[
+                    _action(
+                        step=15,
+                        action="search_and_select",
+                        label="Search: Transaction Type",
+                        status="failed",
+                        strategy="ai_self_repair_lookup",
+                        fallback_strategies=["direct", "experience_lookup", "ai_self_repair_lookup"],
+                        ai_interactions=[interaction],
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert "AI self-repair details" in html
+    assert "Request Sent to AI" in html
+    assert "Request Error" in html
+    assert "http_status" in html
+    assert "404" in html
+    assert "invalid_request_error" in html
+    assert "Unknown endpoint" in html
+    assert "Raw Prompt" in html
 
 
 def test_generate_html_report_content_hides_screenshot_object_keys_but_embeds_images(monkeypatch) -> None:
@@ -376,6 +484,45 @@ def test_generate_html_report_content_hides_screenshot_object_keys_but_embeds_im
     assert "data:image/png;base64,AAAA" in html
     assert "playwright-test-results/failure.png" not in html
     assert "playwright-test-results/steps/step_001_date_pick.png" not in html
+
+
+def test_generate_html_report_content_renders_debug_settings_and_step_debug_trace() -> None:
+    html = generate_html_report_content(
+        test_suite_id="AR_Prepayment_Application",
+        parent_run_id="run-debug",
+        results=[
+            _result(
+                recording_name="AR_Prepayment_Application",
+                debug_settings={
+                    "after_action_wait_ms": 2000,
+                    "capture_steps": True,
+                    "record_video": False,
+                    "step_screenshot_full_page": True,
+                    "page_text_snapshot_max_chars": 24000,
+                    "debug_trace": True,
+                },
+                action_log=[
+                    _action(
+                        step=39,
+                        action="adf_menu_select",
+                        label="Complete and Create Another",
+                        debug={
+                            "oracle_completion_check": {
+                                "matched_signal": "heading_changed_to_review",
+                                "postcondition_passed": True,
+                            }
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert "Debug Settings" in html
+    assert "Debug Trace" in html
+    assert "oracle_completion_check" in html
+    assert "heading_changed_to_review" in html
+    assert "page_text_snapshot_max_chars" in html
 
 
 def test_generate_html_report_content_formats_duration_cards_with_small_units() -> None:

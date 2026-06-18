@@ -449,7 +449,7 @@ def _extract_ai_error_text(interaction: dict[str, Any]) -> str:
         return ""
 
     match = re.search(
-        r"- Last error:\s*(.*?)(?:\nRecorded script data JSON:|\nRecorded target context JSON:|\nDOM candidates JSON:|\Z)",
+        r"- Last error:\s*(.*?)(?:\nRequested action value JSON:|\nRecorded script data JSON:|\nRecorded target context JSON:|\nRelevant DOM candidates JSON:|\nDOM candidates JSON:|\nRetry feedback JSON:|\Z)",
         prompt,
         re.S,
     )
@@ -458,29 +458,42 @@ def _extract_ai_error_text(interaction: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_prompt_json_section(prompt: str, heading: str) -> Any:
+_PROMPT_JSON_HEADINGS = [
+    "Requested action value JSON",
+    "Recorded script data JSON",
+    "Recorded target context JSON",
+    "Relevant DOM candidates JSON",
+    "DOM candidates JSON",
+    "Retry feedback JSON",
+]
+
+
+def _extract_prompt_section_text(prompt: str, *headings: str) -> str:
     prompt_text = _safe_text(prompt)
     if not prompt_text:
-        return None
+        return ""
 
-    marker = f"{heading}:\n"
-    start = prompt_text.find(marker)
-    if start == -1:
-        return None
-    start += len(marker)
+    for heading in headings:
+        marker = f"{heading}:\n"
+        start = prompt_text.find(marker)
+        if start == -1:
+            continue
+        start += len(marker)
 
-    tail = prompt_text[start:]
-    end = len(tail)
-    for next_marker in [
-        "\nRecorded script data JSON:\n",
-        "\nRecorded target context JSON:\n",
-        "\nDOM candidates JSON:\n",
-    ]:
-        idx = tail.find(next_marker)
-        if idx != -1 and idx < end:
-            end = idx
+        tail = prompt_text[start:]
+        end = len(tail)
+        for next_heading in _PROMPT_JSON_HEADINGS:
+            next_marker = f"\n{next_heading}:\n"
+            idx = tail.find(next_marker)
+            if idx != -1 and idx < end:
+                end = idx
 
-    section = tail[:end].strip()
+        return tail[:end].strip()
+    return ""
+
+
+def _extract_prompt_json_section(prompt: str, heading: str) -> Any:
+    section = _extract_prompt_section_text(prompt, heading)
     if not section:
         return None
     try:
@@ -563,19 +576,25 @@ def _ai_block(
     )
 
 
-def _ai_request_payload_json(interaction: dict[str, Any]) -> str:
+def _json_text(value: Any) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=False)
+
+
+def _ai_request_payload(interaction: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
 
-    for field in ("model", "feature", "helper", "label", "max_output_tokens"):
+    for field in ("model", "feature", "helper", "label", "max_output_tokens", "endpoint"):
         value = interaction.get(field)
         if value not in (None, "", []):
             payload[field] = value
 
-    system_prompt = _safe_text(interaction.get("system_prompt"))
     user_prompt = _safe_text(interaction.get("user_prompt") or interaction.get("user_prompt_excerpt"))
     sent_error = _extract_ai_error_text(interaction)
+    requested_action_value = interaction.get("requested_action_value")
+    if requested_action_value in (None, {}, []):
+        requested_action_value = _extract_prompt_json_section(user_prompt, "Requested action value JSON")
 
-    recorded_script_data = interaction.get("recorded_script_data")
+    recorded_script_data = interaction.get("recorded_script_data") or interaction.get("script_data")
     if recorded_script_data in (None, {}, []):
         recorded_script_data = _extract_prompt_json_section(user_prompt, "Recorded script data JSON")
 
@@ -585,18 +604,25 @@ def _ai_request_payload_json(interaction: dict[str, Any]) -> str:
 
     dom_candidates = interaction.get("dom_candidates")
     if dom_candidates in (None, [], {}):
-        dom_json = _extract_prompt_json_section(user_prompt, "DOM candidates JSON")
+        dom_json = _extract_prompt_json_section(user_prompt, "Relevant DOM candidates JSON")
+        if dom_json in (None, "", [], {}):
+            dom_json = _extract_prompt_json_section(user_prompt, "DOM candidates JSON")
         if isinstance(dom_json, dict):
             dom_candidates = dom_json
         elif dom_json is not None:
             dom_candidates = dom_json
 
-    if system_prompt:
-        payload["system_prompt"] = system_prompt
-    if user_prompt:
-        payload["user_prompt"] = user_prompt
+    retry_feedback = interaction.get("retry_feedback")
+    if retry_feedback in (None, {}, []):
+        retry_feedback = _extract_prompt_json_section(user_prompt, "Retry feedback JSON")
+    page_screenshot = interaction.get("page_screenshot") or {}
+    if not isinstance(page_screenshot, dict):
+        page_screenshot = {}
+
     if sent_error:
         payload["last_error"] = sent_error
+    if requested_action_value not in (None, {}, []):
+        payload["requested_action_value"] = requested_action_value
     if recorded_script_data not in (None, {}, []):
         payload["recorded_script_data"] = recorded_script_data
     if recorded_target_context not in (None, {}, []):
@@ -605,8 +631,97 @@ def _ai_request_payload_json(interaction: dict[str, Any]) -> str:
         payload["dom_candidates"] = dom_candidates
     elif interaction.get("dom_candidate_count") not in (None, "", 0):
         payload["dom_candidate_count"] = interaction.get("dom_candidate_count")
+    if retry_feedback not in (None, {}, []):
+        payload["retry_feedback"] = retry_feedback
+    if page_screenshot:
+        payload["page_screenshot"] = {
+            "status": _safe_text(page_screenshot.get("status")),
+            "media_type": _safe_text(page_screenshot.get("media_type")),
+            "format": _safe_text(page_screenshot.get("format")),
+            "full_page": bool(page_screenshot.get("full_page")),
+            "scale": _safe_text(page_screenshot.get("scale")),
+            "quality": page_screenshot.get("quality"),
+            "included_as": "input_image" if _safe_text(page_screenshot.get("image_url")) else "",
+            "error_type": _safe_text(page_screenshot.get("error_type")),
+            "error": _safe_text(page_screenshot.get("error")),
+        }
 
-    return json.dumps(payload, indent=2, ensure_ascii=False)
+    return payload
+
+
+def _ai_request_payload_json(interaction: dict[str, Any]) -> str:
+    return _json_text(_ai_request_payload(interaction))
+
+
+def _ai_error_payload_json(interaction: dict[str, Any]) -> str:
+    payload: dict[str, Any] = {}
+    for field in (
+        "status",
+        "repair_outcome",
+        "error_type",
+        "error",
+        "http_status",
+        "repair_error",
+        "repair_failure",
+    ):
+        value = interaction.get(field)
+        if value not in (None, "", [], {}):
+            payload[field] = value
+
+    for field in ("error_response_body", "api_response_body"):
+        value = interaction.get(field)
+        if value in (None, "", [], {}):
+            continue
+        try:
+            payload[field] = json.loads(str(value))
+        except Exception:
+            payload[field] = value
+
+    return _json_text(payload) if payload else ""
+
+
+def _ai_raw_prompt_text(interaction: dict[str, Any]) -> str:
+    return _safe_text(interaction.get("user_prompt") or interaction.get("user_prompt_excerpt"))
+
+
+def _ai_screenshot_data_url(interaction: dict[str, Any]) -> str:
+    screenshot = interaction.get("page_screenshot") or {}
+    if not isinstance(screenshot, dict):
+        return ""
+    return _safe_text(screenshot.get("image_url"))
+
+
+def _ai_image_block(title: str, image_url: str) -> str:
+    clean_url = _safe_text(image_url)
+    if not clean_url:
+        return ""
+    lightbox_title = escape(json.dumps(title), quote=True)
+    return (
+        '<details class="path-ai-panel tone-slate" open>'
+        '<summary class="path-ai-panel-summary">'
+        '<span class="path-ai-panel-icon">'
+        '<svg viewBox="0 0 24 24" aria-hidden="true">'
+        '<rect x="4.5" y="5" width="15" height="14" rx="2.5" stroke="currentColor" stroke-width="1.8" fill="none"/>'
+        '<path d="M8 14l2.8-3.1 2.4 2.5 2.8-3.4L18 14.5" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
+        '<circle cx="9" cy="9" r="1.2" fill="currentColor"/>'
+        "</svg>"
+        "</span>"
+        '<span class="path-ai-panel-copy">'
+        f'<span class="path-ai-panel-title">{escape(title)}</span>'
+        "</span>"
+        '<span class="path-ai-panel-chevron" aria-hidden="true">'
+        '<svg viewBox="0 0 18 18">'
+        '<path d="M4 7l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+        "</svg>"
+        "</span>"
+        "</summary>"
+        '<div class="path-ai-panel-body">'
+        f'<div class="path-ai-shot-wrap" onclick="openLbFromImage(this, {lightbox_title})">'
+        f'<img src="{escape(clean_url, quote=True)}" alt="{escape(title, quote=True)}" loading="lazy" onerror="this.parentElement.outerHTML=\'<div class=&quot;path-ai-shot-ph&quot;>Image not found</div>\'">'
+        "</div>"
+        "</div>"
+        "</details>"
+    )
 
 
 def _ai_strategy_rows(
@@ -798,6 +913,24 @@ def _executed_script_block(result: dict[str, Any]) -> str:
         "</div>"
         "</div>"
         "</details>"
+    )
+
+
+def _debug_json_text(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, indent=2, ensure_ascii=False)
+    return _safe_text(value)
+
+
+def _debug_block(title: str, payload: Any) -> str:
+    body = _debug_json_text(payload)
+    if not body:
+        return ""
+    return (
+        '<div class="detail-card debug-card">'
+        f'<div class="dc-title">{escape(title)}</div>'
+        f"{_highlight_json(body)}"
+        "</div>"
     )
 
 
@@ -1005,6 +1138,9 @@ def _execution_path_block(action: dict[str, Any]) -> str:
             )
 
         request_payload = _ai_request_payload_json(interaction)
+        error_payload = _ai_error_payload_json(interaction)
+        raw_prompt = _ai_raw_prompt_text(interaction)
+        screenshot_block = _ai_image_block("Screenshot Sent to AI", _ai_screenshot_data_url(interaction))
         request_block = _ai_block(
             "Request Sent to AI",
             request_payload,
@@ -1016,6 +1152,19 @@ def _execution_path_block(action: dict[str, Any]) -> str:
             ),
             tone="blue",
             open_by_default=True,
+            render_json=True,
+        )
+        error_block = _ai_block(
+            "Request Error",
+            error_payload,
+            icon=(
+                '<svg viewBox="0 0 24 24" aria-hidden="true">'
+                '<path d="M12 4.5L20 18.5H4L12 4.5z" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linejoin="round"/>'
+                '<path d="M12 9v4.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>'
+                '<circle cx="12" cy="16.5" r="1.1" fill="currentColor"/>'
+                "</svg>"
+            ),
+            tone="rose",
             render_json=True,
         )
         response_block = _ai_block(
@@ -1030,6 +1179,17 @@ def _execution_path_block(action: dict[str, Any]) -> str:
             ),
             tone="green",
             render_json=True,
+        )
+        raw_prompt_block = _ai_block(
+            "Raw Prompt",
+            raw_prompt,
+            icon=(
+                '<svg viewBox="0 0 24 24" aria-hidden="true">'
+                '<path d="M7 6.5h10M7 11.5h10M7 16.5h7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
+                '<rect x="4.5" y="4.5" width="15" height="15" rx="2.5" stroke="currentColor" stroke-width="1.8" fill="none"/>'
+                "</svg>"
+            ),
+            tone="slate",
         )
 
         attempt_badge = (
@@ -1052,7 +1212,10 @@ def _execution_path_block(action: dict[str, Any]) -> str:
             f'{_ai_strategy_rows(interaction, parsed_strategies, status)}'
             f"{tokens}"
             f"{request_block}"
+            f"{screenshot_block}"
+            f"{error_block}"
             f"{response_block}"
+            f"{raw_prompt_block}"
             "</div>"
         )
 
@@ -1135,6 +1298,7 @@ def _step_item(action: dict[str, Any], action_index: int, result: dict[str, Any]
         for block in [
             _execution_path_block(action),
             _script_block(action),
+            _debug_block("Debug Trace", action.get("debug")),
             _failure_context_block(action),
             stacktrace_html,
         ]
@@ -1250,6 +1414,7 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
     flow_context_block = _flow_context_block(result)
     executed_script_block = _executed_script_block(result)
     preparation_warning_block = _preparation_warning_block(result)
+    debug_settings_block = _debug_block("Debug Settings", result.get("debug_settings"))
 
     trace_body = (
         "".join(_step_item(action, action_index, result, result_index) for action_index, action in enumerate(actions))
@@ -1286,6 +1451,7 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
         + flow_context_block
         + preparation_warning_block
         + executed_script_block
+        + debug_settings_block
         + '<div class="trace-section">'
         '<div class="trace-head">'
         '<div class="trace-title">Execution Trace</div>'
@@ -2124,6 +2290,27 @@ body::before{
   overflow:auto;
   overscroll-behavior:contain;
 }
+.path-ai-shot-wrap{
+  border:1px solid var(--border);
+  border-radius:10px;
+  overflow:hidden;
+  background:#fff;
+  cursor:zoom-in;
+}
+.path-ai-shot-wrap img{
+  display:block;
+  width:100%;
+  height:auto;
+}
+.path-ai-shot-ph{
+  padding:18px 16px;
+  border:1px dashed var(--border2);
+  border-radius:10px;
+  background:#f9fbff;
+  color:var(--text-dim);
+  font-size:12px;
+  text-align:center;
+}
 .path-ai-pre{
   background:#f9fbff;
   border:1px solid var(--border);
@@ -2419,7 +2606,6 @@ body::before{
 """
 
     title_text = test_suite_id.replace("_", " ").strip() or "Test Suite"
-    callout_html = _result_callout(first_failed, first_failed_index, summary_only=True) if first_failed else ""
     recordings_html = "".join(
         _recording_item(result, index) for index, result in enumerate(normalized_results)
     ) or '<div class="empty-trace">No recording results were provided.</div>'
@@ -2499,9 +2685,6 @@ body::before{
         <div class="stat-hint">{total_ai_repairs} AI repair attempts</div>
       </div>
     </div>
-
-    {callout_html}
-
     <div class="section-head">
       <div class="section-title">Suite Runs</div>
       <div class="filter-tabs">

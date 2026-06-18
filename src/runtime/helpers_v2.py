@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import os
 import re
@@ -19,11 +20,21 @@ try:
         append_episode as _experience_append_episode,
         retrieve_recovery_candidates as _experience_retrieve_recovery_candidates,
     )
+    from ..utils.ai_repair_prompt import (
+        AI_REPAIR_SYSTEM_PROMPT,
+        build_ai_repair_prompt,
+    )
+    from ..utils.runtime_env import get_runner_env_value, load_runner_local_env
 except ImportError:  # pragma: no cover - published/runtime fallback
     from src.runtime.experience import (
         append_episode as _experience_append_episode,
         retrieve_recovery_candidates as _experience_retrieve_recovery_candidates,
     )
+    from src.utils.ai_repair_prompt import (
+        AI_REPAIR_SYSTEM_PROMPT,
+        build_ai_repair_prompt,
+    )
+    from src.utils.runtime_env import get_runner_env_value, load_runner_local_env
 
 __all__ = [
     "_ptr_launch_chromium",
@@ -76,6 +87,7 @@ _PTR_CURRENT_STRATEGY = {
     "experience_interactions": [],
     "script_data": {},
     "recovery": None,
+    "debug": {},
 }
 
 _PTR_DIAGNOSTICS_PATH = os.getenv("PTR_DIAGNOSTICS_PATH", "")
@@ -91,6 +103,7 @@ _PTR_LAST_PAGE_SNAPSHOT: dict[str, Any] = {}
 _PTR_HARDCODED_AFTER_ACTION_WAIT_MS = 10_000
 _PTR_STEEL_BROWSER_SESSION_IDS: dict[int, str] = {}
 _PTR_STEEL_RELEASE_SESSION_IDS: set[str] = set()
+load_runner_local_env()
 
 _PTR_POPUP_SCOPE_SELECTORS = [
     '[role="dialog"]:visible',
@@ -111,6 +124,15 @@ def _ptr_wait_ms(env_name: str, default: int) -> int:
         return max(0, int(os.getenv(env_name, str(default))))
     except Exception:
         return default
+
+
+def _ptr_resolve_wait_override_ms(value: Any, env_name: str, default: int) -> int:
+    if value is None:
+        return _ptr_wait_ms(env_name, default)
+    try:
+        return max(0, int(value))
+    except Exception:
+        return _ptr_wait_ms(env_name, default)
 
 
 def _ptr_int_env(name: str, default: int) -> int:
@@ -145,6 +167,82 @@ def _ptr_current_script_data() -> dict[str, Any]:
     return _ptr_clone_json_value(current or {}) or {}
 
 
+def _ptr_debug_enabled() -> bool:
+    return _ptr_env_flag("PTR_DEBUG_TRACE", "false")
+
+
+def _ptr_trim_debug_text(value: Any, limit: int = 240) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}..."
+
+
+def _ptr_set_debug_detail(key: str, payload: Any) -> None:
+    normalized_key = str(key or "").strip()
+    if not normalized_key:
+        return
+    debug_payload = _PTR_CURRENT_STRATEGY.setdefault("debug", {})
+    if not isinstance(debug_payload, dict):
+        debug_payload = {}
+        _PTR_CURRENT_STRATEGY["debug"] = debug_payload
+    debug_payload[normalized_key] = _ptr_clone_json_value(payload)
+
+
+def _ptr_debug_observation_summary(observation: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(observation, dict):
+        return {}
+    active_element = observation.get("active_element")
+    active_element = active_element if isinstance(active_element, dict) else {}
+    target_meta = observation.get("target_meta")
+    target_meta = target_meta if isinstance(target_meta, dict) else {}
+    guided_flow = observation.get("guided_flow")
+    guided_flow = guided_flow if isinstance(guided_flow, dict) else {}
+    return {
+        "url": str(observation.get("url") or "").strip(),
+        "title": str(observation.get("title") or "").strip(),
+        "guided_step": str(observation.get("guided_step") or "").strip(),
+        "guided_flow_primary_heading": _ptr_trim_debug_text(guided_flow.get("primary_heading"), 160),
+        "dialog_count": int(observation.get("dialog_count") or 0),
+        "body_marker": _ptr_trim_debug_text(observation.get("body_marker"), 160),
+        "active_element": {
+            "tag": str(active_element.get("tag") or "").strip(),
+            "id": str(active_element.get("id") or "").strip(),
+            "name": str(active_element.get("name") or "").strip(),
+            "role": str(active_element.get("role") or "").strip(),
+            "aria_label": _ptr_trim_debug_text(active_element.get("aria_label"), 120),
+            "title": _ptr_trim_debug_text(active_element.get("title"), 120),
+        },
+        "target": {
+            "visible": bool(observation.get("target_visible")),
+            "value": _ptr_trim_debug_text(observation.get("target_value"), 120),
+            "text": _ptr_trim_debug_text(observation.get("target_text"), 120),
+            "tag": str(target_meta.get("tag") or "").strip(),
+            "id": str(target_meta.get("id") or "").strip(),
+            "name": str(target_meta.get("name") or "").strip(),
+            "role": str(target_meta.get("role") or "").strip(),
+            "aria_label": _ptr_trim_debug_text(target_meta.get("aria_label"), 120),
+            "title": _ptr_trim_debug_text(target_meta.get("title"), 120),
+            "class_name": _ptr_trim_debug_text(target_meta.get("class_name"), 120),
+            "aria_expanded": str(target_meta.get("aria_expanded") or "").strip(),
+            "aria_selected": str(target_meta.get("aria_selected") or "").strip(),
+        },
+    }
+
+
+def _ptr_update_debug_detail(key: str, payload: dict[str, Any]) -> dict[str, Any]:
+    current = _PTR_CURRENT_STRATEGY.get("debug") or {}
+    existing = current.get(key) if isinstance(current, dict) else {}
+    merged = _ptr_clone_json_value(existing) if isinstance(existing, dict) else {}
+    if not isinstance(merged, dict):
+        merged = {}
+    merged.update(_ptr_clone_json_value(payload) or {})
+    _ptr_set_debug_detail(key, merged)
+    return merged
+
+
 def _ptr_reset_strategy_tracking(helper: str, label: str = "") -> None:
     _PTR_CURRENT_STRATEGY["helper"] = helper
     _PTR_CURRENT_STRATEGY["strategy"] = "direct"
@@ -154,6 +252,7 @@ def _ptr_reset_strategy_tracking(helper: str, label: str = "") -> None:
     _PTR_CURRENT_STRATEGY["experience_interactions"] = []
     _PTR_CURRENT_STRATEGY["script_data"] = _ptr_clone_json_value(_PTR_SCRIPT_DATA or {}) or {}
     _PTR_CURRENT_STRATEGY["recovery"] = None
+    _PTR_CURRENT_STRATEGY["debug"] = {}
 
 
 def _ptr_record_strategy_attempt(strategy: str) -> None:
@@ -210,6 +309,13 @@ def _ptr_finalize_last_ai_interaction(
     if error_text:
         patch["repair_error"] = error_text
     _ptr_update_last_ai_interaction(patch)
+
+
+def _ptr_last_ai_interaction() -> dict[str, Any]:
+    interactions = _PTR_CURRENT_STRATEGY.setdefault("ai_interactions", [])
+    if not interactions or not isinstance(interactions[-1], dict):
+        return {}
+    return _ptr_clone_json_value(interactions[-1]) or {}
 
 
 def _ptr_record_experience_interaction(entry: dict[str, Any]) -> None:
@@ -863,8 +969,17 @@ def _ptr_normalize_text(value: Any) -> str:
     return " ".join(str(value or "").lower().split())
 
 
+def _ptr_oracle_notification_badge_signature(value: Any) -> str:
+    normalized = _ptr_normalize_text(value)
+    match = re.fullmatch(r"notifications\s*\(\d+\s+unread\)", normalized)
+    if not match:
+        return ""
+    return "notifications (unread)"
+
+
 def _ptr_rank_ai_dom_candidates(helper: str, label: str, candidates: list[dict[str, Any]], max_candidates: int) -> list[dict[str, Any]]:
     normalized_label = _ptr_normalize_text(label)
+    normalized_helper = _ptr_normalize_text(helper)
     label_tokens = [token for token in re.findall(r"[a-z0-9]+", normalized_label) if len(token) > 1]
 
     def _score_text(value: Any, weight: int) -> int:
@@ -910,7 +1025,7 @@ def _ptr_rank_ai_dom_candidates(helper: str, label: str, candidates: list[dict[s
         tag = _ptr_normalize_text(candidate.get("tag"))
         role = _ptr_normalize_text(candidate.get("role"))
         html = _ptr_normalize_text(candidate.get("html"))
-        if "button" in helper:
+        if "button" in normalized_helper:
             if tag in {"oj-action-card", "oj-switch"}:
                 score += 40
             if "oj-action-card" in html or "oj-switch" in html:
@@ -919,12 +1034,19 @@ def _ptr_rank_ai_dom_candidates(helper: str, label: str, candidates: list[dict[s
                 score += 25
             if tag == "button":
                 score += 5
-        elif "date" in helper:
+        elif "date" in normalized_helper:
             if tag in {"oj-input-date", "oj-c-input-date"}:
                 score += 35
             if "select date" in html:
                 score += 25
-        elif "combobox" in helper or "search" in helper:
+        elif (
+            "combobox" in normalized_helper
+            or "search" in normalized_helper
+            or "select_option" in normalized_helper
+            or normalized_helper == "select_option"
+        ):
+            if tag == "select":
+                score += 55
             if tag in {"oj-select-single", "oj-c-select-single"}:
                 score += 45
             if candidate.get("oracle_host_tag") in {"oj-select-single", "oj-c-select-single"}:
@@ -995,6 +1117,7 @@ def _ptr_extract_locator_metadata(locator: Locator) -> dict[str, str]:
                 disabled: node?.disabled ? "true" : (node?.hasAttribute?.("disabled") ? "true" : ""),
                 aria_selected: text(node?.getAttribute?.("aria-selected")),
                 aria_checked: text(node?.getAttribute?.("aria-checked")),
+                checked: typeof node?.checked === "boolean" ? (node.checked ? "true" : "false") : "",
             };
         }""",
     )
@@ -1049,7 +1172,7 @@ def _ptr_capture_locator_context(locator: Locator | None) -> dict[str, Any]:
 
 
 def _ptr_locator_is_actionable(locator: Locator, timeout_ms: int | None = None) -> bool:
-    timeout = timeout_ms or _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_ACTION_TIMEOUT_MS", 3000)
     try:
         locator.wait_for(state="visible", timeout=timeout)
         try:
@@ -1062,7 +1185,7 @@ def _ptr_locator_is_actionable(locator: Locator, timeout_ms: int | None = None) 
 
 
 def _ptr_strict_click(locator: Locator, timeout_ms: int | None = None) -> None:
-    timeout = timeout_ms or _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_ACTION_TIMEOUT_MS", 3000)
     locator.wait_for(state="visible", timeout=timeout)
     try:
         locator.scroll_into_view_if_needed(timeout=min(timeout, 1000))
@@ -1072,7 +1195,7 @@ def _ptr_strict_click(locator: Locator, timeout_ms: int | None = None) -> None:
 
 
 def _ptr_strict_dblclick(locator: Locator, timeout_ms: int | None = None) -> None:
-    timeout = timeout_ms or _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_ACTION_TIMEOUT_MS", 3000)
     locator.wait_for(state="visible", timeout=timeout)
     try:
         locator.scroll_into_view_if_needed(timeout=min(timeout, 1000))
@@ -1082,7 +1205,7 @@ def _ptr_strict_dblclick(locator: Locator, timeout_ms: int | None = None) -> Non
 
 
 def _ptr_strict_fill(locator: Locator, value: str, timeout_ms: int | None = None) -> None:
-    timeout = timeout_ms or _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_ACTION_TIMEOUT_MS", 3000)
     locator.wait_for(state="visible", timeout=timeout)
     try:
         locator.scroll_into_view_if_needed(timeout=min(timeout, 1000))
@@ -1099,7 +1222,7 @@ def _ptr_enter_search_value(
     current_page: Page | None = None,
     label: str = "",
 ) -> None:
-    timeout = timeout_ms or _ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000)
+    timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_TEXT_ENTRY_TIMEOUT_MS", 3000)
     locator.wait_for(state="visible", timeout=timeout)
     try:
         locator.scroll_into_view_if_needed(timeout=min(timeout, 1000))
@@ -1303,6 +1426,8 @@ def _ptr_active_element(page: Page | None) -> dict[str, str]:
                 id: text(node?.id),
                 name: text(node?.getAttribute?.("name")),
                 aria_label: text(node?.getAttribute?.("aria-label")),
+                aria_checked: text(node?.getAttribute?.("aria-checked")),
+                checked: typeof node?.checked === "boolean" ? (node.checked ? "true" : "false") : "",
                 title: text(node?.getAttribute?.("title")),
                 text: text(node?.innerText || node?.textContent),
             };
@@ -1670,8 +1795,23 @@ def _ptr_oracle_invoice_shows_not_validated(page: Page | None) -> bool:
     return "not validated" in visible_text or "never validated" in visible_text
 
 
+_PTR_COMPLETION_SPLIT_TRIGGERS = frozenset(
+    {
+        "complete and create another",
+        "submit and create another",
+    }
+)
+
+
+def _ptr_oracle_menu_option_is_completion_action(trigger_label: str) -> bool:
+    return _ptr_normalize_text(trigger_label) in _PTR_COMPLETION_SPLIT_TRIGGERS
+
+
 def _ptr_oracle_menu_trigger_requires_option_visibility(trigger_label: str) -> bool:
-    return _ptr_normalize_text(trigger_label) == "invoice actions"
+    return (
+        _ptr_normalize_text(trigger_label) == "invoice actions"
+        or _ptr_oracle_menu_option_is_completion_action(trigger_label)
+    )
 
 
 def _ptr_menu_panel_option_candidates(
@@ -1782,9 +1922,91 @@ def _ptr_wait_for_menu_option_semantic_condition(
     return _condition()
 
 
+def _ptr_oracle_transaction_completion_advanced(
+    page: Page | None,
+    baseline: dict[str, Any] | None,
+) -> bool:
+    if page is None:
+        return False
+    baseline = baseline if isinstance(baseline, dict) else {}
+    try:
+        current_url = str(getattr(page, "url", "") or "").strip()
+    except Exception:
+        current_url = ""
+    try:
+        current_title = str(page.title() or "").strip()
+    except Exception:
+        current_title = ""
+
+    baseline_url = str(baseline.get("url") or "").strip()
+    baseline_title = str(baseline.get("title") or "").strip()
+
+    baseline_step = str(baseline.get("guided_step") or "").strip()
+    current_step = str(_ptr_current_guided_step(page) or "").strip()
+
+    baseline_guided_flow = baseline.get("guided_flow") if isinstance(baseline.get("guided_flow"), dict) else {}
+    baseline_heading = _ptr_normalize_text(baseline_guided_flow.get("primary_heading"))
+    current_guided_flow = _ptr_guided_flow_state(page)
+    current_heading = _ptr_normalize_text((current_guided_flow or {}).get("primary_heading"))
+
+    baseline_body = _ptr_normalize_text(baseline.get("body_marker"))
+    current_body = _ptr_normalize_text(_ptr_body_marker(page))
+    signals = {
+        "url_changed": bool(baseline_url and current_url and current_url != baseline_url),
+        "title_changed": bool(baseline_title and current_title and current_title != baseline_title),
+        "guided_step_changed": bool(baseline_step and current_step and current_step != baseline_step),
+        "heading_changed_to_review": bool(
+            baseline_heading
+            and current_heading
+            and current_heading != baseline_heading
+            and (current_heading.startswith("review transaction") or current_heading.startswith("view transaction"))
+        ),
+        "body_contains_review_transaction": bool(
+            baseline_body
+            and current_body
+            and current_body != baseline_body
+            and "review transaction" in current_body
+            and "review transaction" not in baseline_body
+        ),
+        "status_incomplete_to_complete": bool(
+            baseline_body
+            and current_body
+            and current_body != baseline_body
+            and "status complete" in current_body
+            and "status incomplete" in baseline_body
+        ),
+    }
+    matched_signal = next((name for name, matched in signals.items() if matched), "")
+    _ptr_set_debug_detail(
+        "oracle_completion_check",
+        {
+            "baseline": {
+                "url": baseline_url,
+                "title": baseline_title,
+                "guided_step": baseline_step,
+                "primary_heading": baseline_heading,
+                "body_marker": _ptr_trim_debug_text(baseline_body),
+            },
+            "current": {
+                "url": current_url,
+                "title": current_title,
+                "guided_step": current_step,
+                "primary_heading": current_heading,
+                "body_marker": _ptr_trim_debug_text(current_body),
+            },
+            "signals": signals,
+            "matched_signal": matched_signal,
+            "postcondition_passed": bool(matched_signal),
+        },
+    )
+    return bool(matched_signal)
+
+
 def _ptr_oracle_menu_option_requires_semantic_validation(trigger_label: str, option_name: str) -> bool:
     normalized_trigger = _ptr_normalize_text(trigger_label)
     normalized_option = _ptr_normalize_text(option_name)
+    if _ptr_oracle_menu_option_is_completion_action(trigger_label):
+        return True
     if normalized_trigger != "invoice actions":
         return False
     return normalized_option in {"validate", "account in final"}
@@ -1794,9 +2016,19 @@ def _ptr_oracle_menu_option_semantic_postcondition(
     page: Page | None,
     trigger_label: str,
     option_name: str,
+    *,
+    before: dict[str, Any] | None = None,
 ) -> bool | None:
     if not _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
         return None
+
+    if _ptr_oracle_menu_option_is_completion_action(trigger_label):
+        return _ptr_wait_for_menu_option_semantic_condition(
+            page,
+            lambda: _ptr_oracle_transaction_completion_advanced(page, before),
+            timeout_env_name="PTR_TRANSACTION_COMPLETE_POSTCONDITION_TIMEOUT_MS",
+            default_timeout_ms=8000,
+        )
 
     normalized_option = _ptr_normalize_text(option_name)
     if normalized_option == "validate":
@@ -1817,6 +2049,11 @@ def _ptr_oracle_menu_option_semantic_postcondition(
 
 
 def _ptr_menu_option_failure_message(trigger_label: str, option_name: str) -> str:
+    if _ptr_oracle_menu_option_is_completion_action(trigger_label):
+        return (
+            f'"{option_name}" did not complete the transaction: the flow did not advance '
+            f"(no navigation / guided-step change), so it stays in the editable draft."
+        )
     if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
         normalized_option = _ptr_normalize_text(option_name)
         if normalized_option == "validate":
@@ -1835,9 +2072,9 @@ def _ptr_menu_trigger_failure_message(trigger_label: str, option_name: str) -> s
 def _ptr_checkbox_state(locator: Locator) -> str:
     metadata = _ptr_extract_locator_metadata(locator)
     if isinstance(metadata, dict):
-        normalized_aria_checked = _ptr_normalize_text(metadata.get("aria_checked"))
-        if normalized_aria_checked in {"true", "false", "mixed"}:
-            return normalized_aria_checked
+        normalized_metadata_state = _ptr_checkbox_observed_state(metadata)
+        if normalized_metadata_state in {"true", "false", "mixed"}:
+            return normalized_metadata_state
     try:
         return "true" if bool(locator.is_checked()) else "false"
     except Exception:
@@ -1859,9 +2096,42 @@ def _ptr_checkbox_state(locator: Locator) -> str:
     return ""
 
 
+def _ptr_checkbox_observed_state(metadata: dict[str, Any] | None) -> str:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    normalized_aria_checked = _ptr_normalize_text(metadata.get("aria_checked"))
+    if normalized_aria_checked in {"true", "false", "mixed"}:
+        return normalized_aria_checked
+    normalized_checked = _ptr_normalize_text(metadata.get("checked"))
+    if normalized_checked in {"true", "false"}:
+        return normalized_checked
+    return ""
+
+
 def _ptr_checkbox_matches(locator: Locator, desired_checked: bool) -> bool:
     desired_state = "true" if desired_checked else "false"
     return _ptr_checkbox_state(locator) == desired_state
+
+
+def _ptr_checkbox_semantic_postcondition(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    desired_checked: bool,
+) -> bool:
+    desired_state = "true" if desired_checked else "false"
+    before_target = before.get("target_meta") if isinstance(before.get("target_meta"), dict) else {}
+    after_target = after.get("target_meta") if isinstance(after.get("target_meta"), dict) else {}
+    if _ptr_checkbox_observed_state(after_target) == desired_state:
+        return True
+
+    active = after.get("active_element") if isinstance(after.get("active_element"), dict) else {}
+    if _ptr_checkbox_observed_state(active) != desired_state:
+        return False
+
+    if before_target and _ptr_active_element_matches_target({"active_element": active, "target_meta": before_target}):
+        return True
+    if after_target and _ptr_active_element_matches_target({"active_element": active, "target_meta": after_target}):
+        return True
+    return False
 
 
 def _ptr_set_checkbox_state(locator: Locator, current_page: Page, label: str, desired_checked: bool) -> None:
@@ -1872,6 +2142,7 @@ def _ptr_set_checkbox_state(locator: Locator, current_page: Page, label: str, de
 
     timeout_ms = _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
     last_error: Exception | None = None
+    before_observation = _ptr_observe(current_page, locator)
 
     try:
         locator.wait_for(state="visible", timeout=timeout_ms)
@@ -1894,6 +2165,9 @@ def _ptr_set_checkbox_state(locator: Locator, current_page: Page, label: str, de
     )
     if _ptr_checkbox_matches(locator, desired_checked):
         return
+    after_raw_check = _ptr_observe(current_page, locator)
+    if _ptr_checkbox_semantic_postcondition(before_observation, after_raw_check, desired_checked):
+        return
 
     try:
         _ptr_record_strategy_attempt("checkbox_click_fallback")
@@ -1907,6 +2181,9 @@ def _ptr_set_checkbox_state(locator: Locator, current_page: Page, label: str, de
         default_ms=750,
     )
     if _ptr_checkbox_matches(locator, desired_checked):
+        return
+    after_click_fallback = _ptr_observe(current_page, locator)
+    if _ptr_checkbox_semantic_postcondition(before_observation, after_click_fallback, desired_checked):
         return
 
     if last_error is not None:
@@ -1933,7 +2210,12 @@ def _ptr_option_selection_postcondition(
     page: Page | None = None,
     trigger_label: str = "",
 ) -> bool:
-    semantic_result = _ptr_oracle_menu_option_semantic_postcondition(page, trigger_label, option_name)
+    semantic_result = _ptr_oracle_menu_option_semantic_postcondition(
+        page,
+        trigger_label,
+        option_name,
+        before=before,
+    )
     if semantic_result is not None:
         return semantic_result
     observed = _ptr_locator_value(trigger) or _ptr_locator_text(trigger)
@@ -2116,8 +2398,8 @@ def _ptr_wait_for_observation_stability(
 ) -> dict[str, Any]:
     if page is None:
         return {}
-    total_timeout = int(timeout_ms or _ptr_wait_ms("PTR_POST_ACTION_STABILIZE_TIMEOUT_MS", 2500))
-    stable_window = int(quiet_ms or _ptr_wait_ms("PTR_POST_ACTION_STABILIZE_QUIET_MS", 600))
+    total_timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_POST_ACTION_STABILIZE_TIMEOUT_MS", 2500)
+    stable_window = _ptr_resolve_wait_override_ms(quiet_ms, "PTR_POST_ACTION_STABILIZE_QUIET_MS", 600)
     if total_timeout <= 0 or stable_window <= 0:
         return _ptr_observe(page)
     deadline = time.time() + (total_timeout / 1000.0)
@@ -2400,6 +2682,7 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                     );
                 }
                 const selectors = [...helperSelectors, ...[
+                    "select",
                     "input",
                     "textarea",
                     "button",
@@ -2791,7 +3074,7 @@ def _ptr_openai_base_url() -> str:
 def _ptr_ai_self_repair_enabled() -> bool:
     if not _ptr_env_flag("PTR_AI_SELF_REPAIR_ENABLED", "false"):
         return False
-    return bool(str(os.getenv("OPENAI_API_KEY", "")).strip())
+    return bool(get_runner_env_value("OPENAI_API_KEY"))
 
 
 def _ptr_ai_self_repair_model() -> str:
@@ -2799,10 +3082,10 @@ def _ptr_ai_self_repair_model() -> str:
         str(
             os.getenv(
                 "PTR_AI_SELF_REPAIR_MODEL",
-                os.getenv("OPENAI_FAILURE_SUMMARY_MODEL", "gpt-4.1-mini"),
+                os.getenv("OPENAI_FAILURE_SUMMARY_MODEL", "gpt-5.4-mini"),
             )
         ).strip()
-        or "gpt-4.1-mini"
+        or "gpt-5.4-mini"
     )
 
 
@@ -2842,6 +3125,7 @@ def _ptr_build_ai_self_repair_prompt(
     value: str | None = None,
     locator: Locator | None = None,
     dom_context: dict[str, Any] | None = None,
+    retry_feedback: dict[str, Any] | None = None,
 ) -> str:
     try:
         page_url = str(current_page.url or "").strip()
@@ -2854,42 +3138,63 @@ def _ptr_build_ai_self_repair_prompt(
 
     if dom_context is None:
         dom_context = _ptr_collect_ai_dom_candidates(current_page, helper, label)
-    dom_json = json.dumps(dom_context, ensure_ascii=False)
-    script_data_json = json.dumps(_ptr_current_script_data(), ensure_ascii=False)
-    locator_context_json = json.dumps(_ptr_capture_locator_context(locator), ensure_ascii=False)
-    action_kind = "fill" if helper == "fill_textbox" else "click"
-    value_line = f"\n- Value to enter: {value}" if value is not None else ""
-    error_text = str(last_error or "").strip()
-    if len(error_text) > 2000:
-        error_text = error_text[:2000] + "..."
-    return (
-        "You repair Playwright locators for enterprise web apps. Return JSON only.\n"
-        "Use the recorded script data to preserve the original target semantics.\n"
-        "Strict execution failed. Use only the provided DOM candidates.\n"
-        "Do not invent attributes or text that are not present.\n"
-        "Prefer stable selectors based on id, aria-label, label-hint, name, role, or data-oj-field.\n"
-        "If the failure mentions pointer interception or overlay issues, prefer the enclosing Oracle host control that matches the recorded target over an intercepted inner input.\n"
-        "Return exactly this schema:\n"
-        '{"strategies":[{"kind":"css"|"xpath"|"role"|"label"|"placeholder"|"text","selector":string|null,"role":string|null,"name":string|null,"text":string|null,"exact":boolean|null,"reason":string|null}]}\n'
-        "Rules:\n"
-        "- Return at most 3 strategies, best first.\n"
-        "- CSS/XPath selectors must be valid Playwright locator selectors.\n"
-        "- For role, set role and name.\n"
-        "- For label/placeholder/text, set text.\n"
-        f"- Helper: {helper}\n"
-        f"- Intended action: {action_kind}\n"
-        f"- Target label: {label}\n"
-        f"- Page title: {page_title or 'unknown'}\n"
-        f"- Page URL: {page_url or 'unknown'}\n"
-        f"- Last error: {error_text}"
-        f"{value_line}\n"
-        "Recorded script data JSON:\n"
-        f"{script_data_json}\n"
-        "Recorded target context JSON:\n"
-        f"{locator_context_json}\n"
-        "DOM candidates JSON:\n"
-        f"{dom_json}"
+    return build_ai_repair_prompt(
+        helper=helper,
+        label=label,
+        last_error=last_error,
+        value=value,
+        page_title=page_title,
+        page_url=page_url,
+        script_data=_ptr_current_script_data(),
+        locator_context=_ptr_capture_locator_context(locator),
+        dom_context=dom_context,
+        retry_feedback=retry_feedback,
     )
+
+
+def _ptr_capture_ai_context_screenshot(current_page: Page | None) -> dict[str, Any]:
+    if current_page is None:
+        return {}
+
+    image_format = _ptr_normalize_text(os.getenv("PTR_AI_SELF_REPAIR_SCREENSHOT_FORMAT", "jpeg"))
+    if image_format not in {"jpeg", "png"}:
+        image_format = "jpeg"
+    media_type = "image/jpeg" if image_format == "jpeg" else "image/png"
+    screenshot_kwargs: dict[str, Any] = {"full_page": True}
+    if image_format == "jpeg":
+        screenshot_kwargs["type"] = "jpeg"
+        screenshot_kwargs["quality"] = max(20, min(95, _ptr_int_env("PTR_AI_SELF_REPAIR_SCREENSHOT_QUALITY", 45)))
+    else:
+        screenshot_kwargs["type"] = "png"
+
+    screenshot_scale = _ptr_normalize_text(os.getenv("PTR_AI_SELF_REPAIR_SCREENSHOT_SCALE", "css"))
+    if screenshot_scale in {"css", "device"}:
+        screenshot_kwargs["scale"] = screenshot_scale
+
+    try:
+        screenshot_bytes = current_page.screenshot(**screenshot_kwargs)
+        if not isinstance(screenshot_bytes, bytes) or not screenshot_bytes:
+            return {}
+        return {
+            "status": "captured",
+            "image_url": f"data:{media_type};base64,{base64.b64encode(screenshot_bytes).decode('ascii')}",
+            "media_type": media_type,
+            "format": image_format,
+            "full_page": True,
+            "scale": screenshot_kwargs.get("scale") or "",
+            "quality": screenshot_kwargs.get("quality"),
+        }
+    except Exception as exc:
+        return {
+            "status": "capture_error",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "media_type": media_type,
+            "format": image_format,
+            "full_page": True,
+            "scale": screenshot_kwargs.get("scale") or "",
+            "quality": screenshot_kwargs.get("quality"),
+        }
 
 
 def _ptr_request_ai_self_repair(
@@ -2899,8 +3204,8 @@ def _ptr_request_ai_self_repair(
     last_error: Any,
     value: str | None = None,
     locator: Locator | None = None,
+    retry_feedback: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    system_prompt = "You are a senior Playwright locator repair assistant. Return concise JSON only."
     endpoint = f"{_ptr_openai_base_url()}/responses"
     model = _ptr_ai_self_repair_model()
     interaction: dict[str, Any] = {
@@ -2909,22 +3214,31 @@ def _ptr_request_ai_self_repair(
         "label": label,
         "model": model,
         "endpoint": endpoint,
-        "system_prompt": system_prompt,
+        "system_prompt": AI_REPAIR_SYSTEM_PROMPT,
     }
     if value is not None:
         interaction["value"] = str(value)
     script_data = _ptr_current_script_data()
     if script_data:
-        interaction["script_data"] = script_data
+        interaction["script_data"] = _ptr_clone_json_value(script_data)
+        interaction["recorded_script_data"] = _ptr_clone_json_value(script_data)
     locator_context = _ptr_capture_locator_context(locator)
     if locator_context:
-        interaction["recorded_target_context"] = locator_context
+        interaction["recorded_target_context"] = _ptr_clone_json_value(locator_context)
+    if retry_feedback:
+        interaction["retry_feedback"] = _ptr_clone_json_value(retry_feedback)
+    if last_error not in (None, ""):
+        interaction["last_error"] = str(last_error)
 
     if not _ptr_ai_self_repair_enabled():
         interaction["status"] = "disabled"
         interaction["error"] = "AI self-repair is disabled or OPENAI_API_KEY is missing."
         _ptr_record_ai_interaction(interaction)
         return []
+
+    screenshot_context = _ptr_capture_ai_context_screenshot(current_page)
+    if screenshot_context:
+        interaction["page_screenshot"] = _ptr_clone_json_value(screenshot_context)
 
     dom_context = _ptr_collect_ai_dom_candidates(current_page, helper, label)
     prompt = _ptr_build_ai_self_repair_prompt(
@@ -2935,8 +3249,15 @@ def _ptr_request_ai_self_repair(
         value=value,
         locator=locator,
         dom_context=dom_context,
+        retry_feedback=retry_feedback,
     )
+    if str((screenshot_context or {}).get("status") or "").strip() == "captured":
+        prompt += (
+            "\nA full-page screenshot is attached in this request as additional context.\n"
+            "Use the screenshot together with the recorded target context and DOM candidates."
+        )
     interaction["user_prompt"] = prompt
+    interaction["dom_candidates"] = _ptr_clone_json_value(dom_context)
     interaction["dom_candidate_count"] = len(dom_context.get("candidates") or [])
     interaction["max_output_tokens"] = 400
 
@@ -2950,11 +3271,17 @@ def _ptr_request_ai_self_repair(
     _ptr_record_ai_interaction(interaction)
     _ptr_record_strategy_attempt("ai_self_repair_lookup")
 
+    user_content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    if str((screenshot_context or {}).get("status") or "").strip() == "captured":
+        image_url = str((screenshot_context or {}).get("image_url") or "").strip()
+        if image_url:
+            user_content.append({"type": "input_image", "image_url": image_url})
+
     payload = {
         "model": model,
         "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            {"role": "system", "content": [{"type": "input_text", "text": AI_REPAIR_SYSTEM_PROMPT}]},
+            {"role": "user", "content": user_content},
         ],
         "text": {"format": {"type": "json_object"}},
         "max_output_tokens": 400,
@@ -2964,7 +3291,7 @@ def _ptr_request_ai_self_repair(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {str(os.getenv('OPENAI_API_KEY', '')).strip()}",
+            "Authorization": f"Bearer {get_runner_env_value('OPENAI_API_KEY')}",
             "Content-Type": "application/json",
         },
         method="POST",
@@ -3056,6 +3383,9 @@ def _ptr_ai_text_matches_label(value: Any, label: str) -> bool:
         return True
     if not normalized_value:
         return False
+    oracle_notification_signature = _ptr_oracle_notification_badge_signature(normalized_label)
+    if oracle_notification_signature and oracle_notification_signature == _ptr_oracle_notification_badge_signature(normalized_value):
+        return True
     if normalized_value == normalized_label or normalized_label in normalized_value:
         return True
     label_tokens = [token for token in re.findall(r"[a-z0-9]+", normalized_label) if len(token) > 1]
@@ -3112,12 +3442,21 @@ def _ptr_ai_repair_locators(
     last_error: Any,
     value: str | None = None,
     locator: Locator | None = None,
+    retry_feedback: dict[str, Any] | None = None,
 ) -> list[tuple[str, Locator, dict[str, Any]]]:
     locators: list[tuple[str, Locator, dict[str, Any]]] = []
     rejected_names: list[str] = []
     rejected_reasons: list[str] = []
     for idx, strategy in enumerate(
-        _ptr_request_ai_self_repair(current_page, helper, label, last_error, value=value, locator=locator),
+        _ptr_request_ai_self_repair(
+            current_page,
+            helper,
+            label,
+            last_error,
+            value=value,
+            locator=locator,
+            retry_feedback=retry_feedback,
+        ),
         start=1,
     ):
         declared_label = str(strategy.get("name") or strategy.get("text") or "").strip()
@@ -3152,6 +3491,209 @@ def _ptr_ai_repair_locators(
                 patch["repair_outcome"] = "no_usable_locator"
         _ptr_update_last_ai_interaction(patch)
     return locators
+
+
+def _ptr_execute_ai_repair_rounds(
+    *,
+    current_page: Page,
+    helper: str,
+    label: str,
+    last_error: Any,
+    value: str | None = None,
+    locator: Locator | None = None,
+    postcondition_kind: str,
+    failure_message,
+    execute_locator,
+) -> tuple[tuple[str, Locator, dict[str, Any]] | None, Exception]:
+    max_rounds = max(1, min(2, _ptr_int_env("PTR_AI_SELF_REPAIR_MAX_ROUNDS", 2)))
+    retry_feedback: dict[str, Any] | None = None
+    latest_error: Exception = last_error if isinstance(last_error, Exception) else RuntimeError(str(last_error))
+    used_ai = False
+    last_ai_strategy_name = ""
+
+    for round_index in range(1, max_rounds + 1):
+        ai_candidates = _ptr_ai_repair_locators(
+            current_page,
+            helper,
+            label,
+            latest_error,
+            value=value,
+            locator=locator,
+            retry_feedback=retry_feedback,
+        )
+        if not ai_candidates:
+            break
+
+        used_ai = True
+        attempted_names: list[str] = []
+        for strategy_name, ai_locator, ai_strategy in ai_candidates:
+            attempted_names.append(strategy_name)
+            last_ai_strategy_name = strategy_name
+            try:
+                _ptr_record_strategy_attempt(strategy_name)
+                if execute_locator(strategy_name, ai_locator, ai_strategy):
+                    _ptr_finalize_last_ai_interaction(
+                        repair_outcome="validated",
+                        strategy_name=strategy_name,
+                        postcondition_kind=postcondition_kind,
+                    )
+                    return (strategy_name, ai_locator, ai_strategy), latest_error
+                latest_error = RuntimeError(str(failure_message(strategy_name)))
+            except Exception as exc:
+                latest_error = exc
+
+        if round_index >= max_rounds:
+            break
+
+        last_interaction = _ptr_last_ai_interaction()
+        retry_feedback = {
+            "round": round_index,
+            "execution_error": str(latest_error),
+            "attempted_locator_strategies": attempted_names,
+            "rejected_locator_reasons": list(last_interaction.get("rejected_locator_reasons") or []),
+            "previous_response_strategies": _ptr_clone_json_value(list(last_interaction.get("response_strategies") or [])),
+            "previous_response_text": str(last_interaction.get("response_text") or "").strip(),
+        }
+        _ptr_update_last_ai_interaction(
+            {
+                "retry_requested": True,
+                "retry_round": round_index + 1,
+                "retry_feedback": _ptr_clone_json_value(retry_feedback),
+            }
+        )
+
+    if used_ai:
+        _ptr_finalize_last_ai_interaction(
+            repair_outcome="execution_failed",
+            strategy_name=last_ai_strategy_name,
+            error=latest_error,
+            postcondition_kind=postcondition_kind,
+        )
+    return None, latest_error
+
+
+def _ptr_replace_primary_locator_arg(
+    args: tuple[Any, ...],
+    primary_locator: Locator | None,
+    replacement_locator: Locator,
+) -> tuple[Any, ...]:
+    if primary_locator is None:
+        return tuple(args)
+    replaced_args = list(args)
+    for index, arg in enumerate(replaced_args):
+        if arg is primary_locator:
+            replaced_args[index] = replacement_locator
+            break
+    return tuple(replaced_args)
+
+
+def _ptr_universal_ai_postcondition_kind(helper_name: str) -> str:
+    normalized_helper = _ptr_normalize_text(helper_name)
+    if normalized_helper in {"check_target", "uncheck_target"}:
+        return "checkbox_state_changed"
+    if normalized_helper == "click_table_row":
+        return "row_selected"
+    if normalized_helper == "click_table_field":
+        return "field_focused"
+    if normalized_helper == "click_navigation_button":
+        return "guided_flow_advanced"
+    if normalized_helper == "submit_textbox_enter":
+        return "enter_submitted"
+    return "action_effect"
+
+
+def _ptr_try_universal_ai_action_repair(
+    *,
+    action_type: str,
+    label: str,
+    fn,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    current_page: Page | None,
+    primary_locator: Locator | None,
+    last_error: Exception,
+) -> tuple[bool, Any, Exception]:
+    if current_page is None or primary_locator is None:
+        return False, None, last_error
+    if _PTR_CURRENT_STRATEGY.get("ai_interactions"):
+        return False, None, last_error
+
+    helper_name = _ptr_normalize_runtime_action_name(getattr(fn, "__name__", action_type))
+    eligible_helpers = {
+        "check_target",
+        "uncheck_target",
+        "click_textbox",
+        "click_table_field",
+        "click_table_row",
+        "dblclick_text_target",
+        "click_navigation_button",
+        "submit_textbox_enter",
+    }
+    if helper_name not in eligible_helpers:
+        return False, None, last_error
+
+    debug_trace = _ptr_update_debug_detail(
+        "universal_ai_repair",
+        {
+            "helper": helper_name,
+            "label": label,
+            "status": "requested",
+            "trigger_error": _ptr_trim_debug_text(last_error, 320),
+        },
+    )
+    postcondition_kind = _ptr_universal_ai_postcondition_kind(helper_name)
+    execution_result: Any = None
+
+    def _execute_ai_action_locator(strategy_name: str, ai_locator: Locator, ai_strategy: dict[str, Any]) -> bool:
+        nonlocal execution_result
+        retry_args = _ptr_replace_primary_locator_arg(args, primary_locator, ai_locator)
+        execution_result = fn(*retry_args, **kwargs)
+        return True
+
+    ai_result, latest_error = _ptr_execute_ai_repair_rounds(
+        current_page=current_page,
+        helper=helper_name,
+        label=label,
+        last_error=last_error,
+        locator=primary_locator,
+        postcondition_kind=postcondition_kind,
+        failure_message=lambda strategy_name: (
+            f'AI strategy "{strategy_name}" did not repair "{label}" for helper "{helper_name}".'
+        ),
+        execute_locator=_execute_ai_action_locator,
+    )
+    if ai_result is None:
+        debug_trace["status"] = "failed"
+        debug_trace["error"] = _ptr_trim_debug_text(latest_error, 320)
+        _ptr_set_debug_detail("universal_ai_repair", debug_trace)
+        return False, None, latest_error
+
+    strategy_name, ai_locator, ai_strategy = ai_result
+    debug_trace["status"] = "validated"
+    debug_trace["strategy_name"] = strategy_name
+    debug_trace["locator_strategy"] = _ptr_clone_json_value(ai_strategy)
+    _ptr_set_debug_detail("universal_ai_repair", debug_trace)
+    _ptr_set_recovery_record(
+        "ai_validated",
+        "ai_locator_repair",
+        "ai_locator_repair",
+        {
+            "helper": helper_name,
+            "strategy_name": strategy_name,
+            "locator_strategy": _ptr_clone_json_value(ai_strategy),
+        },
+    )
+    _ptr_store_experience_episode(
+        action_type=helper_name,
+        label=label,
+        page=current_page,
+        locator=ai_locator,
+        error=last_error,
+        status="success",
+        postcondition_kind=postcondition_kind,
+        postcondition_passed=True,
+    )
+    return True, execution_result, latest_error
 
 
 def _ptr_try_expand_oracle_quick_actions(page: Page, label: str) -> bool:
@@ -3288,6 +3830,92 @@ def _ptr_try_oracle_home_search(page: Page, label: str, postcondition) -> bool:
     except Exception:
         return False
     return False
+
+
+def _ptr_try_oracle_notification_badge(page: Page, label: str, postcondition) -> str:
+    if not _ptr_oracle_notification_badge_signature(label):
+        return ""
+
+    badge_pattern = re.compile(r"^Notifications\s*\(\d+\s+unread\)$", re.IGNORECASE)
+    candidates = [
+        ("oracle_notification_badge_role", page.get_by_role("link", name=badge_pattern)),
+        ("oracle_notification_badge_text", page.get_by_text(badge_pattern)),
+    ]
+
+    for strategy_name, candidate in candidates:
+        try:
+            resolved = candidate.first if hasattr(candidate, "first") else candidate
+            if not _ptr_locator_is_actionable(resolved, timeout_ms=1200):
+                continue
+            before = _ptr_observe(page, resolved)
+            _ptr_record_strategy_attempt(strategy_name)
+            _ptr_strict_click(resolved)
+            page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+            after = _ptr_observe(page, resolved)
+            if postcondition(before, after):
+                return strategy_name
+        except Exception:
+            continue
+    return ""
+
+
+def _ptr_try_oracle_recorded_button_context(
+    page: Page,
+    locator: Locator,
+    label: str,
+    error: Any,
+    postcondition,
+) -> str:
+    error_text = str(error or "")
+    lowered_error = error_text.lower()
+    if "strict mode violation" not in lowered_error:
+        return ""
+    if "get_by_role(\"button\"" not in error_text and "get_by_role('button'" not in error_text:
+        return ""
+
+    recorded_context = _ptr_capture_locator_context(locator)
+    if not isinstance(recorded_context, dict):
+        return ""
+
+    title_text = str(recorded_context.get("title") or "").strip()
+    id_text = str(recorded_context.get("id") or "").strip()
+    class_name = str(recorded_context.get("class_name") or "").strip()
+    if not title_text and not id_text:
+        return ""
+    page_title = ""
+    try:
+        page_title = str(page.title() or "").strip()
+    except Exception:
+        page_title = ""
+    if not (
+        "oracle" in _ptr_normalize_text(page_title)
+        or "homebutton" in _ptr_normalize_text(class_name)
+    ):
+        return ""
+
+    candidates: list[tuple[str, Locator]] = []
+    if title_text:
+        escaped_title = title_text.replace("\\", "\\\\").replace('"', '\\"')
+        candidates.append(("oracle_recorded_button_title", page.locator(f'button[title="{escaped_title}"]')))
+    if id_text:
+        escaped_id = id_text.replace("\\", "\\\\").replace('"', '\\"')
+        candidates.append(("oracle_recorded_button_id", page.locator(f'button[id="{escaped_id}"]')))
+
+    for strategy_name, candidate in candidates:
+        try:
+            resolved = candidate.first if hasattr(candidate, "first") else candidate
+            if not _ptr_locator_is_actionable(resolved, timeout_ms=1200):
+                continue
+            before = _ptr_observe(page, resolved)
+            _ptr_record_strategy_attempt(strategy_name)
+            _ptr_strict_click(resolved)
+            page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+            after = _ptr_observe(page, resolved)
+            if postcondition(before, after):
+                return strategy_name
+        except Exception:
+            continue
+    return ""
 
 
 def _ptr_try_oracle_guided_action_card(page: Page, label: str, postcondition) -> bool:
@@ -3525,6 +4153,9 @@ def _ptr_finalize_action_log(action_type: str, label: str, status: str, duration
     recovery = _PTR_CURRENT_STRATEGY.get("recovery")
     if isinstance(recovery, dict) and recovery:
         entry["recovery"] = _ptr_clone_json_value(recovery)
+    debug_payload = _PTR_CURRENT_STRATEGY.get("debug")
+    if isinstance(debug_payload, dict) and debug_payload:
+        entry["debug"] = _ptr_clone_json_value(debug_payload)
     if error is not None:
         entry["error"] = str(error)
         entry["failure_context"] = _ptr_capture_failure_context(page, action_type, label, error)
@@ -3597,6 +4228,28 @@ def _ptr_tracked_action(action_type: str, label: str, fn, *args, **kwargs):
         return result
     except Exception as exc:
         current_page = _PTR_LAST_PAGE or page
+        repaired, repaired_result, final_error = _ptr_try_universal_ai_action_repair(
+            action_type=action_type,
+            label=label,
+            fn=fn,
+            args=args,
+            kwargs=kwargs,
+            current_page=current_page,
+            primary_locator=primary_locator,
+            last_error=exc,
+        )
+        if repaired:
+            current_page = _PTR_LAST_PAGE or current_page
+            _ptr_wait_after_interaction(current_page)
+            _ptr_capture_step(action_type)
+            _ptr_finalize_action_log(
+                action_type,
+                label,
+                "success",
+                int((time.time() - start) * 1000),
+                page=current_page,
+            )
+            return repaired_result
         _ptr_capture_step(action_type)
         _ptr_capture_failure_screenshot()
         _ptr_store_experience_episode(
@@ -3604,7 +4257,7 @@ def _ptr_tracked_action(action_type: str, label: str, fn, *args, **kwargs):
             label=label,
             page=current_page,
             locator=primary_locator,
-            error=exc,
+            error=final_error,
             status="failed",
             postcondition_kind="none",
             postcondition_passed=False,
@@ -3614,9 +4267,11 @@ def _ptr_tracked_action(action_type: str, label: str, fn, *args, **kwargs):
             label,
             "failed",
             int((time.time() - start) * 1000),
-            error=exc,
+            error=final_error,
             page=current_page,
         )
+        if final_error is not exc:
+            raise final_error from exc
         raise
 
 
@@ -3636,8 +4291,10 @@ def _ptr_tracked_raw_action(
     _ptr_reset_strategy_tracking(action_type, label)
     _ptr_record_strategy_attempt("raw_inline")
     start = time.time()
+    exec_globals = dict(global_scope or {})
+    exec_globals.setdefault("re", re)
     try:
-        exec(str(raw_source or ""), global_scope, local_scope)
+        exec(str(raw_source or ""), exec_globals, local_scope)
         current_page = _PTR_LAST_PAGE or current_page
         _ptr_wait_after_interaction(current_page)
         _ptr_capture_step(action_type)
@@ -3675,21 +4332,51 @@ def _ptr_tracked_raw_action(
 
 def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper: str, postcondition):
     before = _ptr_observe(page, locator)
+    debug_trace = _ptr_update_debug_detail(
+        "click_with_candidates",
+        {
+            "helper": helper,
+            "label": label,
+            "status": "strict_attempt",
+            "before": _ptr_debug_observation_summary(before),
+            "experience_attempts": [],
+        },
+    )
     try:
         _ptr_strict_click(locator)
         after = _ptr_observe(page, locator)
         if postcondition(before, after):
+            debug_trace["direct_attempt"] = {
+                "status": "validated",
+                "after": _ptr_debug_observation_summary(after),
+            }
+            debug_trace["resolved_by"] = "strict"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_with_candidates", debug_trace)
             return
         raise RuntimeError(f'Action "{label}" completed but no postcondition changed.')
     except Exception as direct_exc:
         last_error: Exception = direct_exc
+        debug_trace["direct_attempt"] = {
+            "status": "failed",
+            "error": _ptr_trim_debug_text(direct_exc, 320),
+        }
         quick_actions_expanded = False
         if _ptr_try_expand_oracle_quick_actions(page, label):
             quick_actions_expanded = True
+            debug_trace["oracle_quick_actions_expand"] = {"attempted": True, "status": "retrying"}
             try:
                 _ptr_strict_click(locator)
                 after = _ptr_observe(page, locator)
                 if postcondition(before, after):
+                    debug_trace["oracle_quick_actions_expand"] = {
+                        "attempted": True,
+                        "status": "validated",
+                        "after": _ptr_debug_observation_summary(after),
+                    }
+                    debug_trace["resolved_by"] = "oracle_quick_actions_expand"
+                    debug_trace["status"] = "success"
+                    _ptr_set_debug_detail("click_with_candidates", debug_trace)
                     _ptr_set_recovery_record(
                         "oracle_handler",
                         "quick_action_expand",
@@ -3708,8 +4395,18 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                     )
                     return
                 last_error = RuntimeError(f'Action "{label}" still had no postcondition after expanding quick actions.')
+                debug_trace["oracle_quick_actions_expand"] = {
+                    "attempted": True,
+                    "status": "postcondition_failed",
+                    "error": _ptr_trim_debug_text(last_error, 320),
+                }
             except Exception as exc:
                 last_error = exc
+                debug_trace["oracle_quick_actions_expand"] = {
+                    "attempted": True,
+                    "status": "failed",
+                    "error": _ptr_trim_debug_text(exc, 320),
+                }
 
         quick_action_strategy = _ptr_try_oracle_quick_action_exact_match(
             page,
@@ -3719,6 +4416,13 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
             allow_after_expand=quick_actions_expanded,
         )
         if quick_action_strategy:
+            debug_trace["oracle_quick_action_exact_match"] = {
+                "status": "validated",
+                "strategy_name": quick_action_strategy,
+            }
+            debug_trace["resolved_by"] = "oracle_quick_action_exact_match"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_with_candidates", debug_trace)
             _ptr_set_recovery_record(
                 "oracle_handler",
                 "quick_action_exact_match",
@@ -3736,8 +4440,82 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                 postcondition_passed=True,
             )
             return
+        debug_trace["oracle_quick_action_exact_match"] = {
+            "status": "not_applied",
+            "after_expand": quick_actions_expanded,
+        }
+
+        notification_badge_strategy = _ptr_try_oracle_notification_badge(page, label, postcondition)
+        if notification_badge_strategy:
+            debug_trace["oracle_notification_badge"] = {
+                "status": "validated",
+                "strategy_name": notification_badge_strategy,
+            }
+            debug_trace["resolved_by"] = "oracle_notification_badge"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_with_candidates", debug_trace)
+            _ptr_set_recovery_record(
+                "oracle_handler",
+                "notification_badge",
+                "oracle_notification_badge",
+                {"label": label, "strategy_name": notification_badge_strategy},
+            )
+            _ptr_store_experience_episode(
+                action_type=helper,
+                label=label,
+                page=page,
+                locator=locator,
+                error=last_error,
+                status="success",
+                postcondition_kind="action_effect",
+                postcondition_passed=True,
+            )
+            return
+        debug_trace["oracle_notification_badge"] = {"status": "not_applied"}
+
+        if helper in {"click_button_target", "click_numeric_button_target"}:
+            recorded_button_strategy = _ptr_try_oracle_recorded_button_context(
+                page,
+                locator,
+                label,
+                last_error,
+                postcondition,
+            )
+            if recorded_button_strategy:
+                debug_trace["oracle_recorded_button_context"] = {
+                    "status": "validated",
+                    "strategy_name": recorded_button_strategy,
+                }
+                debug_trace["resolved_by"] = "oracle_recorded_button_context"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("click_with_candidates", debug_trace)
+                _ptr_set_recovery_record(
+                    "oracle_handler",
+                    "recorded_button_context",
+                    "oracle_recorded_button_context",
+                    {"label": label, "strategy_name": recorded_button_strategy},
+                )
+                _ptr_store_experience_episode(
+                    action_type=helper,
+                    label=label,
+                    page=page,
+                    locator=locator,
+                    error=last_error,
+                    status="success",
+                    postcondition_kind="action_effect",
+                    postcondition_passed=True,
+                )
+                return
+            debug_trace["oracle_recorded_button_context"] = {"status": "not_applied"}
 
         if _ptr_try_oracle_home_search(page, label, postcondition):
+            debug_trace["oracle_home_search"] = {
+                "status": "validated",
+                "search_label": label,
+            }
+            debug_trace["resolved_by"] = "oracle_home_search"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_with_candidates", debug_trace)
             _ptr_set_recovery_record(
                 "oracle_handler",
                 "home_search",
@@ -3755,8 +4533,16 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                 postcondition_passed=True,
             )
             return
+        debug_trace["oracle_home_search"] = {"status": "not_applied"}
 
         if helper in {"click_button_target", "click_numeric_button_target"} and _ptr_try_oracle_guided_action_card(page, label, postcondition):
+            debug_trace["oracle_guided_action_card"] = {
+                "status": "validated",
+                "label": label,
+            }
+            debug_trace["resolved_by"] = "oracle_guided_action_card"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_with_candidates", debug_trace)
             _ptr_set_recovery_record(
                 "oracle_handler",
                 "guided_action_card",
@@ -3774,6 +4560,7 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                 postcondition_passed=True,
             )
             return
+            debug_trace["oracle_guided_action_card"] = {"status": "not_applied"}
 
         if helper == "click_button_target":
             optional_warning_skip = _ptr_try_skip_optional_oracle_warning_ok(
@@ -3783,6 +4570,13 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                 last_error,
             )
             if optional_warning_skip:
+                debug_trace["oracle_optional_warning_ok_absent"] = {
+                    "status": "validated",
+                    "details": _ptr_clone_json_value(optional_warning_skip),
+                }
+                debug_trace["resolved_by"] = "oracle_optional_warning_ok_absent"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("click_with_candidates", debug_trace)
                 _ptr_set_recovery_record(
                     "oracle_handler",
                     "optional_warning_ok_absent",
@@ -3800,6 +4594,7 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                     postcondition_passed=True,
                 )
                 return
+            debug_trace["oracle_optional_warning_ok_absent"] = {"status": "not_applied"}
 
         for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(page, helper, label, last_error, locator=locator):
             try:
@@ -3808,6 +4603,20 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                 _ptr_strict_click(experience_locator)
                 after_experience = _ptr_observe(page, experience_locator)
                 if postcondition(before_experience, after_experience):
+                    experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                    if isinstance(experience_attempts, list):
+                        experience_attempts.append(
+                            {
+                                "strategy_name": strategy_name,
+                                "status": "validated",
+                                "episode_id": str(episode.get("episode_id") or "").strip(),
+                                "retrieval_score": int(episode.get("retrieval_score") or 0),
+                                "after": _ptr_debug_observation_summary(after_experience),
+                            }
+                        )
+                    debug_trace["resolved_by"] = "experience_reuse"
+                    debug_trace["status"] = "success"
+                    _ptr_set_debug_detail("click_with_candidates", debug_trace)
                     _ptr_set_recovery_record(
                         "experience_reuse",
                         str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -3830,60 +4639,101 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
                     )
                     return
                 last_error = RuntimeError(f'Experience strategy "{strategy_name}" did not satisfy postcondition for "{label}".')
-            except Exception as exc:
-                last_error = exc
-
-        ai_candidates = _ptr_ai_repair_locators(page, helper, label, last_error, locator=locator)
-        last_ai_strategy_name = ""
-        for strategy_name, ai_locator, ai_strategy in ai_candidates:
-            last_ai_strategy_name = strategy_name
-            try:
-                _ptr_record_strategy_attempt(strategy_name)
-                before_ai = _ptr_observe(page, ai_locator)
-                _ptr_strict_click(ai_locator)
-                after_ai = _ptr_observe(page, ai_locator)
-                if postcondition(before_ai, after_ai):
-                    _ptr_set_recovery_record(
-                        "ai_validated",
-                        "ai_locator_repair",
-                        "ai_locator_repair",
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
                         {
                             "strategy_name": strategy_name,
-                            "locator_strategy": _ptr_clone_json_value(ai_strategy),
-                        },
+                            "status": "postcondition_failed",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "error": _ptr_trim_debug_text(last_error, 320),
+                        }
                     )
-                    _ptr_store_experience_episode(
-                        action_type=helper,
-                        label=label,
-                        page=page,
-                        locator=ai_locator,
-                        error=last_error,
-                        status="success",
-                        postcondition_kind="action_effect",
-                        postcondition_passed=True,
-                    )
-                    _ptr_finalize_last_ai_interaction(
-                        repair_outcome="validated",
-                        strategy_name=strategy_name,
-                        postcondition_kind="action_effect",
-                    )
-                    return
-                last_error = RuntimeError(f'AI strategy "{strategy_name}" did not satisfy postcondition for "{label}".')
             except Exception as exc:
                 last_error = exc
-        if ai_candidates:
-            _ptr_finalize_last_ai_interaction(
-                repair_outcome="execution_failed",
-                strategy_name=last_ai_strategy_name,
-                error=last_error,
-                postcondition_kind="action_effect",
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "failed",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "error": _ptr_trim_debug_text(exc, 320),
+                        }
+                    )
+        if not debug_trace.get("experience_attempts"):
+            debug_trace["experience_attempts"] = [{"status": "no_candidates"}]
+
+        def _execute_ai_click_locator(strategy_name: str, ai_locator: Locator, ai_strategy: dict[str, Any]) -> bool:
+            before_ai = _ptr_observe(page, ai_locator)
+            _ptr_strict_click(ai_locator)
+            after_ai = _ptr_observe(page, ai_locator)
+            return postcondition(before_ai, after_ai)
+
+        ai_result, last_error = _ptr_execute_ai_repair_rounds(
+            current_page=page,
+            helper=helper,
+            label=label,
+            last_error=last_error,
+            locator=locator,
+            postcondition_kind="action_effect",
+            failure_message=lambda strategy_name: f'AI strategy "{strategy_name}" did not satisfy postcondition for "{label}".',
+            execute_locator=_execute_ai_click_locator,
+        )
+        if ai_result is not None:
+            strategy_name, ai_locator, ai_strategy = ai_result
+            debug_trace["ai_repair"] = {
+                "status": "validated",
+                "strategy_name": strategy_name,
+                "locator_strategy": _ptr_clone_json_value(ai_strategy),
+            }
+            debug_trace["resolved_by"] = "ai_locator_repair"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_with_candidates", debug_trace)
+            _ptr_set_recovery_record(
+                "ai_validated",
+                "ai_locator_repair",
+                "ai_locator_repair",
+                {
+                    "strategy_name": strategy_name,
+                    "locator_strategy": _ptr_clone_json_value(ai_strategy),
+                },
             )
+            _ptr_store_experience_episode(
+                action_type=helper,
+                label=label,
+                page=page,
+                locator=ai_locator,
+                error=last_error,
+                status="success",
+                postcondition_kind="action_effect",
+                postcondition_passed=True,
+            )
+            return
+        debug_trace["ai_repair"] = {
+            "status": "failed",
+            "error": _ptr_trim_debug_text(last_error, 320),
+        }
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("click_with_candidates", debug_trace)
 
         raise RuntimeError(f'Unable to click target "{label}" after strict execution, Oracle recovery, and AI self-repair.') from last_error
 
 
 def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: str) -> None:
     _ptr_register_page(current_page)
+    debug_trace = _ptr_update_debug_detail(
+        "fill_textbox",
+        {
+            "label": label,
+            "requested_value": _ptr_trim_debug_text(value, 120),
+            "status": "strict_attempt",
+            "experience_attempts": [],
+        },
+    )
     try:
         _ptr_strict_fill(locator, value)
         _ptr_wait_for_field_processing(
@@ -3893,13 +4743,31 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
         )
         observed = _ptr_locator_value(locator) or _ptr_locator_text(locator)
         if _ptr_value_matches(value, observed):
+            debug_trace["direct_attempt"] = {
+                "status": "validated",
+                "observed_value": _ptr_trim_debug_text(observed, 160),
+            }
+            debug_trace["resolved_by"] = "strict"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("fill_textbox", debug_trace)
             return
         raise RuntimeError(f'Textbox "{label}" did not reflect the requested value.')
     except Exception as direct_exc:
         last_error: Exception = direct_exc
+        debug_trace["direct_attempt"] = {
+            "status": "failed",
+            "error": _ptr_trim_debug_text(direct_exc, 320),
+        }
         try:
             oracle_recovery = _ptr_try_oracle_table_active_editor_fill(current_page, locator, label, value)
             if oracle_recovery:
+                debug_trace["oracle_table_active_editor_fill"] = {
+                    "status": "validated",
+                    "details": _ptr_clone_json_value(oracle_recovery),
+                }
+                debug_trace["resolved_by"] = "oracle_table_active_editor_fill"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("fill_textbox", debug_trace)
                 _ptr_set_recovery_record(
                     "oracle_handler",
                     "oracle_table_active_editor_fill",
@@ -3919,6 +4787,12 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
                 return
         except Exception as exc:
             last_error = exc
+            debug_trace["oracle_table_active_editor_fill"] = {
+                "status": "failed",
+                "error": _ptr_trim_debug_text(exc, 320),
+            }
+        if "oracle_table_active_editor_fill" not in debug_trace:
+            debug_trace["oracle_table_active_editor_fill"] = {"status": "not_applied"}
         for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(current_page, "fill_textbox", label, direct_exc, locator=locator):
             try:
                 _ptr_record_strategy_attempt(strategy_name)
@@ -3930,6 +4804,20 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
                 )
                 observed = _ptr_locator_value(experience_locator) or _ptr_locator_text(experience_locator)
                 if _ptr_value_matches(value, observed):
+                    experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                    if isinstance(experience_attempts, list):
+                        experience_attempts.append(
+                            {
+                                "strategy_name": strategy_name,
+                                "status": "validated",
+                                "episode_id": str(episode.get("episode_id") or "").strip(),
+                                "retrieval_score": int(episode.get("retrieval_score") or 0),
+                                "observed_value": _ptr_trim_debug_text(observed, 160),
+                            }
+                        )
+                    debug_trace["resolved_by"] = "experience_reuse"
+                    debug_trace["status"] = "success"
+                    _ptr_set_debug_detail("fill_textbox", debug_trace)
                     _ptr_set_recovery_record(
                         "experience_reuse",
                         str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -3952,57 +4840,91 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
                     )
                     return
                 last_error = RuntimeError(f'Experience strategy "{strategy_name}" did not satisfy fill postcondition for "{label}".')
-            except Exception as exc:
-                last_error = exc
-        ai_candidates = _ptr_ai_repair_locators(current_page, "fill_textbox", label, direct_exc, value=value, locator=locator)
-        last_ai_strategy_name = ""
-        for strategy_name, ai_locator, ai_strategy in ai_candidates:
-            last_ai_strategy_name = strategy_name
-            try:
-                _ptr_record_strategy_attempt(strategy_name)
-                _ptr_strict_fill(ai_locator, value)
-                _ptr_wait_for_field_processing(
-                    current_page,
-                    env_name="PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS",
-                    default_ms=500,
-                )
-                observed = _ptr_locator_value(ai_locator) or _ptr_locator_text(ai_locator)
-                if _ptr_value_matches(value, observed):
-                    _ptr_set_recovery_record(
-                        "ai_validated",
-                        "ai_locator_repair",
-                        "ai_locator_repair",
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
                         {
                             "strategy_name": strategy_name,
-                            "locator_strategy": _ptr_clone_json_value(ai_strategy),
-                        },
+                            "status": "postcondition_failed",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "observed_value": _ptr_trim_debug_text(observed, 160),
+                            "error": _ptr_trim_debug_text(last_error, 320),
+                        }
                     )
-                    _ptr_store_experience_episode(
-                        action_type="fill_textbox",
-                        label=label,
-                        page=current_page,
-                        locator=ai_locator,
-                        error=direct_exc,
-                        status="success",
-                        postcondition_kind="field_value_changed",
-                        postcondition_passed=True,
-                    )
-                    _ptr_finalize_last_ai_interaction(
-                        repair_outcome="validated",
-                        strategy_name=strategy_name,
-                        postcondition_kind="field_value_changed",
-                    )
-                    return
-                last_error = RuntimeError(f'AI strategy "{strategy_name}" did not satisfy fill postcondition for "{label}".')
             except Exception as exc:
                 last_error = exc
-        if ai_candidates:
-            _ptr_finalize_last_ai_interaction(
-                repair_outcome="execution_failed",
-                strategy_name=last_ai_strategy_name,
-                error=last_error,
-                postcondition_kind="field_value_changed",
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "failed",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "error": _ptr_trim_debug_text(exc, 320),
+                        }
+                    )
+        if not debug_trace.get("experience_attempts"):
+            debug_trace["experience_attempts"] = [{"status": "no_candidates"}]
+        def _execute_ai_fill_locator(strategy_name: str, ai_locator: Locator, ai_strategy: dict[str, Any]) -> bool:
+            _ptr_strict_fill(ai_locator, value)
+            _ptr_wait_for_field_processing(
+                current_page,
+                env_name="PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS",
+                default_ms=500,
             )
+            observed = _ptr_locator_value(ai_locator) or _ptr_locator_text(ai_locator)
+            return _ptr_value_matches(value, observed)
+
+        ai_result, last_error = _ptr_execute_ai_repair_rounds(
+            current_page=current_page,
+            helper="fill_textbox",
+            label=label,
+            last_error=last_error,
+            value=value,
+            locator=locator,
+            postcondition_kind="field_value_changed",
+            failure_message=lambda strategy_name: f'AI strategy "{strategy_name}" did not satisfy fill postcondition for "{label}".',
+            execute_locator=_execute_ai_fill_locator,
+        )
+        if ai_result is not None:
+            strategy_name, ai_locator, ai_strategy = ai_result
+            debug_trace["ai_repair"] = {
+                "status": "validated",
+                "strategy_name": strategy_name,
+                "locator_strategy": _ptr_clone_json_value(ai_strategy),
+            }
+            debug_trace["resolved_by"] = "ai_locator_repair"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("fill_textbox", debug_trace)
+            _ptr_set_recovery_record(
+                "ai_validated",
+                "ai_locator_repair",
+                "ai_locator_repair",
+                {
+                    "strategy_name": strategy_name,
+                    "locator_strategy": _ptr_clone_json_value(ai_strategy),
+                },
+            )
+            _ptr_store_experience_episode(
+                action_type="fill_textbox",
+                label=label,
+                page=current_page,
+                locator=ai_locator,
+                error=direct_exc,
+                status="success",
+                postcondition_kind="field_value_changed",
+                postcondition_passed=True,
+            )
+            return
+        debug_trace["ai_repair"] = {
+            "status": "failed",
+            "error": _ptr_trim_debug_text(last_error, 320),
+        }
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("fill_textbox", debug_trace)
         raise RuntimeError(f'Unable to fill textbox "{label}" using strict execution and AI self-repair.') from last_error
 
 
@@ -4064,6 +4986,8 @@ def _ptr_select_option_state(locator: Locator) -> dict[str, Any]:
                 };
             }
             const selectedOptions = Array.from(node.selectedOptions || []);
+            const attr = (name) => normalize(node.getAttribute ? node.getAttribute(name) : "");
+            const nodeId = String(node.id || "");
             return {
                 value: normalize("value" in node ? node.value : ""),
                 selected_values: dedupe(selectedOptions.map((option) => option?.value)),
@@ -4072,10 +4996,58 @@ def _ptr_select_option_state(locator: Locator) -> dict[str, Any]:
                     .map((option) => Number(option?.index))
                     .filter((value) => Number.isInteger(value)),
                 text: normalize(node.innerText || node.textContent),
+                // ADF Faces selectOneChoice commit markers (see _ptr_adf_select_commit_contradicted).
+                title: attr("title"),
+                afov: attr("_afov"),
+                is_adf: Boolean((node.hasAttribute && node.hasAttribute("_afov")) || nodeId.indexOf("::") !== -1),
             };
         }""",
     )
     return state if isinstance(state, dict) else {}
+
+
+def _ptr_adf_select_commit_contradicted(state: dict[str, Any]) -> bool:
+    """Return True when an ADF Faces ``<select>`` shows the requested option in
+    the DOM but ADF's committed markers still reflect the prior value.
+
+    Playwright's ``select_option`` mutates the native ``<select>`` value and
+    ``selectedOptions`` directly. For an Oracle ADF ``selectOneChoice`` that is
+    not enough: ADF only mirrors the committed value into the element's
+    ``title`` attribute and its ``_afov`` ("original value") attribute when its
+    own change handler / partial-page-refresh actually runs. When those markers
+    contradict the DOM-selected option, Oracle never accepted the selection
+    (e.g. the dependent "Create Transaction: Invoice" header never changes), so
+    the action must not be reported as successful.
+
+    Only ADF selects are gated (``is_adf``); plain HTML ``<select>`` elements are
+    left to the existing DOM-state postcondition. A missing/blank marker is never
+    treated as a contradiction, so a genuinely-committed select is never failed.
+    """
+    if not isinstance(state, dict) or not state.get("is_adf"):
+        return False
+
+    selected_labels = [
+        label for label in (state.get("selected_labels") or []) if _ptr_normalize_text(label)
+    ]
+    selected_value = _ptr_normalize_text(state.get("value"))
+    selected_indexes = {str(index).strip() for index in (state.get("selected_indexes") or [])}
+
+    title = _ptr_normalize_text(state.get("title"))
+    afov = _ptr_normalize_text(state.get("afov"))
+
+    # No committed markers to evaluate -> cannot prove a missing commit.
+    if not title and not afov:
+        return False
+
+    title_confirms = bool(title) and any(_ptr_value_matches(label, title) for label in selected_labels)
+    afov_confirms = bool(afov) and (afov == selected_value or afov in selected_indexes)
+
+    # A marker that agrees with the DOM selection means ADF committed the value.
+    if title_confirms or afov_confirms:
+        return False
+
+    # Markers are present but still reflect the prior value -> not committed.
+    return True
 
 
 def _ptr_select_option_postcondition(
@@ -4123,9 +5095,21 @@ def _ptr_select_option_postcondition(
             return False
 
     if matched_explicit_expectation:
-        return True
+        base_pass = True
+    else:
+        base_pass = after_state != before_state and bool(observed_values or observed_labels or observed_indexes)
 
-    return after_state != before_state and bool(observed_values or observed_labels or observed_indexes)
+    if not base_pass:
+        return False
+
+    # Oracle ADF selectOneChoice commit gate: a forced native-<select> value is
+    # not success unless ADF actually committed it (title/_afov agree with the
+    # DOM selection). Otherwise the UI shows the new option while the model and
+    # dependent header stay on the old value -> the action failed.
+    if _ptr_adf_select_commit_contradicted(after_state):
+        return False
+
+    return True
 
 
 def _ptr_apply_select_option(locator: Locator, option_args: list[Any] | None, option_kwargs: dict[str, Any] | None) -> None:
@@ -4139,6 +5123,451 @@ def _ptr_apply_select_option(locator: Locator, option_args: list[Any] | None, op
     call_kwargs = dict(option_kwargs or {})
     call_kwargs.setdefault("timeout", timeout_ms)
     locator.select_option(*(option_args or []), **call_kwargs)
+
+
+def _ptr_primary_selected_index(state: dict[str, Any]) -> int | None:
+    for value in list((state or {}).get("selected_indexes") or []):
+        try:
+            return int(value)
+        except Exception:
+            continue
+    return None
+
+
+def _ptr_resolve_select_target(locator: Locator, option_args: list[Any] | None, option_kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    expectations = _ptr_select_option_expectations(option_args, option_kwargs)
+    snapshot = _ptr_safe_locator_eval(
+        locator,
+        r"""(node, payload) => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const options = Array.from(node?.options || []);
+            const nodeId = String(node?.id || "");
+            return {
+                is_adf: Boolean((node?.hasAttribute && node.hasAttribute("_afov")) || nodeId.indexOf("::") !== -1),
+                options: options.map((option) => ({
+                    index: Number(option?.index),
+                    value: normalize(option?.value),
+                    label: normalize(option?.label || option?.innerText || option?.textContent),
+                })),
+            };
+        }""",
+        expectations,
+    )
+    if not isinstance(snapshot, dict):
+        return {}
+
+    raw_options = snapshot.get("options") or []
+    options: list[dict[str, Any]] = []
+    for raw_option in raw_options if isinstance(raw_options, list) else []:
+        if not isinstance(raw_option, dict):
+            continue
+        try:
+            option_index = int(raw_option.get("index"))
+        except Exception:
+            continue
+        options.append(
+            {
+                "index": option_index,
+                "value": str(raw_option.get("value") or "").strip(),
+                "label": str(raw_option.get("label") or "").strip(),
+            }
+        )
+
+    def _pick(option: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "index": int(option.get("index")),
+            "value": str(option.get("value") or "").strip(),
+            "label": str(option.get("label") or "").strip(),
+        }
+
+    for expected_index in expectations["indexes"]:
+        try:
+            wanted_index = int(expected_index)
+        except Exception:
+            continue
+        for option in options:
+            if int(option.get("index")) == wanted_index:
+                return _pick(option)
+
+    for expected_value in expectations["values"]:
+        normalized_expected = str(expected_value or "").strip()
+        if not normalized_expected:
+            continue
+        for option in options:
+            if _ptr_value_matches(normalized_expected, option.get("value")):
+                return _pick(option)
+
+    for expected_label in expectations["labels"]:
+        normalized_expected = str(expected_label or "").strip()
+        if not normalized_expected:
+            continue
+        for option in options:
+            if _ptr_value_matches(normalized_expected, option.get("label")):
+                return _pick(option)
+
+    # Oracle ADF selectOneChoice often stores zero-based internal values while
+    # older recordings persist the visible ordinal as "1", "2", "3". Reuse the
+    # live option order only when the control clearly looks like ADF and the
+    # option values are the canonical zero-based sequence.
+    is_adf = bool(snapshot.get("is_adf"))
+    if is_adf and len(expectations["values"]) == 1 and not expectations["labels"] and not expectations["indexes"]:
+        try:
+            ordinal = int(str(expectations["values"][0] or "").strip())
+        except Exception:
+            ordinal = None
+        option_values = [str(option.get("value") or "").strip() for option in options]
+        looks_zero_based = option_values == [str(index) for index in range(len(options))]
+        if ordinal is not None and looks_zero_based and 1 <= ordinal <= len(options):
+            return _pick(options[ordinal - 1])
+
+    return {}
+
+
+def _ptr_oracle_adf_commit_events(locator: Locator) -> bool:
+    result = _ptr_safe_locator_eval(
+        locator,
+        r"""(node) => {
+            if (!node) return false;
+            const fire = (name) => node.dispatchEvent(new Event(name, { bubbles: true, cancelable: true }));
+            try {
+                node.focus?.();
+            } catch (error) {
+                return false;
+            }
+            fire("input");
+            fire("change");
+            fire("blur");
+            fire("focusout");
+            return true;
+        }""",
+    )
+    return bool(result)
+
+
+def _ptr_reset_select_to_index(locator: Locator, index: int) -> bool:
+    result = _ptr_safe_locator_eval(
+        locator,
+        r"""(node, payload) => {
+            if (!node || !node.options) return false;
+            const nextIndex = Number(payload?.index);
+            if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex >= node.options.length) return false;
+            node.selectedIndex = nextIndex;
+            return true;
+        }""",
+        {"index": index},
+    )
+    return bool(result)
+
+
+def _ptr_try_commit_oracle_adf_select(
+    locator: Locator,
+    current_page: Page,
+    before_state: dict[str, Any],
+    option_args: list[Any] | None,
+    option_kwargs: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    contradicted_state = _ptr_select_option_state(locator)
+    if not _ptr_adf_select_commit_contradicted(contradicted_state):
+        return None
+
+    timeout_ms = _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    wait_ms = _ptr_wait_ms("PTR_ADF_SELECT_COMMIT_WAIT_MS", 250)
+    target = _ptr_resolve_select_target(locator, option_args, option_kwargs)
+    before_index = _ptr_primary_selected_index(before_state)
+    target_index = target.get("index")
+    if isinstance(target_index, bool):
+        target_index = int(target_index)
+    elif not isinstance(target_index, int):
+        try:
+            target_index = int(target_index)
+        except Exception:
+            target_index = None
+
+    if before_index is not None and target_index is not None and before_index != target_index:
+        try:
+            locator.focus(timeout=timeout_ms)
+        except Exception:
+            pass
+        if _ptr_reset_select_to_index(locator, before_index):
+            direction = "ArrowDown" if target_index > before_index else "ArrowUp"
+            for _ in range(abs(target_index - before_index)):
+                locator.press(direction, timeout=timeout_ms)
+            try:
+                locator.press("Tab", timeout=timeout_ms)
+            except Exception:
+                pass
+            current_page.wait_for_timeout(wait_ms)
+            _ptr_wait_for_field_processing(
+                current_page,
+                env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+                default_ms=5000,
+            )
+            keyboard_state = _ptr_select_option_state(locator)
+            if _ptr_select_option_postcondition(before_state, keyboard_state, option_args, option_kwargs):
+                return {
+                    "strategy_name": "oracle_adf_select_keyboard_commit",
+                    "target_index": target_index,
+                    "target_value": str(target.get("value") or "").strip(),
+                    "target_label": str(target.get("label") or "").strip(),
+                }
+
+    if _ptr_oracle_adf_commit_events(locator):
+        current_page.wait_for_timeout(wait_ms)
+        _ptr_wait_for_field_processing(
+            current_page,
+            env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+            default_ms=5000,
+        )
+        event_state = _ptr_select_option_state(locator)
+        if _ptr_select_option_postcondition(before_state, event_state, option_args, option_kwargs):
+            return {
+                "strategy_name": "oracle_adf_select_event_commit",
+                "target_index": target_index if target_index is not None else -1,
+                "target_value": str(target.get("value") or "").strip(),
+                "target_label": str(target.get("label") or "").strip(),
+            }
+
+    return None
+
+
+def _ptr_oracle_label_value_matches(page: Page | None, label: str, expected_value: str) -> bool:
+    normalized_label = _ptr_normalize_text(label)
+    normalized_value = _ptr_normalize_text(expected_value)
+    if not normalized_label or not normalized_value:
+        return False
+
+    result = _ptr_safe_page_eval(
+        page,
+        r"""(payload) => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+            const targetLabel = normalize(payload?.label);
+            const targetValue = normalize(payload?.value);
+            if (!targetLabel || !targetValue) return false;
+
+            const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                if (!style) return false;
+                if (style.display === "none" || style.visibility === "hidden") return false;
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (node) => normalize(node?.innerText || node?.textContent || "");
+            const matchesValue = (text) => {
+                if (!text) return false;
+                return text === targetValue || text.includes(targetValue) || targetValue.includes(text);
+            };
+            const containsLabel = (text) => {
+                if (!text) return false;
+                return text === targetLabel || text.includes(targetLabel) || targetLabel.includes(text);
+            };
+            const controlValues = (node) => {
+                if (!node) return [];
+                const values = [];
+                const append = (value) => {
+                    const normalized = normalize(value);
+                    if (normalized) values.push(normalized);
+                };
+                append(node.value);
+                append(node.getAttribute?.("value"));
+                append(node.getAttribute?.("aria-valuetext"));
+                append(node.getAttribute?.("aria-label"));
+                const selectedOptions = Array.from(node.selectedOptions || []);
+                for (const option of selectedOptions) {
+                    append(option?.label || option?.innerText || option?.textContent);
+                    append(option?.value);
+                }
+                append(node.innerText || node.textContent);
+                return Array.from(new Set(values.filter(Boolean)));
+            };
+            const controlMatches = (node) => controlValues(node).some(matchesValue);
+            const regionMatches = (text) => {
+                if (!text) return false;
+                if (!containsLabel(text)) return false;
+                if (matchesValue(text)) return true;
+                const withoutLabel = normalize(text.replace(payload?.label || "", " "));
+                if (matchesValue(withoutLabel)) return true;
+                return false;
+            };
+            const nearbyControlMatches = (node) => {
+                if (!node) return false;
+                const controls = [];
+                const add = (candidate) => {
+                    if (!candidate || controls.includes(candidate)) return;
+                    controls.push(candidate);
+                };
+                const pushFrom = (root) => {
+                    if (!root || !root.querySelectorAll) return;
+                    for (const candidate of root.querySelectorAll("select, input, textarea, [role='combobox'], oj-select-single, oj-c-select-single")) {
+                        add(candidate);
+                    }
+                };
+                const forId = normalize(node.getAttribute?.("for"));
+                if (forId) add(document.getElementById(forId));
+                pushFrom(node);
+                pushFrom(node.parentElement);
+                pushFrom(node.closest("tr, .oj-formlayout-row, .oj-flex, .oj-sm-flex, .oj-form, .AFStretchWidth"));
+                pushFrom(node.parentElement?.parentElement);
+                return controls.some((candidate) => isVisible(candidate) && controlMatches(candidate));
+            };
+            const candidateSelectors = "label, oj-label, span, div, td, th";
+
+            for (const node of document.querySelectorAll(candidateSelectors)) {
+                if (!isVisible(node)) continue;
+                const labelText = textOf(node);
+                if (!labelText || !containsLabel(labelText)) continue;
+                if (regionMatches(labelText)) return true;
+                if (nearbyControlMatches(node)) return true;
+
+                const siblingCandidates = [
+                    node.nextElementSibling,
+                    node.parentElement?.nextElementSibling,
+                ].filter(Boolean);
+                for (const candidate of siblingCandidates) {
+                    const candidateText = textOf(candidate);
+                    if (matchesValue(candidateText)) return true;
+                    if (controlMatches(candidate)) return true;
+                }
+
+                const parent = node.parentElement;
+                if (parent) {
+                    if (regionMatches(textOf(parent))) return true;
+                    const rowCandidates = Array.from(parent.children || [])
+                        .filter((child) => child !== node)
+                        .map((child) => textOf(child))
+                        .filter(Boolean);
+                    if (rowCandidates.some(matchesValue)) return true;
+                }
+
+                const ownRow = node.closest("tr, .oj-formlayout-row, .oj-flex, .oj-sm-flex, .oj-form, .AFStretchWidth");
+                if (ownRow) {
+                    if (regionMatches(textOf(ownRow))) return true;
+                    if (nearbyControlMatches(ownRow)) return true;
+                    const rowTextCandidates = Array.from(ownRow.querySelectorAll("span, div, td, th, a"))
+                        .filter((candidate) => candidate !== node && isVisible(candidate))
+                        .map((candidate) => textOf(candidate))
+                        .filter(Boolean);
+                    if (rowTextCandidates.some(matchesValue)) return true;
+                }
+
+                const grandParent = parent?.parentElement;
+                if (grandParent && regionMatches(textOf(grandParent))) return true;
+            }
+            return false;
+        }""",
+        {"label": label, "value": expected_value},
+    )
+    return bool(result)
+
+
+def _ptr_try_oracle_searchselect_select_option_recovery(
+    locator: Locator,
+    current_page: Page,
+    label: str,
+    option_args: list[Any] | None,
+    option_kwargs: dict[str, Any] | None,
+    resolved_target: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    metadata = _ptr_extract_locator_metadata(locator)
+    target = _ptr_clone_json_value(resolved_target or {}) or _ptr_resolve_select_target(locator, option_args, option_kwargs)
+    expectations = _ptr_select_option_expectations(option_args, option_kwargs)
+    debug_trace: dict[str, Any] = {
+        "label": label,
+        "metadata": _ptr_clone_json_value(metadata),
+        "target": _ptr_clone_json_value(target),
+        "expectations": _ptr_clone_json_value(expectations),
+        "trigger_attempts": [],
+    }
+
+    option_name = str(target.get("label") or "").strip()
+    if not option_name:
+        explicit_labels = [str(item or "").strip() for item in expectations.get("labels") or [] if str(item or "").strip()]
+        explicit_values = [str(item or "").strip() for item in expectations.get("values") or [] if str(item or "").strip()]
+        option_name = (explicit_labels[0] if explicit_labels else "") or (explicit_values[0] if explicit_values else "")
+    if not option_name:
+        debug_trace["status"] = "skipped_missing_option_name"
+        _ptr_set_debug_detail("oracle_searchselect_recovery", debug_trace)
+        return None
+
+    fill_value = str(target.get("label") or "").strip() or option_name
+    trigger_candidates: list[tuple[str, Locator]] = []
+    direct_tag = str(metadata.get("tag") or "").strip().lower()
+    direct_role = str(metadata.get("role") or "").strip().lower()
+    oracle_host_tag = str(metadata.get("oracle_host_tag") or "").strip().lower()
+
+    if (
+        direct_role == "combobox"
+        or direct_tag in {"oj-select-single", "oj-c-select-single"}
+        or oracle_host_tag in {"oj-select-single", "oj-c-select-single"}
+    ):
+        trigger_candidates.append(("oracle_searchselect_direct", locator))
+
+    get_by_role = getattr(current_page, "get_by_role", None)
+    if callable(get_by_role):
+        try:
+            trigger_candidates.append(("oracle_searchselect_role_combobox", current_page.get_by_role("combobox", name=label, exact=True)))
+        except Exception:
+            pass
+
+    seen_trigger_ids: set[int] = set()
+    last_error: Exception | None = None
+    for strategy_name, candidate in trigger_candidates:
+        attempt: dict[str, Any] = {"strategy_name": strategy_name}
+        try:
+            resolved = candidate.first if hasattr(candidate, "first") else candidate
+        except Exception:
+            resolved = candidate
+        if resolved is None:
+            attempt["status"] = "empty_candidate"
+            debug_trace["trigger_attempts"].append(attempt)
+            continue
+        resolved_id = id(resolved)
+        if resolved_id in seen_trigger_ids:
+            attempt["status"] = "duplicate_candidate"
+            debug_trace["trigger_attempts"].append(attempt)
+            continue
+        seen_trigger_ids.add(resolved_id)
+        label_match = _ptr_ai_locator_matches_label(resolved, label)
+        attempt["label_match"] = label_match
+        if not label_match:
+            attempt["status"] = "label_mismatch"
+            debug_trace["trigger_attempts"].append(attempt)
+            continue
+        try:
+            option_locator = current_page.get_by_text(option_name, exact=True)
+            _ptr_select_search_trigger_option(
+                resolved,
+                option_locator,
+                current_page,
+                label,
+                option_name,
+                option_exact=True,
+                fill_value=fill_value,
+                allow_repair=False,
+            )
+            attempt["status"] = "success"
+            debug_trace["trigger_attempts"].append(attempt)
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("oracle_searchselect_recovery", debug_trace)
+            return {
+                "strategy_name": strategy_name,
+                "target_index": int(target.get("index")) if isinstance(target.get("index"), int) else -1,
+                "target_value": str(target.get("value") or "").strip(),
+                "target_label": str(target.get("label") or "").strip(),
+                "option_name": option_name,
+                "fill_value": fill_value,
+            }
+        except Exception as exc:
+            last_error = exc
+            attempt["status"] = "failed"
+            attempt["error"] = _ptr_trim_debug_text(exc, 400)
+            debug_trace["trigger_attempts"].append(attempt)
+
+    debug_trace["status"] = "failed"
+    if last_error is not None:
+        debug_trace["last_error"] = _ptr_trim_debug_text(last_error, 400)
+    _ptr_set_debug_detail("oracle_searchselect_recovery", debug_trace)
+    return None
 
 
 def _ptr_select_option_target(
@@ -4158,8 +5587,18 @@ def _ptr_select_option_target(
         ),
         ensure_ascii=False,
     )
+    debug_trace: dict[str, Any] = {
+        "label": label,
+        "target_description": _ptr_clone_json_value({"args": option_args or [], "kwargs": option_kwargs or {}}),
+    }
+    _ptr_set_debug_detail("select_option_target", debug_trace)
+    initial_target = _ptr_resolve_select_target(locator, option_args, option_kwargs)
+    debug_trace["initial_target"] = _ptr_clone_json_value(initial_target)
+    _ptr_set_debug_detail("select_option_target", debug_trace)
 
     before_state = _ptr_select_option_state(locator)
+    debug_trace["before_state"] = _ptr_clone_json_value(before_state)
+    _ptr_set_debug_detail("select_option_target", debug_trace)
     try:
         _ptr_apply_select_option(locator, option_args, option_kwargs)
         _ptr_wait_for_field_processing(
@@ -4168,12 +5607,102 @@ def _ptr_select_option_target(
             default_ms=5000,
         )
         after_state = _ptr_select_option_state(locator)
-        if _ptr_select_option_postcondition(before_state, after_state, option_args, option_kwargs):
+        direct_postcondition = _ptr_select_option_postcondition(before_state, after_state, option_args, option_kwargs)
+        debug_trace["after_state"] = _ptr_clone_json_value(after_state)
+        debug_trace["direct_postcondition_passed"] = direct_postcondition
+        _ptr_set_debug_detail("select_option_target", debug_trace)
+        if direct_postcondition:
             return
+        semantic_target = initial_target or _ptr_resolve_select_target(locator, option_args, option_kwargs)
+        semantic_label = str(semantic_target.get("label") or "").strip()
+        debug_trace["semantic_target"] = _ptr_clone_json_value(semantic_target)
+        semantic_match = bool(semantic_label) and _ptr_oracle_label_value_matches(current_page, label, semantic_label)
+        debug_trace["semantic_label_match"] = semantic_match
+        _ptr_set_debug_detail("select_option_target", debug_trace)
+        if semantic_match:
+            _ptr_set_recovery_record(
+                "oracle_handler",
+                "oracle_label_value_already_selected",
+                "oracle_label_value_already_selected",
+                {
+                    "target_value": str(semantic_target.get("value") or "").strip(),
+                    "target_label": semantic_label,
+                },
+            )
+            _ptr_store_experience_episode(
+                action_type="select_option_target",
+                label=label,
+                page=current_page,
+                locator=locator,
+                error=None,
+                status="success",
+                postcondition_kind="option_selected",
+                postcondition_passed=True,
+            )
+            return
+        oracle_recovery = _ptr_try_commit_oracle_adf_select(
+            locator,
+            current_page,
+            before_state,
+            option_args,
+            option_kwargs,
+        )
+        debug_trace["oracle_adf_commit_recovery"] = _ptr_clone_json_value(oracle_recovery)
+        _ptr_set_debug_detail("select_option_target", debug_trace)
+        if oracle_recovery:
+            _ptr_set_recovery_record(
+                "oracle_handler",
+                "oracle_adf_select_commit",
+                "oracle_adf_select_commit",
+                oracle_recovery,
+            )
+            _ptr_store_experience_episode(
+                action_type="select_option_target",
+                label=label,
+                page=current_page,
+                locator=locator,
+                error=None,
+                status="success",
+                postcondition_kind="option_selected",
+                postcondition_passed=True,
+            )
+            return
+        oracle_searchselect_recovery = _ptr_try_oracle_searchselect_select_option_recovery(
+            locator,
+            current_page,
+            label,
+            option_args,
+            option_kwargs,
+            resolved_target=initial_target,
+        )
+        debug_trace["oracle_searchselect_recovery"] = _ptr_clone_json_value(oracle_searchselect_recovery)
+        _ptr_set_debug_detail("select_option_target", debug_trace)
+        if oracle_searchselect_recovery:
+            _ptr_set_recovery_record(
+                "oracle_handler",
+                "oracle_searchselect_select_option",
+                "oracle_searchselect_select_option",
+                oracle_searchselect_recovery,
+            )
+            _ptr_store_experience_episode(
+                action_type="select_option_target",
+                label=label,
+                page=current_page,
+                locator=locator,
+                error=None,
+                status="success",
+                postcondition_kind="option_selected",
+                postcondition_passed=True,
+            )
+            return
+        debug_trace["status"] = "direct_failed"
+        _ptr_set_debug_detail("select_option_target", debug_trace)
         raise RuntimeError(
             f'Select "{label}" did not reflect the requested option selection {target_description}.'
         )
     except Exception as direct_exc:
+        debug_trace["direct_error"] = _ptr_trim_debug_text(direct_exc, 400)
+        _ptr_set_debug_detail("select_option_target", debug_trace)
         last_error: Exception = direct_exc
         for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(
             current_page,
@@ -4198,6 +5727,44 @@ def _ptr_select_option_target(
                     option_args,
                     option_kwargs,
                 ):
+                    debug_trace["experience_reuse"] = {
+                        "strategy_name": strategy_name,
+                        "status": "success",
+                    }
+                    _ptr_set_debug_detail("select_option_target", debug_trace)
+                    _ptr_set_recovery_record(
+                        "experience_reuse",
+                        str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
+                        "experience_reuse",
+                        {
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "locator_strategy": _ptr_clone_json_value(((episode.get("recovery") or {}).get("details") or {}).get("locator_strategy") or {}),
+                        },
+                    )
+                    _ptr_store_experience_episode(
+                        action_type="select_option_target",
+                        label=label,
+                        page=current_page,
+                        locator=experience_locator,
+                        error=direct_exc,
+                        status="success",
+                        postcondition_kind="option_selected",
+                        postcondition_passed=True,
+                    )
+                    return
+                if _ptr_try_commit_oracle_adf_select(
+                    experience_locator,
+                    current_page,
+                    before_experience,
+                    option_args,
+                    option_kwargs,
+                ):
+                    debug_trace["experience_reuse"] = {
+                        "strategy_name": strategy_name,
+                        "status": "oracle_commit_success",
+                    }
+                    _ptr_set_debug_detail("select_option_target", debug_trace)
                     _ptr_set_recovery_record(
                         "experience_reuse",
                         str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -4222,73 +5789,92 @@ def _ptr_select_option_target(
                 last_error = RuntimeError(
                     f'Experience strategy "{strategy_name}" did not satisfy select_option for "{label}".'
                 )
+                debug_trace["experience_reuse"] = {
+                    "strategy_name": strategy_name,
+                    "status": "postcondition_failed",
+                    "error": _ptr_trim_debug_text(last_error, 300),
+                }
+                _ptr_set_debug_detail("select_option_target", debug_trace)
             except Exception as exc:
                 last_error = exc
+                debug_trace["experience_reuse"] = {
+                    "strategy_name": strategy_name,
+                    "status": "failed",
+                    "error": _ptr_trim_debug_text(exc, 300),
+                }
+                _ptr_set_debug_detail("select_option_target", debug_trace)
 
-        ai_candidates = _ptr_ai_repair_locators(
-            current_page,
-            "select_option_target",
-            label,
-            direct_exc,
-            value=target_description,
-            locator=locator,
-        )
-        last_ai_strategy_name = ""
-        for strategy_name, ai_locator, ai_strategy in ai_candidates:
-            last_ai_strategy_name = strategy_name
-            try:
-                _ptr_record_strategy_attempt(strategy_name)
-                before_ai = _ptr_select_option_state(ai_locator)
-                _ptr_apply_select_option(ai_locator, option_args, option_kwargs)
-                _ptr_wait_for_field_processing(
+        def _execute_ai_select_locator(strategy_name: str, ai_locator: Locator, ai_strategy: dict[str, Any]) -> bool:
+            before_ai = _ptr_select_option_state(ai_locator)
+            _ptr_apply_select_option(ai_locator, option_args, option_kwargs)
+            _ptr_wait_for_field_processing(
+                current_page,
+                env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+                default_ms=5000,
+            )
+            after_ai = _ptr_select_option_state(ai_locator)
+            if _ptr_select_option_postcondition(
+                before_ai,
+                after_ai,
+                option_args,
+                option_kwargs,
+            ):
+                return True
+            return bool(
+                _ptr_try_commit_oracle_adf_select(
+                    ai_locator,
                     current_page,
-                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
-                    default_ms=5000,
-                )
-                after_ai = _ptr_select_option_state(ai_locator)
-                if _ptr_select_option_postcondition(
                     before_ai,
-                    after_ai,
                     option_args,
                     option_kwargs,
-                ):
-                    _ptr_set_recovery_record(
-                        "ai_validated",
-                        "ai_locator_repair",
-                        "ai_locator_repair",
-                        {
-                            "strategy_name": strategy_name,
-                            "locator_strategy": _ptr_clone_json_value(ai_strategy),
-                        },
-                    )
-                    _ptr_store_experience_episode(
-                        action_type="select_option_target",
-                        label=label,
-                        page=current_page,
-                        locator=ai_locator,
-                        error=direct_exc,
-                        status="success",
-                        postcondition_kind="option_selected",
-                        postcondition_passed=True,
-                    )
-                    _ptr_finalize_last_ai_interaction(
-                        repair_outcome="validated",
-                        strategy_name=strategy_name,
-                        postcondition_kind="option_selected",
-                    )
-                    return
-                last_error = RuntimeError(
-                    f'AI strategy "{strategy_name}" did not satisfy select_option for "{label}".'
                 )
-            except Exception as exc:
-                last_error = exc
-        if ai_candidates:
-            _ptr_finalize_last_ai_interaction(
-                repair_outcome="execution_failed",
-                strategy_name=last_ai_strategy_name,
-                error=last_error,
-                postcondition_kind="option_selected",
             )
+
+        ai_result, last_error = _ptr_execute_ai_repair_rounds(
+            current_page=current_page,
+            helper="select_option_target",
+            label=label,
+            last_error=last_error,
+            value=target_description,
+            locator=locator,
+            postcondition_kind="option_selected",
+            failure_message=lambda strategy_name: f'AI strategy "{strategy_name}" did not satisfy select_option for "{label}".',
+            execute_locator=_execute_ai_select_locator,
+        )
+        if ai_result is not None:
+            strategy_name, ai_locator, ai_strategy = ai_result
+            debug_trace["ai_repair"] = {
+                "strategy_name": strategy_name,
+                "status": "success",
+                "locator_strategy": _ptr_clone_json_value(ai_strategy),
+            }
+            _ptr_set_debug_detail("select_option_target", debug_trace)
+            _ptr_set_recovery_record(
+                "ai_validated",
+                "ai_locator_repair",
+                "ai_locator_repair",
+                {
+                    "strategy_name": strategy_name,
+                    "locator_strategy": _ptr_clone_json_value(ai_strategy),
+                },
+            )
+            _ptr_store_experience_episode(
+                action_type="select_option_target",
+                label=label,
+                page=current_page,
+                locator=ai_locator,
+                error=direct_exc,
+                status="success",
+                postcondition_kind="option_selected",
+                postcondition_passed=True,
+            )
+            return
+        debug_trace["ai_repair"] = {
+            "status": "failed",
+            "error": _ptr_trim_debug_text(last_error, 300),
+        }
+        debug_trace["status"] = "failed"
+        _ptr_set_debug_detail("select_option_target", debug_trace)
         raise RuntimeError(
             f'Unable to apply select_option for "{label}" with target {target_description}.'
         ) from last_error
@@ -4317,17 +5903,44 @@ def _ptr_click_textbox(locator: Locator, current_page: Page, label: str) -> None
 def _ptr_click_combobox(locator: Locator, current_page: Page, label: str) -> None:
     _ptr_register_page(current_page)
     before = _ptr_observe(current_page, locator)
+    debug_trace = _ptr_update_debug_detail(
+        "click_combobox",
+        {
+            "label": label,
+            "status": "strict_attempt",
+            "before": _ptr_debug_observation_summary(before),
+            "experience_attempts": [],
+        },
+    )
     try:
         _ptr_strict_click(locator)
         current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_OPEN_WAIT_MS", 350))
         after = _ptr_observe(current_page, locator)
         if _ptr_combobox_open_postcondition(before, after):
+            debug_trace["direct_attempt"] = {
+                "status": "validated",
+                "after": _ptr_debug_observation_summary(after),
+            }
+            debug_trace["resolved_by"] = "strict"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_combobox", debug_trace)
             return
         raise RuntimeError(f'Combobox "{label}" did not open.')
     except Exception as direct_exc:
         last_error: Exception = direct_exc
+        debug_trace["direct_attempt"] = {
+            "status": "failed",
+            "error": _ptr_trim_debug_text(direct_exc, 320),
+        }
         oracle_strategy_name = _ptr_try_open_oracle_select_single_with_keyboard(current_page, locator, direct_exc)
         if oracle_strategy_name:
+            debug_trace["oracle_select_single_keyboard_open"] = {
+                "status": "validated",
+                "strategy_name": oracle_strategy_name,
+            }
+            debug_trace["resolved_by"] = "oracle_select_single_keyboard_open"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_combobox", debug_trace)
             _ptr_set_recovery_record(
                 "oracle_handler",
                 "oracle_select_single_keyboard_open",
@@ -4348,6 +5961,7 @@ def _ptr_click_combobox(locator: Locator, current_page: Page, label: str) -> Non
                 postcondition_passed=True,
             )
             return
+        debug_trace["oracle_select_single_keyboard_open"] = {"status": "not_applied"}
         for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(current_page, "click_combobox", label, direct_exc, locator=locator):
             try:
                 _ptr_record_strategy_attempt(strategy_name)
@@ -4356,6 +5970,20 @@ def _ptr_click_combobox(locator: Locator, current_page: Page, label: str) -> Non
                 current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_OPEN_WAIT_MS", 350))
                 after_experience = _ptr_observe(current_page, experience_locator)
                 if _ptr_combobox_open_postcondition(before_experience, after_experience):
+                    experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                    if isinstance(experience_attempts, list):
+                        experience_attempts.append(
+                            {
+                                "strategy_name": strategy_name,
+                                "status": "validated",
+                                "episode_id": str(episode.get("episode_id") or "").strip(),
+                                "retrieval_score": int(episode.get("retrieval_score") or 0),
+                                "after": _ptr_debug_observation_summary(after_experience),
+                            }
+                        )
+                    debug_trace["resolved_by"] = "experience_reuse"
+                    debug_trace["status"] = "success"
+                    _ptr_set_debug_detail("click_combobox", debug_trace)
                     _ptr_set_recovery_record(
                         "experience_reuse",
                         str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -4378,54 +6006,86 @@ def _ptr_click_combobox(locator: Locator, current_page: Page, label: str) -> Non
                     )
                     return
                 last_error = RuntimeError(f'Experience strategy "{strategy_name}" did not open combobox "{label}".')
-            except Exception as exc:
-                last_error = exc
-        ai_candidates = _ptr_ai_repair_locators(current_page, "click_combobox", label, direct_exc, locator=locator)
-        last_ai_strategy_name = ""
-        for strategy_name, ai_locator, ai_strategy in ai_candidates:
-            last_ai_strategy_name = strategy_name
-            try:
-                _ptr_record_strategy_attempt(strategy_name)
-                before_ai = _ptr_observe(current_page, ai_locator)
-                _ptr_strict_click(ai_locator)
-                current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_OPEN_WAIT_MS", 350))
-                after_ai = _ptr_observe(current_page, ai_locator)
-                if _ptr_combobox_open_postcondition(before_ai, after_ai):
-                    _ptr_set_recovery_record(
-                        "ai_validated",
-                        "ai_locator_repair",
-                        "ai_locator_repair",
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
                         {
                             "strategy_name": strategy_name,
-                            "locator_strategy": _ptr_clone_json_value(ai_strategy),
-                        },
+                            "status": "postcondition_failed",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "error": _ptr_trim_debug_text(last_error, 320),
+                        }
                     )
-                    _ptr_store_experience_episode(
-                        action_type="click_combobox",
-                        label=label,
-                        page=current_page,
-                        locator=ai_locator,
-                        error=direct_exc,
-                        status="success",
-                        postcondition_kind="dialog_opened",
-                        postcondition_passed=True,
-                    )
-                    _ptr_finalize_last_ai_interaction(
-                        repair_outcome="validated",
-                        strategy_name=strategy_name,
-                        postcondition_kind="dialog_opened",
-                    )
-                    return
-                last_error = RuntimeError(f'AI strategy "{strategy_name}" did not open combobox "{label}".')
             except Exception as exc:
                 last_error = exc
-        if ai_candidates:
-            _ptr_finalize_last_ai_interaction(
-                repair_outcome="execution_failed",
-                strategy_name=last_ai_strategy_name,
-                error=last_error,
-                postcondition_kind="dialog_opened",
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "failed",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "error": _ptr_trim_debug_text(exc, 320),
+                        }
+                    )
+        if not debug_trace.get("experience_attempts"):
+            debug_trace["experience_attempts"] = [{"status": "no_candidates"}]
+        def _execute_ai_combobox_locator(strategy_name: str, ai_locator: Locator, ai_strategy: dict[str, Any]) -> bool:
+            before_ai = _ptr_observe(current_page, ai_locator)
+            _ptr_strict_click(ai_locator)
+            current_page.wait_for_timeout(_ptr_wait_ms("PTR_COMBOBOX_OPEN_WAIT_MS", 350))
+            after_ai = _ptr_observe(current_page, ai_locator)
+            return _ptr_combobox_open_postcondition(before_ai, after_ai)
+
+        ai_result, last_error = _ptr_execute_ai_repair_rounds(
+            current_page=current_page,
+            helper="click_combobox",
+            label=label,
+            last_error=last_error,
+            locator=locator,
+            postcondition_kind="dialog_opened",
+            failure_message=lambda strategy_name: f'AI strategy "{strategy_name}" did not open combobox "{label}".',
+            execute_locator=_execute_ai_combobox_locator,
+        )
+        if ai_result is not None:
+            strategy_name, ai_locator, ai_strategy = ai_result
+            debug_trace["ai_repair"] = {
+                "status": "validated",
+                "strategy_name": strategy_name,
+                "locator_strategy": _ptr_clone_json_value(ai_strategy),
+            }
+            debug_trace["resolved_by"] = "ai_locator_repair"
+            debug_trace["status"] = "success"
+            _ptr_set_debug_detail("click_combobox", debug_trace)
+            _ptr_set_recovery_record(
+                "ai_validated",
+                "ai_locator_repair",
+                "ai_locator_repair",
+                {
+                    "strategy_name": strategy_name,
+                    "locator_strategy": _ptr_clone_json_value(ai_strategy),
+                },
             )
+            _ptr_store_experience_episode(
+                action_type="click_combobox",
+                label=label,
+                page=current_page,
+                locator=ai_locator,
+                error=direct_exc,
+                status="success",
+                postcondition_kind="dialog_opened",
+                postcondition_passed=True,
+            )
+            return
+        debug_trace["ai_repair"] = {
+            "status": "failed",
+            "error": _ptr_trim_debug_text(last_error, 320),
+        }
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("click_combobox", debug_trace)
         raise RuntimeError(f'Unable to open combobox "{label}".') from last_error
 
 
@@ -4509,6 +6169,16 @@ def _ptr_click_table_row(locator: Locator, current_page: Page, label: str) -> No
 
 def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page: Page, label: str, option_name: str) -> None:
     _ptr_register_page(current_page)
+    debug_trace = _ptr_update_debug_detail(
+        "select_combobox_option",
+        {
+            "label": label,
+            "option_name": option_name,
+            "status": "open_trigger",
+            "option_attempts": [],
+            "experience_attempts": [],
+        },
+    )
     _ptr_click_combobox(trigger, current_page, label)
     last_error: Exception | None = None
     option_target = str(option_name or "").strip()
@@ -4531,10 +6201,34 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
                 option_name,
             )
             if candidate_error is None:
+                option_attempts = debug_trace.setdefault("option_attempts", [])
+                if isinstance(option_attempts, list):
+                    option_attempts.append({"strategy_name": strategy_name, "status": "validated"})
+                debug_trace["resolved_by"] = strategy_name
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("select_combobox_option", debug_trace)
                 return
             last_error = candidate_error
+            option_attempts = debug_trace.setdefault("option_attempts", [])
+            if isinstance(option_attempts, list):
+                option_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "postcondition_failed",
+                        "error": _ptr_trim_debug_text(candidate_error, 320),
+                    }
+                )
         except Exception as exc:
             last_error = exc
+            option_attempts = debug_trace.setdefault("option_attempts", [])
+            if isinstance(option_attempts, list):
+                option_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "failed",
+                        "error": _ptr_trim_debug_text(exc, 320),
+                    }
+                )
     if last_error is None:
         last_error = RuntimeError(f'Combobox "{label}" did not reflect option "{option_name}".')
 
@@ -4555,6 +6249,19 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
                 option_name,
             )
             if candidate_error is None:
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "validated",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                        }
+                    )
+                debug_trace["resolved_by"] = "experience_reuse"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("select_combobox_option", debug_trace)
                 _ptr_set_recovery_record(
                     "experience_reuse",
                     str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -4576,69 +6283,94 @@ def _ptr_select_combobox_option(trigger: Locator, option: Locator, current_page:
                     status="success",
                         postcondition_kind="option_selected",
                         postcondition_passed=True,
-                    )
+                )
                 return
             last_error = candidate_error
+            experience_attempts = debug_trace.setdefault("experience_attempts", [])
+            if isinstance(experience_attempts, list):
+                experience_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "postcondition_failed",
+                        "episode_id": str(episode.get("episode_id") or "").strip(),
+                        "retrieval_score": int(episode.get("retrieval_score") or 0),
+                        "error": _ptr_trim_debug_text(candidate_error, 320),
+                    }
+                )
         except Exception as exc:
             last_error = exc
+            experience_attempts = debug_trace.setdefault("experience_attempts", [])
+            if isinstance(experience_attempts, list):
+                experience_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "failed",
+                        "episode_id": str(episode.get("episode_id") or "").strip(),
+                        "retrieval_score": int(episode.get("retrieval_score") or 0),
+                        "error": _ptr_trim_debug_text(exc, 320),
+                    }
+                )
+    if not debug_trace.get("experience_attempts"):
+        debug_trace["experience_attempts"] = [{"status": "no_candidates"}]
 
-    ai_candidates = _ptr_ai_repair_locators(
-        current_page,
-        "select_combobox_option",
-        option_target,
-        last_error,
+    ai_result, last_error = _ptr_execute_ai_repair_rounds(
+        current_page=current_page,
+        helper="select_combobox_option",
+        label=option_target,
+        last_error=last_error,
         locator=option,
-    )
-    last_ai_strategy_name = ""
-    for strategy_name, ai_locator, ai_strategy in ai_candidates:
-        last_ai_strategy_name = strategy_name
-        try:
-            _ptr_record_strategy_attempt(strategy_name)
-            candidate_error = _ptr_try_apply_combobox_option_candidate(
+        postcondition_kind="option_selected",
+        failure_message=lambda strategy_name: f'AI strategy "{strategy_name}" did not apply combobox option "{option_name}".',
+        execute_locator=lambda strategy_name, ai_locator, ai_strategy: (
+            _ptr_try_apply_combobox_option_candidate(
                 trigger,
                 ai_locator,
                 current_page,
                 label,
                 option_name,
             )
-            if candidate_error is None:
-                _ptr_set_recovery_record(
-                    "ai_validated",
-                    "ai_locator_repair",
-                    "ai_locator_repair",
-                    {
-                        "trigger_label": label,
-                        "option_name": option_name,
-                        "strategy_name": strategy_name,
-                        "locator_strategy": _ptr_clone_json_value(ai_strategy),
-                    },
-                )
-                _ptr_store_experience_episode(
-                    action_type="select_combobox_option",
-                    label=option_target,
-                    page=current_page,
-                    locator=ai_locator,
-                    error=last_error,
-                    status="success",
-                    postcondition_kind="option_selected",
-                    postcondition_passed=True,
-                )
-                _ptr_finalize_last_ai_interaction(
-                    repair_outcome="validated",
-                    strategy_name=strategy_name,
-                    postcondition_kind="option_selected",
-                )
-                return
-            last_error = candidate_error
-        except Exception as exc:
-            last_error = exc
-    if ai_candidates:
-        _ptr_finalize_last_ai_interaction(
-            repair_outcome="execution_failed",
-            strategy_name=last_ai_strategy_name,
-            error=last_error,
-            postcondition_kind="option_selected",
+            is None
+        ),
+    )
+    if ai_result is not None:
+        strategy_name, ai_locator, ai_strategy = ai_result
+        debug_trace["ai_repair"] = {
+            "status": "validated",
+            "strategy_name": strategy_name,
+            "locator_strategy": _ptr_clone_json_value(ai_strategy),
+        }
+        debug_trace["resolved_by"] = "ai_locator_repair"
+        debug_trace["status"] = "success"
+        _ptr_set_debug_detail("select_combobox_option", debug_trace)
+        _ptr_set_recovery_record(
+            "ai_validated",
+            "ai_locator_repair",
+            "ai_locator_repair",
+            {
+                "trigger_label": label,
+                "option_name": option_name,
+                "strategy_name": strategy_name,
+                "locator_strategy": _ptr_clone_json_value(ai_strategy),
+            },
         )
+        _ptr_store_experience_episode(
+            action_type="select_combobox_option",
+            label=option_target,
+            page=current_page,
+            locator=ai_locator,
+            error=last_error,
+            status="success",
+            postcondition_kind="option_selected",
+            postcondition_passed=True,
+        )
+        return
+    debug_trace["ai_repair"] = {
+        "status": "failed",
+        "error": _ptr_trim_debug_text(last_error, 320),
+    }
+    debug_trace["status"] = "failed"
+    debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+    _ptr_set_debug_detail("select_combobox_option", debug_trace)
     raise RuntimeError(f'Unable to select combobox option "{option_name}" for "{label}".') from last_error
 
 
@@ -4730,7 +6462,7 @@ def _ptr_wait_for_oracle_searchselect_query(
     *,
     timeout_ms: int | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    timeout = timeout_ms or _ptr_wait_ms("PTR_SEARCH_QUERY_REFLECT_TIMEOUT_MS", 1500)
+    timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_SEARCH_QUERY_REFLECT_TIMEOUT_MS", 1500)
     deadline = time.time() + max(timeout, 0) / 1000.0
     last_state: dict[str, Any] = {}
 
@@ -4755,8 +6487,20 @@ def _ptr_select_search_trigger_option(
     option_kind: str = "text",
     option_exact: bool | None = None,
     fill_value: str | None = None,
+    allow_repair: bool = True,
 ) -> None:
     _ptr_register_page(current_page)
+    debug_trace = _ptr_update_debug_detail(
+        "select_search_trigger_option",
+        {
+            "title": title,
+            "option_name": option_name,
+            "fill_value": _ptr_trim_debug_text(fill_value, 120),
+            "status": "open_or_search",
+            "option_attempts": [],
+            "experience_attempts": [],
+        },
+    )
     search_timeout_ms = _ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000)
     raw_option_timeout_ms = _ptr_wait_ms("PTR_SEARCH_RESULT_TIMEOUT_MS", 6000)
     option_already_visible = False
@@ -4795,18 +6539,54 @@ def _ptr_select_search_trigger_option(
             if not query_reflected:
                 option_already_visible = _ptr_locator_visible(option, timeout_ms=raw_option_timeout_ms)
             if not query_reflected and not option_already_visible:
+                debug_trace["oracle_search_state"] = {
+                    "open": bool(oracle_search_state.get("open")),
+                    "no_matches": bool(oracle_search_state.get("no_matches")),
+                    "filter_value": _ptr_trim_debug_text(oracle_search_state.get("filter_value"), 160),
+                    "live_text": _ptr_trim_debug_text(oracle_search_state.get("live_text"), 160),
+                    "query_reflected": False,
+                    "option_already_visible": False,
+                }
+                debug_trace["status"] = "failed"
                 visible_query = (
                     str(oracle_search_state.get("filter_value") or "").strip() or "unknown"
                 )
+                debug_trace["final_error"] = _ptr_trim_debug_text(
+                    f'Oracle search-select "{title}" did not reflect requested query "{fill_value}". Visible query: "{visible_query}"',
+                    320,
+                )
+                _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
                 raise RuntimeError(
                     f'Oracle search-select "{title}" did not reflect requested query "{fill_value}". '
                     f'Visible query: "{visible_query}"'
                 )
+        debug_trace["oracle_search_state"] = {
+            "open": bool(oracle_search_state.get("open")),
+            "no_matches": bool(oracle_search_state.get("no_matches")),
+            "filter_value": _ptr_trim_debug_text(oracle_search_state.get("filter_value"), 160),
+            "live_text": _ptr_trim_debug_text(oracle_search_state.get("live_text"), 160),
+            "query_reflected": bool(query_reflected),
+            "option_already_visible": bool(option_already_visible),
+        }
     if bool(oracle_search_state.get("no_matches")) and not option_already_visible:
         option_already_visible = _ptr_locator_visible(option, timeout_ms=min(raw_option_timeout_ms, 750))
     if bool(oracle_search_state.get("no_matches")) and not option_already_visible:
         query_text = str(oracle_search_state.get("filter_value") or fill_value or option_name or "").strip()
         visible_state = str(oracle_search_state.get("live_text") or "No matches found").strip() or "No matches found"
+        debug_trace["oracle_search_state"] = {
+            "open": bool(oracle_search_state.get("open")),
+            "no_matches": True,
+            "filter_value": _ptr_trim_debug_text(query_text, 160),
+            "live_text": _ptr_trim_debug_text(visible_state, 160),
+            "query_reflected": debug_trace.get("oracle_search_state", {}).get("query_reflected"),
+            "option_already_visible": bool(option_already_visible),
+        }
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(
+            f'Oracle search-select "{title}" returned no matches for query "{query_text}" while looking for option "{option_name}". Visible state: {visible_state}',
+            320,
+        )
+        _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
         raise RuntimeError(
             f'Oracle search-select "{title}" returned no matches for query "{query_text}" '
             f'while looking for option "{option_name}". Visible state: {visible_state}'
@@ -4840,12 +6620,48 @@ def _ptr_select_search_trigger_option(
                     env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
                     default_ms=5000,
                 )
+                option_attempts = debug_trace.setdefault("option_attempts", [])
+                if isinstance(option_attempts, list):
+                    option_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "validated",
+                            "after": _ptr_debug_observation_summary(after),
+                        }
+                    )
+                debug_trace["resolved_by"] = strategy_name
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
                 return
             last_error = RuntimeError(f'Search trigger "{title}" did not apply option "{option_name}".')
+            option_attempts = debug_trace.setdefault("option_attempts", [])
+            if isinstance(option_attempts, list):
+                option_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "postcondition_failed",
+                        "error": _ptr_trim_debug_text(last_error, 320),
+                    }
+                )
         except Exception as exc:
             last_error = exc
+            option_attempts = debug_trace.setdefault("option_attempts", [])
+            if isinstance(option_attempts, list):
+                option_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "failed",
+                        "error": _ptr_trim_debug_text(exc, 320),
+                    }
+                )
     if last_error is None:
         last_error = RuntimeError(f'Search trigger "{title}" did not apply option "{option_name}".')
+
+    if not allow_repair:
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
+        raise RuntimeError(f'Unable to apply search option "{option_name}" for "{title}".') from last_error
 
     for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(
         current_page,
@@ -4866,6 +6682,20 @@ def _ptr_select_search_trigger_option(
                     env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
                     default_ms=5000,
                 )
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "validated",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "after": _ptr_debug_observation_summary(after_experience),
+                        }
+                    )
+                debug_trace["resolved_by"] = "experience_reuse"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
                 _ptr_set_recovery_record(
                     "experience_reuse",
                     str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -4890,69 +6720,112 @@ def _ptr_select_search_trigger_option(
                 )
                 return
             last_error = RuntimeError(f'Experience strategy "{strategy_name}" did not apply search option "{option_name}".')
-        except Exception as exc:
-            last_error = exc
-
-    ai_candidates = _ptr_ai_repair_locators(
-        current_page,
-        "select_search_trigger_option",
-        option_target,
-        last_error,
-        locator=option,
-    )
-    last_ai_strategy_name = ""
-    for strategy_name, ai_locator, ai_strategy in ai_candidates:
-        last_ai_strategy_name = strategy_name
-        try:
-            _ptr_record_strategy_attempt(strategy_name)
-            before_ai = _ptr_observe(current_page, ai_locator)
-            _ptr_strict_click(ai_locator)
-            current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
-            after_ai = _ptr_observe(current_page, ai_locator)
-            if _ptr_option_selection_postcondition(before_ai, after_ai, trigger, ai_locator, option_name):
-                _ptr_wait_for_field_processing(
-                    current_page,
-                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
-                    default_ms=5000,
-                )
-                _ptr_set_recovery_record(
-                    "ai_validated",
-                    "ai_locator_repair",
-                    "ai_locator_repair",
+            experience_attempts = debug_trace.setdefault("experience_attempts", [])
+            if isinstance(experience_attempts, list):
+                experience_attempts.append(
                     {
-                        "trigger_label": title,
-                        "option_name": option_name,
                         "strategy_name": strategy_name,
-                        "locator_strategy": _ptr_clone_json_value(ai_strategy),
-                    },
+                        "status": "postcondition_failed",
+                        "episode_id": str(episode.get("episode_id") or "").strip(),
+                        "retrieval_score": int(episode.get("retrieval_score") or 0),
+                        "error": _ptr_trim_debug_text(last_error, 320),
+                    }
                 )
-                _ptr_store_experience_episode(
-                    action_type="select_search_trigger_option",
-                    label=option_target,
-                    page=current_page,
-                    locator=ai_locator,
-                    error=last_error,
-                    status="success",
-                    postcondition_kind="option_selected",
-                    postcondition_passed=True,
-                )
-                _ptr_finalize_last_ai_interaction(
-                    repair_outcome="validated",
-                    strategy_name=strategy_name,
-                    postcondition_kind="option_selected",
-                )
-                return
-            last_error = RuntimeError(f'AI strategy "{strategy_name}" did not apply search option "{option_name}".')
         except Exception as exc:
             last_error = exc
-    if ai_candidates:
-        _ptr_finalize_last_ai_interaction(
-            repair_outcome="execution_failed",
-            strategy_name=last_ai_strategy_name,
-            error=last_error,
-            postcondition_kind="option_selected",
+            experience_attempts = debug_trace.setdefault("experience_attempts", [])
+            if isinstance(experience_attempts, list):
+                experience_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "failed",
+                        "episode_id": str(episode.get("episode_id") or "").strip(),
+                        "retrieval_score": int(episode.get("retrieval_score") or 0),
+                        "error": _ptr_trim_debug_text(exc, 320),
+                    }
+                )
+    if not debug_trace.get("experience_attempts"):
+        debug_trace["experience_attempts"] = [{"status": "no_candidates"}]
+
+    def _execute_ai_search_option_locator(strategy_name: str, ai_locator: Locator, ai_strategy: dict[str, Any]) -> bool:
+        before_ai = _ptr_observe(current_page, ai_locator)
+        _ptr_strict_click(ai_locator)
+        current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+        after_ai = _ptr_observe(current_page, ai_locator)
+        if not _ptr_option_selection_postcondition(before_ai, after_ai, trigger, ai_locator, option_name):
+            return False
+        _ptr_wait_for_field_processing(
+            current_page,
+            env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+            default_ms=5000,
         )
+        return True
+
+    ai_result, last_error = _ptr_execute_ai_repair_rounds(
+        current_page=current_page,
+        helper="select_search_trigger_option",
+        label=option_target,
+        last_error=last_error,
+        locator=option,
+        postcondition_kind="option_selected",
+        failure_message=lambda strategy_name: f'AI strategy "{strategy_name}" did not apply search option "{option_name}".',
+        execute_locator=_execute_ai_search_option_locator,
+    )
+    if ai_result is not None:
+        strategy_name, ai_locator, ai_strategy = ai_result
+        debug_trace["ai_repair"] = {
+            "status": "validated",
+            "strategy_name": strategy_name,
+            "locator_strategy": _ptr_clone_json_value(ai_strategy),
+        }
+        debug_trace["resolved_by"] = "ai_locator_repair"
+        debug_trace["status"] = "success"
+        _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
+        _ptr_set_recovery_record(
+            "ai_validated",
+            "ai_locator_repair",
+            "ai_locator_repair",
+            {
+                "trigger_label": title,
+                "option_name": option_name,
+                "strategy_name": strategy_name,
+                "locator_strategy": _ptr_clone_json_value(ai_strategy),
+            },
+        )
+        _ptr_store_experience_episode(
+            action_type="select_search_trigger_option",
+            label=option_target,
+            page=current_page,
+            locator=ai_locator,
+            error=last_error,
+            status="success",
+            postcondition_kind="option_selected",
+            postcondition_passed=True,
+        )
+        return
+    debug_trace["ai_repair"] = {
+        "status": "failed",
+        "error": _ptr_trim_debug_text(last_error, 320),
+    }
+    debug_trace["status"] = "failed"
+    debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+    _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
     raise RuntimeError(f'Unable to apply search option "{option_name}" for "{title}".') from last_error
+
+
+def _ptr_reopen_menu_if_options_hidden(
+    trigger: Locator,
+    current_page: Page,
+    candidate: Locator,
+) -> None:
+    probe_ms = _ptr_wait_ms("PTR_MENU_REOPEN_PROBE_MS", 300)
+    if _ptr_locator_is_actionable(candidate, timeout_ms=probe_ms):
+        return
+    try:
+        _ptr_strict_click(trigger)
+        current_page.wait_for_timeout(_ptr_wait_ms("PTR_MENU_OPEN_WAIT_MS", 350))
+    except Exception:
+        pass
 
 
 def _ptr_select_adf_menu_panel_option(
@@ -4965,17 +6838,65 @@ def _ptr_select_adf_menu_panel_option(
     trigger_kind: str = "title",
 ) -> None:
     _ptr_register_page(current_page)
+    debug_trace = _ptr_update_debug_detail(
+        "select_adf_menu_panel_option",
+        {
+            "trigger_label": trigger_label,
+            "option_name": option_name,
+            "status": "open_menu",
+            "option_attempts": [],
+            "experience_attempts": [],
+        },
+    )
     _ptr_strict_click(trigger)
     current_page.wait_for_timeout(_ptr_wait_ms("PTR_MENU_OPEN_WAIT_MS", 350))
+    is_completion = _ptr_oracle_menu_option_is_completion_action(trigger_label)
     option_candidates = _ptr_menu_panel_option_candidates(current_page, option, option_name)
+    if is_completion:
+        option_candidates = option_candidates[:2]
     if not _ptr_wait_for_oracle_menu_trigger_option_visibility(current_page, option_candidates, trigger_label):
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(
+            _ptr_menu_trigger_failure_message(trigger_label, option_name),
+            320,
+        )
+        _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
         raise RuntimeError(_ptr_menu_trigger_failure_message(trigger_label, option_name))
     last_error: Exception | None = None
     semantic_failure_after_click = False
     option_target = str(option_name or "").strip()
-    for strategy_name, candidate in option_candidates:
+    option_probe_ms = _ptr_wait_ms("PTR_MENU_OPTION_PROBE_MS", 1000)
+    for index, (strategy_name, candidate) in enumerate(option_candidates):
         try:
             _ptr_record_strategy_attempt(strategy_name)
+            if is_completion:
+                _ptr_reopen_menu_if_options_hidden(trigger, current_page, candidate)
+                if not _ptr_locator_is_actionable(
+                    candidate,
+                    timeout_ms=option_probe_ms,
+                ):
+                    option_attempts = debug_trace.setdefault("option_attempts", [])
+                    if isinstance(option_attempts, list):
+                        option_attempts.append(
+                            {
+                                "strategy_name": strategy_name,
+                                "status": "not_actionable",
+                            }
+                        )
+                    continue
+            else:
+                if index > 0:
+                    _ptr_reopen_menu_if_options_hidden(trigger, current_page, candidate)
+                if not _ptr_locator_is_actionable(candidate, timeout_ms=option_probe_ms):
+                    option_attempts = debug_trace.setdefault("option_attempts", [])
+                    if isinstance(option_attempts, list):
+                        option_attempts.append(
+                            {
+                                "strategy_name": strategy_name,
+                                "status": "not_actionable",
+                            }
+                        )
+                    continue
             before = _ptr_observe(current_page, candidate)
             _ptr_strict_click(candidate)
             current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
@@ -4994,16 +6915,54 @@ def _ptr_select_adf_menu_panel_option(
                     env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
                     default_ms=5000,
                 )
+                option_attempts = debug_trace.setdefault("option_attempts", [])
+                if isinstance(option_attempts, list):
+                    option_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "validated",
+                            "after": _ptr_debug_observation_summary(after),
+                        }
+                    )
+                debug_trace["resolved_by"] = strategy_name
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
                 return
             last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
-            if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
+            option_attempts = debug_trace.setdefault("option_attempts", [])
+            if isinstance(option_attempts, list):
+                option_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "postcondition_failed",
+                        "error": _ptr_trim_debug_text(last_error, 320),
+                    }
+                )
+            if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name) and not is_completion:
                 semantic_failure_after_click = True
                 break
         except Exception as exc:
             last_error = exc
+            option_attempts = debug_trace.setdefault("option_attempts", [])
+            if isinstance(option_attempts, list):
+                option_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "failed",
+                        "error": _ptr_trim_debug_text(exc, 320),
+                    }
+                )
     if last_error is None:
         last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
     if semantic_failure_after_click:
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
+        raise last_error
+    if is_completion:
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
         raise last_error
 
     for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(
@@ -5033,6 +6992,20 @@ def _ptr_select_adf_menu_panel_option(
                     env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
                     default_ms=5000,
                 )
+                experience_attempts = debug_trace.setdefault("experience_attempts", [])
+                if isinstance(experience_attempts, list):
+                    experience_attempts.append(
+                        {
+                            "strategy_name": strategy_name,
+                            "status": "validated",
+                            "episode_id": str(episode.get("episode_id") or "").strip(),
+                            "retrieval_score": int(episode.get("retrieval_score") or 0),
+                            "after": _ptr_debug_observation_summary(after_experience),
+                        }
+                    )
+                debug_trace["resolved_by"] = "experience_reuse"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
                 _ptr_set_recovery_record(
                     "experience_reuse",
                     str(((episode.get("recovery") or {}).get("kind") or "")).strip() or "experience_reuse",
@@ -5057,86 +7030,120 @@ def _ptr_select_adf_menu_panel_option(
                 )
                 return
             last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
-            if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
-                semantic_failure_after_click = True
-                break
-        except Exception as exc:
-            last_error = exc
-    if semantic_failure_after_click:
-        raise last_error
-
-    ai_candidates = _ptr_ai_repair_locators(
-        current_page,
-        "select_adf_menu_panel_option",
-        option_target,
-        last_error,
-        locator=option,
-    )
-    last_ai_strategy_name = ""
-    for strategy_name, ai_locator, ai_strategy in ai_candidates:
-        last_ai_strategy_name = strategy_name
-        try:
-            _ptr_record_strategy_attempt(strategy_name)
-            before_ai = _ptr_observe(current_page, ai_locator)
-            _ptr_strict_click(ai_locator)
-            current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
-            after_ai = _ptr_observe(current_page, ai_locator)
-            if _ptr_option_selection_postcondition(
-                before_ai,
-                after_ai,
-                trigger,
-                ai_locator,
-                option_name,
-                page=current_page,
-                trigger_label=trigger_label,
-            ):
-                _ptr_wait_for_field_processing(
-                    current_page,
-                    env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
-                    default_ms=5000,
-                )
-                _ptr_set_recovery_record(
-                    "ai_validated",
-                    "ai_locator_repair",
-                    "ai_locator_repair",
+            experience_attempts = debug_trace.setdefault("experience_attempts", [])
+            if isinstance(experience_attempts, list):
+                experience_attempts.append(
                     {
-                        "trigger_label": trigger_label,
-                        "option_name": option_name,
                         "strategy_name": strategy_name,
-                        "locator_strategy": _ptr_clone_json_value(ai_strategy),
-                    },
+                        "status": "postcondition_failed",
+                        "episode_id": str(episode.get("episode_id") or "").strip(),
+                        "retrieval_score": int(episode.get("retrieval_score") or 0),
+                        "error": _ptr_trim_debug_text(last_error, 320),
+                    }
                 )
-                _ptr_store_experience_episode(
-                    action_type="select_adf_menu_panel_option",
-                    label=option_target,
-                    page=current_page,
-                    locator=ai_locator,
-                    error=last_error,
-                    status="success",
-                    postcondition_kind="option_selected",
-                    postcondition_passed=True,
-                )
-                _ptr_finalize_last_ai_interaction(
-                    repair_outcome="validated",
-                    strategy_name=strategy_name,
-                    postcondition_kind="option_selected",
-                )
-                return
-            last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
             if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
                 semantic_failure_after_click = True
                 break
         except Exception as exc:
             last_error = exc
+            experience_attempts = debug_trace.setdefault("experience_attempts", [])
+            if isinstance(experience_attempts, list):
+                experience_attempts.append(
+                    {
+                        "strategy_name": strategy_name,
+                        "status": "failed",
+                        "episode_id": str(episode.get("episode_id") or "").strip(),
+                        "retrieval_score": int(episode.get("retrieval_score") or 0),
+                        "error": _ptr_trim_debug_text(exc, 320),
+                    }
+                )
     if semantic_failure_after_click:
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
         raise last_error
-    if ai_candidates:
-        _ptr_finalize_last_ai_interaction(
-            repair_outcome="execution_failed",
-            strategy_name=last_ai_strategy_name,
-            error=last_error,
-            postcondition_kind="option_selected",
+    if not debug_trace.get("experience_attempts"):
+        debug_trace["experience_attempts"] = [{"status": "no_candidates"}]
+
+    def _execute_ai_menu_locator(strategy_name: str, ai_locator: Locator, ai_strategy: dict[str, Any]) -> bool:
+        nonlocal semantic_failure_after_click
+        before_ai = _ptr_observe(current_page, ai_locator)
+        _ptr_strict_click(ai_locator)
+        current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+        after_ai = _ptr_observe(current_page, ai_locator)
+        if _ptr_option_selection_postcondition(
+            before_ai,
+            after_ai,
+            trigger,
+            ai_locator,
+            option_name,
+            page=current_page,
+            trigger_label=trigger_label,
+        ):
+            _ptr_wait_for_field_processing(
+                current_page,
+                env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+                default_ms=5000,
+            )
+            return True
+        if _ptr_oracle_menu_option_requires_semantic_validation(trigger_label, option_name):
+            semantic_failure_after_click = True
+        return False
+
+    ai_result, last_error = _ptr_execute_ai_repair_rounds(
+        current_page=current_page,
+        helper="select_adf_menu_panel_option",
+        label=option_target,
+        last_error=last_error,
+        locator=option,
+        postcondition_kind="option_selected",
+        failure_message=lambda strategy_name: _ptr_menu_option_failure_message(trigger_label, option_name),
+        execute_locator=_execute_ai_menu_locator,
+    )
+    if semantic_failure_after_click:
+        debug_trace["status"] = "failed"
+        debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+        _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
+        raise last_error
+    if ai_result is not None:
+        strategy_name, ai_locator, ai_strategy = ai_result
+        debug_trace["ai_repair"] = {
+            "status": "validated",
+            "strategy_name": strategy_name,
+            "locator_strategy": _ptr_clone_json_value(ai_strategy),
+        }
+        debug_trace["resolved_by"] = "ai_locator_repair"
+        debug_trace["status"] = "success"
+        _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
+        _ptr_set_recovery_record(
+            "ai_validated",
+            "ai_locator_repair",
+            "ai_locator_repair",
+            {
+                "trigger_label": trigger_label,
+                "option_name": option_name,
+                "strategy_name": strategy_name,
+                "locator_strategy": _ptr_clone_json_value(ai_strategy),
+            },
         )
+        _ptr_store_experience_episode(
+            action_type="select_adf_menu_panel_option",
+            label=option_target,
+            page=current_page,
+            locator=ai_locator,
+            error=last_error,
+            status="success",
+            postcondition_kind="option_selected",
+            postcondition_passed=True,
+        )
+        return
+    debug_trace["ai_repair"] = {
+        "status": "failed",
+        "error": _ptr_trim_debug_text(last_error, 320),
+    }
+    debug_trace["status"] = "failed"
+    debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)
+    _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
     raise RuntimeError(f'Unable to apply menu option "{option_name}" for "{trigger_label}".') from last_error
 
 
