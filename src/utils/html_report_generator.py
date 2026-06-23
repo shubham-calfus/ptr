@@ -241,6 +241,8 @@ def _execution_mode_label(mode: Any) -> str:
         return "AST Prepared"
     if raw == "raw_script_fallback":
         return "Raw Script Fallback"
+    if raw == "script_step":
+        return "Script Step"
     return ""
 
 
@@ -898,6 +900,8 @@ def _executed_script_block(result: dict[str, Any]) -> str:
     subtitle = "Final prepared Python script for this run."
     if execution_mode == "raw_script_fallback":
         subtitle = "Substituted raw recording executed after AST coverage fallback."
+    elif execution_mode == "script_step":
+        subtitle = "Plain Python script step executed with runner parameter context."
     return (
         '<details class="recording-script-block executed-script-details">'
         '<summary class="executed-script-summary">'
@@ -963,7 +967,8 @@ def _flow_context_request_payload_json(interaction: dict[str, Any]) -> str:
 def _flow_context_block(result: dict[str, Any]) -> str:
     input_status = result.get("flow_input_status") or {}
     output_results = result.get("flow_output_results") or []
-    if not input_status and not output_results:
+    extracted_outputs = result.get("extracted_outputs") or {}
+    if not input_status and not output_results and not extracted_outputs:
         return ""
 
     input_rows = ""
@@ -984,7 +989,11 @@ def _flow_context_block(result: dict[str, Any]) -> str:
         )
 
     output_cards: list[str] = []
+    rendered_output_names: set[str] = set()
     for item in output_results:
+        output_name = str(item.get("name") or "").strip()
+        if output_name:
+            rendered_output_names.add(output_name)
         attempts = item.get("attempts") or []
         attempt_html = ""
         if attempts:
@@ -1050,6 +1059,21 @@ def _flow_context_block(result: dict[str, Any]) -> str:
             "</div>"
         )
 
+    for name, value in extracted_outputs.items():
+        output_name = str(name or "").strip()
+        if not output_name or output_name in rendered_output_names:
+            continue
+        output_cards.append(
+            '<div class="ctx-output-card">'
+            '<div class="ctx-output-top">'
+            f'<span class="ctx-name">{escape(output_name)}</span>'
+            '<span class="ctx-state ok">extracted</span>'
+            "</div>"
+            f'<div class="ctx-output-value">{escape(str(value))}</div>'
+            '<div class="ctx-output-source">script step</div>'
+            "</div>"
+        )
+
     output_section = ""
     if output_cards:
         output_section = (
@@ -1063,7 +1087,7 @@ def _flow_context_block(result: dict[str, Any]) -> str:
         '<div class="recording-params-block">'
         '<div class="trace-head">'
         '<div class="trace-title">Flow Context</div>'
-        '<div class="trace-subtitle">Workbook-defined parent inputs and extracted outputs for this recording run.</div>'
+        '<div class="trace-subtitle">Resolved parent inputs and extracted outputs for this recording run.</div>'
         "</div>"
         f"{input_rows}{output_section}"
         "</div>"

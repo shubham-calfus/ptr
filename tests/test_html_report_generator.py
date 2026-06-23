@@ -259,7 +259,7 @@ def test_generate_html_report_content_renders_flow_context_inputs_outputs_and_ai
     )
 
     assert "Flow Context" in html
-    assert "Workbook-defined parent inputs and extracted outputs for this recording run." in html
+    assert "Resolved parent inputs and extracted outputs for this recording run." in html
     assert "Inputs" in html
     assert "Extracted Outputs" in html
     assert "Search Value" in html
@@ -267,6 +267,28 @@ def test_generate_html_report_content_renders_flow_context_inputs_outputs_and_ai
     assert "Found requisition number in confirmation text" in html
     assert "Request Sent to AI" in html
     assert "Model Output" in html
+
+
+def test_generate_html_report_content_renders_script_step_extracted_outputs() -> None:
+    html = generate_html_report_content(
+        test_suite_id="PO_Script_Output",
+        parent_run_id="run-script-output",
+        results=[
+            _result(
+                recording_name="create_po",
+                status="passed",
+                duration_seconds=3,
+                execution_mode="script_step",
+                extracted_outputs={"order_number": "PO-1009"},
+            )
+        ],
+    )
+
+    assert "Flow Context" in html
+    assert "Extracted Outputs" in html
+    assert "order_number" in html
+    assert "PO-1009" in html
+    assert "script step" in html
 
 
 def test_generate_html_report_content_renders_combined_ai_request_and_model_output() -> None:
@@ -626,6 +648,38 @@ def test_generate_html_report_content_marks_raw_script_fallback_runs(monkeypatch
     assert "Raw Script Fallback" in html
     assert "Preparation Fallback" in html
     assert "Substituted raw recording executed after AST coverage fallback." in html
+
+    report_generator._load_text_object.cache_clear()
+
+
+def test_generate_html_report_content_marks_script_step_runs(monkeypatch) -> None:
+    script_key = "playwright-test-results/demo-suite/run-script-step/demo-recording/executed_script.py"
+
+    def _fake_load_bytes(object_key: str | None) -> bytes | None:
+        if object_key == script_key:
+            return b"extract_name = 'order_number'\nextract_value = 'PO-1009'\n"
+        return None
+
+    monkeypatch.setattr(report_generator, "_load_bytes", _fake_load_bytes)
+    report_generator._load_text_object.cache_clear()
+
+    html = generate_html_report_content(
+        test_suite_id="PO_Script_Step",
+        parent_run_id="run-script-step",
+        results=[
+            _result(
+                recording_name="create_po",
+                status="passed",
+                duration_seconds=3,
+                executed_script_s3_key=script_key,
+                execution_mode="script_step",
+            )
+        ],
+    )
+
+    assert "Execution Mode" in html
+    assert "Script Step" in html
+    assert "Plain Python script step executed with runner parameter context." in html
 
     report_generator._load_text_object.cache_clear()
 

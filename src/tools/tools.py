@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
@@ -63,6 +64,26 @@ _FLOW_CONTEXT_SHEET_ALIASES = {
     "outputinput",
 }
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+_OBVIOUS_JS_RECORDING_MARKERS = (
+    "import {",
+    "from '@playwright/test'",
+    'from "@playwright/test"',
+    "test(",
+    "test.describe(",
+    "=>",
+    "const ",
+    "let ",
+    "await page.goto(",
+)
+_PLAYWRIGHT_PYTHON_MARKERS = (
+    "from playwright.async_api import",
+    "from playwright.sync_api import",
+    "async_playwright",
+    "sync_playwright",
+    "def run(",
+    "def main(",
+    "async def main(",
+)
 _RUNNER_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _RUNNER_CONFIG_PATH = _RUNNER_PROJECT_ROOT / "configs.txt"
 _RUNNER_DATA_DIR = _RUNNER_PROJECT_ROOT / ".runner_data"
@@ -468,6 +489,44 @@ def _extract_table_parameter_sets(rows: list[tuple[Any, ...]]) -> list[dict[str,
         )
         if parameter_sets:
             return parameter_sets
+
+    def _looks_like_parameter_header_cell(value: str) -> bool:
+        raw = str(value or "").strip()
+        if not raw:
+            return False
+        normalized = _normalize_param_name(raw)
+        if not normalized:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_ ]*", raw))
+
+    if len(normalized_rows) >= 2:
+        source_row_index, second_row = normalized_rows[1]
+        first_non_empty = [cell for cell in first_row if cell]
+        second_non_empty = [cell for cell in second_row if cell]
+        if (
+            len(first_non_empty) == 2
+            and len(first_non_empty) == len(second_non_empty)
+            and all(_looks_like_parameter_header_cell(cell) for cell in first_non_empty)
+            and not all(_looks_like_parameter_header_cell(cell) for cell in second_non_empty)
+        ):
+            horizontal_params: dict[str, str] = {}
+            for idx, header in enumerate(first_row):
+                if not header or idx >= len(second_row):
+                    continue
+                value = second_row[idx]
+                if not value:
+                    continue
+                normalized_header = _normalize_param_name(header)
+                if normalized_header.startswith("click_"):
+                    continue
+                horizontal_params[normalized_header] = value
+            if horizontal_params:
+                return [
+                    {
+                        "row_index": source_row_index,
+                        "values": horizontal_params,
+                    }
+                ]
 
     if len(normalized_rows) >= 2 and sum(1 for cell in first_row if cell) > 2:
         parameter_sets: list[dict[str, Any]] = []
@@ -1980,37 +2039,24 @@ def _call_openai_failure_summary(
         }
 
 
-def _validate_python_playwright_script(script_text: str) -> None:
+def _classify_recording_script(script_text: str) -> str:
     trimmed = script_text.lstrip()
 
-    obvious_js_markers = [
-        "import {",
-        "from '@playwright/test'",
-        'from "@playwright/test"',
-        "test(",
-        "test.describe(",
-        "=>",
-        "const ",
-        "let ",
-        "await page.goto(",
-    ]
-    if any(marker in trimmed for marker in obvious_js_markers):
+    if any(marker in trimmed for marker in _OBVIOUS_JS_RECORDING_MARKERS):
         raise ValueError(
             "Recording is not a Python Playwright script. "
             "test_runner currently supports Python recordings only."
         )
 
-    python_markers = [
-        "from playwright.async_api import",
-        "from playwright.sync_api import",
-        "async_playwright",
-        "sync_playwright",
-        "def run(",
-        "def main(",
-        "async def main(",
-    ]
-    if not any(marker in trimmed for marker in python_markers):
-        raise ValueError("Recording does not look like a supported Python Playwright script.")
+    if any(marker in trimmed for marker in _PLAYWRIGHT_PYTHON_MARKERS):
+        return "python_playwright"
+
+    try:
+        ast.parse(script_text)
+    except SyntaxError as exc:
+        raise ValueError("Recording does not look like a supported Python script.") from exc
+
+    return "plain_python"
 
 
 def _insert_after_future_imports(script_text: str, helper: str) -> str:
@@ -2037,14 +2083,38 @@ class UnsupportedActionCoverageError(RuntimeError):
     """Raised when AST preparation cannot cover a recording safely."""
 
 
-def _normalize_script_for_execution_input(
+def _substitute_execution_parameters(
     script_text: str,
     parameters: dict[str, Any] | None = None,
 ) -> str:
-    _validate_python_playwright_script(script_text)
     if parameters:
         script_text = _substitute_parameters(script_text, parameters)
     return script_text
+
+
+def _read_script_step_output(output_path: Path) -> tuple[dict[str, str], list[str]]:
+    """Read the outputs a script step recorded via api_helpers.extract()."""
+    if not output_path.exists():
+        return {}, []
+
+    try:
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {}, [f"script_step: failed to read extract output: {exc}"]
+
+    raw_outputs = payload.get("outputs") if isinstance(payload, dict) else None
+    if not isinstance(raw_outputs, dict):
+        return {}, ["script_step: extract output must be a JSON object with an 'outputs' map"]
+
+    extracted: dict[str, str] = {}
+    errors: list[str] = []
+    for raw_name, raw_value in raw_outputs.items():
+        name = str(raw_name or "").strip()
+        if not name:
+            errors.append("script_step: output name must be a non-empty string")
+            continue
+        extracted[name] = str(raw_value)
+    return extracted, errors
 
 
 def _prepare_normalized_script_for_execution(script_text: str) -> str:
@@ -2097,7 +2167,10 @@ def _resolve_executable_script(
     parameters: dict[str, Any] | None = None,
 ) -> tuple[str, str, str | None]:
     """Return the script that should execute plus the chosen execution mode."""
-    normalized_script = _normalize_script_for_execution_input(script_text, parameters)
+    script_kind = _classify_recording_script(script_text)
+    if script_kind == "plain_python":
+        return script_text, "script_step", None
+    normalized_script = _substitute_execution_parameters(script_text, parameters)
     try:
         return _prepare_normalized_script_for_execution(normalized_script), "ast_prepared", None
     except UnsupportedActionCoverageError as exc:
@@ -2117,7 +2190,10 @@ def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] |
     Statement-level prep gaps still fail fast with an explicit error so we do
     not silently revive the old fallback-heavy runtime.
     """
-    normalized_script = _normalize_script_for_execution_input(script_text, parameters)
+    script_kind = _classify_recording_script(script_text)
+    if script_kind != "python_playwright":
+        raise ValueError("Only Python Playwright recordings can be prepared via the AST runner.")
+    normalized_script = _substitute_execution_parameters(script_text, parameters)
     return _prepare_normalized_script_for_execution(normalized_script)
 
 
@@ -2308,15 +2384,20 @@ async def execute_recording_script(
     try:
         raw_script_bytes = await asyncio.to_thread(_load_script_bytes, file_key)
         logger.info("Downloaded recording script for %s (%s bytes)", file_key, len(raw_script_bytes))
+        raw_script_text = raw_script_bytes.decode("utf-8")
+        script_kind = _classify_recording_script(raw_script_text)
 
-        # Auto-parameterise: extract hardcoded values as defaults and inject
-        # {{placeholders}} in one pass — no manual script editing required.
-        parameterised_script, default_params = _parameterise_script(raw_script_bytes.decode("utf-8"))
-        logger.info("Auto-extracted %d default parameter(s) from script", len(default_params))
+        if script_kind == "python_playwright":
+            # Auto-parameterise: extract hardcoded values as defaults and inject
+            # {{placeholders}} in one pass — no manual script editing required.
+            parameterised_script, default_params = _parameterise_script(raw_script_text)
+            logger.info("Auto-extracted %d default parameter(s) from script", len(default_params))
+        else:
+            parameterised_script = raw_script_text
+            default_params = {}
+            logger.info("Using plain script-step execution for %s", file_key)
 
         # Merge order: script defaults → Excel file overrides → inline overrides.
-        # Before execution we normalize the merged values into a JSON object and
-        # substitute placeholders from that JSON payload.
         parameters: dict[str, str] = _normalize_parameter_values(default_params)
         parameters_file_key = str(recording.get("parameters_file_key") or "").strip() or None
         if not bool(recording.get("skip_parameters_file_load")):
@@ -2417,12 +2498,14 @@ async def execute_recording_script(
 
         diagnostics_path = working_dir / "diagnostics.json"
         failure_screenshot_path = working_dir / "failure.png"
+        script_step_output_path = working_dir / "script_step_output.json"
         step_artifacts_dir = working_dir / "steps"
         video_dir = working_dir / "video"
 
         env = _ensure_runner_pythonpath(_merge_runner_env_defaults(os.environ.copy()))
         env["PTR_DIAGNOSTICS_PATH"] = str(diagnostics_path)
         env["PTR_FAILURE_SCREENSHOT_PATH"] = str(failure_screenshot_path)
+        env["PTR_SCRIPT_STEP_OUTPUT_PATH"] = str(script_step_output_path)
         env["PTR_EXECUTION_PARAMETERS_JSON"] = json.dumps(execution_parameters, sort_keys=True)
         experience_store_path = _default_experience_store_path()
         experience_store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2554,11 +2637,13 @@ async def execute_recording_script(
             result.get("flow_context_specs") or [],
         )
         explicit_outputs, explicit_output_errors = _extract_recording_outputs(result, recording.get("outputs"))
+        script_step_outputs, script_step_output_errors = _read_script_step_output(script_step_output_path)
         extracted_outputs = dict(workbook_outputs)
         extracted_outputs.update(explicit_outputs)
+        extracted_outputs.update(script_step_outputs)
         result["flow_output_results"] = flow_output_results
         result["extracted_outputs"] = extracted_outputs
-        result["output_errors"] = [*flow_output_errors, *explicit_output_errors]
+        result["output_errors"] = [*flow_output_errors, *explicit_output_errors, *script_step_output_errors]
 
     logger.info(
         "Finished recording %s with status=%s exit_code=%s duration=%ss",

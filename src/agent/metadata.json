@@ -1,6 +1,6 @@
 {
   "name": "test_runner",
-  "version": "0.0.6",
+  "version": "0.0.8",
   "description": "Executes Playwright-generated Python scripts as a test suite and returns an HTML report.",
   "component": "agent",
   "config": {

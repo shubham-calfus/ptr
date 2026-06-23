@@ -6,9 +6,11 @@ from src.tools.tools import (
     UnsupportedActionCoverageError,
     _apply_recording_debug_env_overrides,
     _call_openai_failure_summary,
+    _classify_recording_script,
     _collect_unresolved_execution_parameters,
     _default_experience_store_path,
     _derive_parameters_file_candidates,
+    _ensure_runner_pythonpath,
     _effective_debug_settings,
     _extract_table_parameter_sets,
     _load_resume_state_from_run_data,
@@ -25,6 +27,7 @@ from src.tools.tools import (
     _parse_excel_parameter_sets,
     _parse_excel_parameters,
     _prepare_script_for_execution,
+    _read_script_step_output,
     _resolve_executable_script,
     _run_python_script,
     _split_storage_object_ref,
@@ -168,6 +171,116 @@ with sync_playwright() as playwright:
     assert preparation_warning is not None
     assert 'page.goto("https://example.com/app")' in executable_script
     assert 'page.locator(".xen").first.click()' in executable_script
+
+
+def test_classify_recording_script_treats_non_playwright_python_as_script_step() -> None:
+    script_kind = _classify_recording_script(
+        """
+import requests
+
+payload = {"name": "demo"}
+print(requests.__name__, payload["name"])
+"""
+    )
+
+    assert script_kind == "plain_python"
+
+
+def test_resolve_executable_script_returns_script_step_for_plain_python() -> None:
+    executable_script, execution_mode, preparation_warning = _resolve_executable_script(
+        """
+from src.runtime.api_helpers import extract, get_runtime_params
+
+p = get_runtime_params()
+print("creating", p["order_type"])
+extract("order_number", f"PO-{p['order_type']}")
+""",
+        {"order_type": "standard"},
+    )
+
+    assert execution_mode == "script_step"
+    assert preparation_warning is None
+    assert 'print("creating", p["order_type"])' in executable_script
+    assert 'extract("order_number", f"PO-{p[\'order_type\']}")' in executable_script
+
+
+def test_resolve_executable_script_does_not_substitute_placeholders_for_plain_python() -> None:
+    executable_script, execution_mode, preparation_warning = _resolve_executable_script(
+        'print("{{username}}")\n',
+        {"username": "svc"},
+    )
+
+    assert execution_mode == "script_step"
+    assert preparation_warning is None
+    assert executable_script == 'print("{{username}}")\n'
+
+
+def test_script_step_runs_plain_python_and_captures_extract_output(tmp_path: Path) -> None:
+    script_path = tmp_path / "create_po.py"
+    output_path = tmp_path / "script_step_output.json"
+
+    script_path.write_text(
+        """
+from src.runtime.api_helpers import extract, get_runtime_params
+
+p = get_runtime_params()
+extract("order_number", f"PO-{p['suffix']}")
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_python_script(
+        script_path,
+        tmp_path,
+        timeout_seconds=30,
+        env=_ensure_runner_pythonpath(
+            {
+                "PTR_USE_XVFB": "false",
+                "PTR_EXECUTION_PARAMETERS_JSON": '{"suffix":"1009"}',
+                "PTR_SCRIPT_STEP_OUTPUT_PATH": str(output_path),
+            }
+        ),
+    )
+
+    extracted, errors = _read_script_step_output(output_path)
+
+    assert completed.returncode == 0
+    assert extracted == {"order_number": "PO-1009"}
+    assert errors == []
+
+
+def test_read_script_step_output_reads_outputs_payload(tmp_path: Path) -> None:
+    output_path = tmp_path / "script_step_output.json"
+    output_path.write_text(
+        '{"outputs":{"order_number":"PO-1009","po_header_id":300000123456789}}',
+        encoding="utf-8",
+    )
+
+    extracted, errors = _read_script_step_output(output_path)
+
+    assert extracted == {
+        "order_number": "PO-1009",
+        "po_header_id": "300000123456789",
+    }
+    assert errors == []
+
+
+def test_read_script_step_output_returns_empty_when_no_outputs_file(tmp_path: Path) -> None:
+    extracted, errors = _read_script_step_output(tmp_path / "missing.json")
+
+    assert extracted == {}
+    assert errors == []
+
+
+def test_read_script_step_output_reports_malformed_payload(tmp_path: Path) -> None:
+    output_path = tmp_path / "script_step_output.json"
+    output_path.write_text('{"order_number": "PO-1009"}', encoding="utf-8")
+
+    extracted, errors = _read_script_step_output(output_path)
+
+    assert extracted == {}
+    assert errors == ["script_step: extract output must be a JSON object with an 'outputs' map"]
 
 
 def test_load_resume_state_from_run_data_starts_from_first_failed_recording(monkeypatch) -> None:
@@ -673,6 +786,28 @@ def test_parse_excel_parameters_supports_horizontal_header_value_sheet() -> None
     }
 
 
+def test_parse_excel_parameters_supports_two_column_horizontal_header_value_sheet() -> None:
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["username", "password"])
+    ws.append(["FUSDEV.CNV", "Fu58e^U@T#1Dec25"])
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    wb.close()
+
+    params = _parse_excel_parameters(buffer.getvalue())
+
+    assert params == {
+        "username": "FUSDEV.CNV",
+        "password": "Fu58e^U@T#1Dec25",
+    }
+
+
 def test_parse_excel_parameter_sets_supports_multiple_horizontal_data_rows() -> None:
     from io import BytesIO
 
@@ -848,6 +983,25 @@ def test_parse_flow_context_aliases_accepts_existing_lists_without_stringifying(
     assert _parse_flow_context_aliases(["Req Number", "Job Requisition Number"]) == [
         "Req Number",
         "Job Requisition Number",
+    ]
+
+
+def test_extract_table_parameter_sets_keeps_headerless_vertical_credentials_sheet() -> None:
+    parameter_sets = _extract_table_parameter_sets(
+        [
+            ("username", "FUSDEV.CNV"),
+            ("password", "Fu58e^U@T#1Dec25"),
+        ]
+    )
+
+    assert parameter_sets == [
+        {
+            "row_index": 1,
+            "values": {
+                "username": "FUSDEV.CNV",
+                "password": "Fu58e^U@T#1Dec25",
+            },
+        }
     ]
 
 
