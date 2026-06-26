@@ -22,14 +22,6 @@ from common_lib.storage.storage_client import RetrievalMode, storage
 from common_lib.utils.logger import setup_logger
 
 try:
-    from runtime.parameterization import (
-        normalize_param_name as _normalize_param_name,
-        parameterise_script as _parameterise_script,
-        substitute_parameters as _substitute_parameters,
-    )
-    from utils.runtime_env import get_runner_env_value, load_runner_local_env
-    from utils.html_report_generator import generate_html_report_content
-except ImportError:  # pragma: no cover - published/runtime fallback
     from src.runtime.parameterization import (
         normalize_param_name as _normalize_param_name,
         parameterise_script as _parameterise_script,
@@ -37,6 +29,14 @@ except ImportError:  # pragma: no cover - published/runtime fallback
     )
     from src.utils.runtime_env import get_runner_env_value, load_runner_local_env
     from src.utils.html_report_generator import generate_html_report_content
+except ImportError:  # pragma: no cover - published/runtime fallback
+    from runtime.parameterization import (
+        normalize_param_name as _normalize_param_name,
+        parameterise_script as _parameterise_script,
+        substitute_parameters as _substitute_parameters,
+    )
+    from utils.runtime_env import get_runner_env_value, load_runner_local_env
+    from utils.html_report_generator import generate_html_report_content
 
 logger = setup_logger(__name__)
 load_runner_local_env()
@@ -64,6 +64,7 @@ _FLOW_CONTEXT_SHEET_ALIASES = {
     "outputinput",
 }
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+_RUNTIME_PLACEHOLDER_LITERAL_RE = re.compile(r"""(?P<quote>["'])\{\{[A-Za-z0-9_]+\}\}(?P=quote)""")
 _OBVIOUS_JS_RECORDING_MARKERS = (
     "import {",
     "from '@playwright/test'",
@@ -2075,8 +2076,27 @@ def _inject_runtime_helpers(script_text: str) -> str:
 
 
 def _inject_runtime_helpers_v2(script_text: str) -> str:
-    helper_import = "from src.runtime.helpers_v2 import *"
-    return _insert_after_future_imports(script_text, helper_import)
+    helper_block = textwrap.dedent(
+        """
+        from src.runtime.helpers_v2 import *
+
+
+        def ai_extract(name, prompt):
+            current_page = _PTR_LAST_PAGE
+            if current_page is None:
+                raise RuntimeError("ai_extract requires a registered page before extraction.")
+            return _ptr_ai_extract(current_page, name, prompt)
+        """
+    ).strip()
+    return _insert_after_future_imports(script_text, helper_block)
+
+
+def _wrap_runtime_placeholder_literals(script_text: str) -> str:
+    """Resolve runtime ``{{name}}`` placeholders in raw-script fallback mode."""
+    return _RUNTIME_PLACEHOLDER_LITERAL_RE.sub(
+        lambda match: f"_ptr_resolve({match.group(0)})",
+        script_text,
+    )
 
 
 class UnsupportedActionCoverageError(RuntimeError):
@@ -2120,13 +2140,13 @@ def _read_script_step_output(output_path: Path) -> tuple[dict[str, str], list[st
 def _prepare_normalized_script_for_execution(script_text: str) -> str:
     """Prepare an already validated/substituted Playwright script via AST."""
     try:
-        from runtime.optimizer import optimize
-        from runtime.parser import ParseCoverageError, parse_script
-        from runtime.script_generator import CoverageError, generate_full_script
-    except ImportError:  # pragma: no cover - published/runtime fallback
         from src.runtime.optimizer import optimize
         from src.runtime.parser import ParseCoverageError, parse_script
         from src.runtime.script_generator import CoverageError, generate_full_script
+    except ImportError:  # pragma: no cover - published/runtime fallback
+        from runtime.optimizer import optimize
+        from runtime.parser import ParseCoverageError, parse_script
+        from runtime.script_generator import CoverageError, generate_full_script
 
     try:
         actions = parse_script(script_text)
@@ -2174,7 +2194,8 @@ def _resolve_executable_script(
     try:
         return _prepare_normalized_script_for_execution(normalized_script), "ast_prepared", None
     except UnsupportedActionCoverageError as exc:
-        return normalized_script, "raw_script_fallback", str(exc)
+        raw_fallback_script = _wrap_runtime_placeholder_literals(normalized_script)
+        return _inject_runtime_helpers_v2(raw_fallback_script), "raw_script_fallback", str(exc)
 
 
 def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] | None = None) -> str:
@@ -2284,7 +2305,10 @@ def _base_recording_result(recording: dict[str, Any]) -> dict[str, Any]:
         "page_text": None,
         "oracle_tables": [],
         "page_semantics": {},
+        "runtime_debug": {},
+        "runtime_diagnostics": {},
         "screenshot_s3_key": None,
+        "diagnostics_s3_key": None,
         "executed_script_s3_key": None,
         "execution_mode": None,
         "preparation_warning": None,
@@ -2316,6 +2340,24 @@ def _persist_recording_manifest(
     )
     result["result_s3_key"] = manifest_key
     return result
+
+
+def _build_runtime_diagnostics_manifest_payload(
+    diagnostics: dict[str, Any],
+    *,
+    diagnostics_s3_key: str | None = None,
+    uploaded_step_artifacts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return {}
+    payload = json.loads(json.dumps(diagnostics))
+    if not isinstance(payload, dict):
+        return {}
+    if diagnostics_s3_key:
+        payload["diagnostics_s3_key"] = diagnostics_s3_key
+    if uploaded_step_artifacts:
+        payload["uploaded_step_artifacts"] = json.loads(json.dumps(uploaded_step_artifacts))
+    return payload
 
 
 def _store_executed_script_artifact(artifact_prefix: str, prepared_script: str) -> str | None:
@@ -2572,6 +2614,16 @@ async def execute_recording_script(
         result["page_text"] = diagnostics.get("page_text")
         result["oracle_tables"] = diagnostics.get("oracle_tables") or []
         result["page_semantics"] = diagnostics.get("page_semantics") or {}
+        result["runtime_debug"] = diagnostics.get("runtime_debug") or {}
+
+        if diagnostics_path.exists():
+            diagnostics_key = f"{artifact_prefix}/diagnostics.json"
+            _storage_put_bytes(
+                diagnostics_key,
+                diagnostics_path.read_bytes(),
+                content_type="application/json",
+            )
+            result["diagnostics_s3_key"] = diagnostics_key
 
         failure_local_path = diagnostics.get("failure_screenshot_path")
         failure_screenshot_path: Path | None = None
@@ -2607,6 +2659,11 @@ async def execute_recording_script(
             )
         result["step_artifacts"] = step_artifacts
         result["action_log"] = diagnostics.get("action_log") or []
+        result["runtime_diagnostics"] = _build_runtime_diagnostics_manifest_payload(
+            diagnostics,
+            diagnostics_s3_key=result.get("diagnostics_s3_key"),
+            uploaded_step_artifacts=step_artifacts,
+        )
 
         # Oracle Fusion (and similar apps) open task pages in a new browser page,
         # so Playwright produces one .webm file per page. Upload all of them so

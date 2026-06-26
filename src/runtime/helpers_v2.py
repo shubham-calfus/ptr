@@ -71,6 +71,8 @@ __all__ = [
     "_ptr_pick_date_via_icon",
     "_ptr_click_navigation_button",
     "_ptr_wait_for_post_login_redirect",
+    "_ptr_ai_extract",
+    "_ptr_resolve",
 ]
 
 _PTR_LAST_PAGE: Page | None = None
@@ -103,6 +105,7 @@ _PTR_LAST_PAGE_SNAPSHOT: dict[str, Any] = {}
 _PTR_HARDCODED_AFTER_ACTION_WAIT_MS = 10_000
 _PTR_STEEL_BROWSER_SESSION_IDS: dict[int, str] = {}
 _PTR_STEEL_RELEASE_SESSION_IDS: set[str] = set()
+_PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG: bytes | None = None
 load_runner_local_env()
 
 _PTR_POPUP_SCOPE_SELECTORS = [
@@ -763,6 +766,48 @@ def _ptr_semantic_snapshot_has_content(snapshot: dict[str, Any] | None) -> bool:
     return any(bool(snapshot.get(key)) for key in ("label_values", "text_candidates", "dialogs"))
 
 
+def _ptr_runtime_debug_settings() -> dict[str, Any]:
+    return {
+        "runner_version": _PTR_RUNNER_VERSION,
+        "after_action_wait_ms": _ptr_wait_ms("PTR_AFTER_ACTION_WAIT_MS", _PTR_HARDCODED_AFTER_ACTION_WAIT_MS),
+        "capture_steps": bool(_PTR_STEP_ARTIFACTS_DIR),
+        "record_video": bool(str(os.getenv("PTR_VIDEO_DIR", "")).strip()),
+        "step_screenshot_full_page": _ptr_env_flag("PTR_STEP_SCREENSHOT_FULL_PAGE", "false"),
+        "page_text_snapshot_max_chars": _ptr_wait_ms("PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS", 12_000),
+        "debug_trace": _ptr_env_flag("PTR_DEBUG_TRACE", "false"),
+        "experience_enabled": _ptr_env_flag("PTR_EXPERIENCE_ENABLED", "true"),
+        "ai_self_repair_enabled": _ptr_ai_self_repair_enabled(),
+        "action_timeout_ms": _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000),
+        "text_entry_timeout_ms": _ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000),
+        "text_click_timeout_ms": _ptr_wait_ms("PTR_TEXT_CLICK_TIMEOUT_MS", 3000),
+        "textbox_change_processing_wait_ms": _ptr_wait_ms("PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS", 500),
+        "ai_extract_pre_capture_wait_ms": _ptr_wait_ms("PTR_AI_EXTRACT_PRE_CAPTURE_WAIT_MS", 1200),
+    }
+
+
+def _ptr_runtime_snapshot_summary(snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    current = snapshot if isinstance(snapshot, dict) else {}
+    oracle_tables = current.get("oracle_tables")
+    oracle_tables = oracle_tables if isinstance(oracle_tables, list) else []
+    page_semantics = current.get("page_semantics")
+    page_semantics = page_semantics if isinstance(page_semantics, dict) else {}
+    return {
+        "captured_at_epoch_ms": int(time.time() * 1000),
+        "page_text_length": len(str(current.get("page_text") or "")),
+        "oracle_table_count": len(oracle_tables),
+        "oracle_table_row_count": sum(
+            len(table.get("rows") or [])
+            for table in oracle_tables
+            if isinstance(table, dict)
+        ),
+        "label_value_count": len(page_semantics.get("label_values") or []),
+        "text_candidate_count": len(page_semantics.get("text_candidates") or []),
+        "dialog_count": len(page_semantics.get("dialogs") or []),
+        "step_artifact_count": len(_PTR_STEP_ARTIFACTS),
+        "action_log_count": len(_PTR_ACTION_LOG),
+    }
+
+
 def _ptr_persist_diagnostics_snapshot(snapshot: dict[str, Any] | None = None) -> None:
     if not _PTR_DIAGNOSTICS_PATH:
         return
@@ -776,6 +821,11 @@ def _ptr_persist_diagnostics_snapshot(snapshot: dict[str, Any] | None = None) ->
         "failure_screenshot_path": _PTR_FAILURE_SCREENSHOT_PATH or None,
         "step_artifacts": _PTR_STEP_ARTIFACTS,
         "action_log": _PTR_ACTION_LOG,
+        "runtime_debug": {
+            "settings": _ptr_runtime_debug_settings(),
+            "snapshot_summary": _ptr_runtime_snapshot_summary(current),
+            "last_strategy_state": _ptr_clone_json_value(_PTR_CURRENT_STRATEGY),
+        },
     }
     try:
         Path(_PTR_DIAGNOSTICS_PATH).write_text(json.dumps(payload), encoding="utf-8")
@@ -943,8 +993,27 @@ def _ptr_locator_value(locator: Locator) -> str:
         value = handle.evaluate(
             r"""(node) => {
                 if (!node) return "";
-                if ("value" in node) return String(node.value || "");
-                return "";
+                const readValue = (candidate) => {
+                    if (!candidate) return "";
+                    if ("value" in candidate) {
+                        const direct = String(candidate.value || "").trim();
+                        if (direct) return direct;
+                    }
+                    const attrCandidates = [
+                        candidate.getAttribute?.("value"),
+                        candidate.getAttribute?.("aria-valuetext"),
+                        candidate.getAttribute?.("aria-valuenow"),
+                    ];
+                    for (const raw of attrCandidates) {
+                        const text = String(raw || "").trim();
+                        if (text) return text;
+                    }
+                    return "";
+                };
+                const direct = readValue(node);
+                if (direct) return direct;
+                const nested = node.querySelector?.("[role='spinbutton'], input, textarea, select");
+                return readValue(nested);
             }"""
         )
         return str(value or "").strip()
@@ -1025,7 +1094,21 @@ def _ptr_rank_ai_dom_candidates(helper: str, label: str, candidates: list[dict[s
         tag = _ptr_normalize_text(candidate.get("tag"))
         role = _ptr_normalize_text(candidate.get("role"))
         html = _ptr_normalize_text(candidate.get("html"))
-        if "button" in normalized_helper:
+        text_length = len(_ptr_normalize_text(candidate.get("text")))
+        if "menu" in normalized_helper:
+            if role == "menuitem":
+                score += 45
+            if role in {"button", "link", "option"}:
+                score += 18
+            if tag in {"a", "button"}:
+                score += 12
+            if tag in {"select", "input", "textarea"}:
+                score -= 40
+            if "oj-popup" in html or "role=\"menu\"" in html or "role='menu'" in html:
+                score += 15
+            if text_length > 180:
+                score -= 20
+        elif "button" in normalized_helper:
             if tag in {"oj-action-card", "oj-switch"}:
                 score += 40
             if "oj-action-card" in html or "oj-switch" in html:
@@ -1034,6 +1117,10 @@ def _ptr_rank_ai_dom_candidates(helper: str, label: str, candidates: list[dict[s
                 score += 25
             if tag == "button":
                 score += 5
+            if tag in {"select", "textarea"}:
+                score -= 25
+            if text_length > 220:
+                score -= 15
         elif "date" in normalized_helper:
             if tag in {"oj-input-date", "oj-c-input-date"}:
                 score += 35
@@ -1563,7 +1650,7 @@ def _ptr_value_matches(expected: str, observed: str) -> bool:
     normalized_expected = _ptr_normalize_text(expected)
     normalized_observed = _ptr_normalize_text(observed)
     if not normalized_expected:
-        return bool(normalized_observed)
+        return not normalized_observed
     if not normalized_observed:
         return False
     if normalized_expected == normalized_observed:
@@ -1597,6 +1684,10 @@ def _ptr_recorded_locator_roles(script_data: dict[str, Any] | None = None) -> li
 
 def _ptr_recorded_locator_is_table_scoped(script_data: dict[str, Any] | None = None) -> bool:
     return any(role in {"row", "table", "cell", "gridcell"} for role in _ptr_recorded_locator_roles(script_data))
+
+
+def _ptr_recorded_locator_is_spinbutton(script_data: dict[str, Any] | None = None) -> bool:
+    return "spinbutton" in _ptr_recorded_locator_roles(script_data)
 
 
 _PTR_ORACLE_TABLE_EDITOR_ID_PATTERNS = (
@@ -1653,6 +1744,61 @@ def _ptr_active_oracle_table_editor(page: Page | None) -> dict[str, str]:
     if not _ptr_normalize_text(active_info.get("row_text")) and not _ptr_normalize_text(active_info.get("table_id")):
         return {}
     return active_info
+
+
+def _ptr_active_spinbutton_locator(page: Page | None) -> tuple[dict[str, str], Locator | None]:
+    active_info = _ptr_safe_page_eval(
+        page,
+        r"""() => {
+            const node = document.activeElement;
+            const text = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            if (!node) return {};
+            return {
+                tag: String(node?.tagName || "").toLowerCase(),
+                role: text(node?.getAttribute?.("role")),
+                id: text(node?.id),
+                name: text(node?.getAttribute?.("name")),
+                aria_label: text(node?.getAttribute?.("aria-label")),
+                title: text(node?.getAttribute?.("title")),
+                value: text(("value" in node ? node.value : "") || node?.getAttribute?.("value")),
+                aria_valuenow: text(node?.getAttribute?.("aria-valuenow")),
+                aria_valuetext: text(node?.getAttribute?.("aria-valuetext")),
+            };
+        }""",
+    )
+    active_info = active_info if isinstance(active_info, dict) else {}
+    if page is None or not active_info:
+        return active_info, None
+
+    role = _ptr_normalize_text(active_info.get("role"))
+    if role != "spinbutton":
+        return active_info, None
+
+    locator = None
+    active_id = str(active_info.get("id") or "").strip()
+    if active_id:
+        escaped_id = active_id.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            locator = page.locator(f'[id="{escaped_id}"]').first
+        except Exception:
+            try:
+                locator = page.locator(f'[id="{escaped_id}"]')
+            except Exception:
+                locator = None
+
+    if locator is None:
+        active_name = str(active_info.get("name") or "").strip()
+        if active_name:
+            escaped_name = active_name.replace("\\", "\\\\").replace('"', '\\"')
+            try:
+                locator = page.locator(f'[name="{escaped_name}"]').first
+            except Exception:
+                try:
+                    locator = page.locator(f'[name="{escaped_name}"]')
+                except Exception:
+                    locator = None
+
+    return active_info, locator
 
 
 def _ptr_active_oracle_table_editor_locator(page: Page | None) -> tuple[dict[str, str], Locator | None]:
@@ -1733,6 +1879,56 @@ def _ptr_oracle_table_fill_postcondition(locator: Locator, active_locator: Locat
         if _ptr_value_matches(value, observed):
             return True
     return False
+
+
+def _ptr_oracle_spinbutton_fill_postcondition(
+    current_page: Page | None,
+    locator: Locator,
+    active_locator: Locator | None,
+    label: str,
+    value: str,
+) -> bool:
+    candidates = [active_locator, locator]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        observed = _ptr_locator_value(candidate) or _ptr_locator_text(candidate)
+        if _ptr_value_matches(value, observed):
+            return True
+    return _ptr_oracle_label_value_matches(current_page, label, value)
+
+
+def _ptr_try_oracle_spinbutton_fill(
+    current_page: Page,
+    locator: Locator,
+    label: str,
+    value: str,
+) -> dict[str, Any] | None:
+    if not _ptr_recorded_locator_is_spinbutton():
+        return None
+
+    active_info, active_locator = _ptr_active_spinbutton_locator(current_page)
+    target_locator = active_locator or locator
+
+    strategy_name = "oracle_spinbutton_keyboard_fill"
+    _ptr_record_strategy_attempt(strategy_name)
+    _ptr_fill_locator_via_keyboard(target_locator, value)
+    try:
+        target_locator.press("Tab", timeout=_ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000))
+    except Exception:
+        pass
+    _ptr_wait_for_field_processing(
+        current_page,
+        env_name="PTR_TEXTBOX_CHANGE_PROCESSING_WAIT_MS",
+        default_ms=500,
+    )
+    if _ptr_oracle_spinbutton_fill_postcondition(current_page, locator, active_locator, label, value):
+        return {
+            "strategy_name": strategy_name,
+            "active_element_id": str(active_info.get("id") or "").strip(),
+            "used_keyboard_entry": True,
+        }
+    raise RuntimeError(f'Oracle spinbutton "{label}" did not reflect the requested value.')
 
 
 def _ptr_try_oracle_table_active_editor_fill(
@@ -1821,10 +2017,58 @@ def _ptr_menu_panel_option_candidates(
 ) -> list[tuple[str, Locator]]:
     return [
         ("raw_option", option),
-        ("role_menuitem", current_page.get_by_role("menuitem", name=option_name)),
-        ("role_option", current_page.get_by_role("option", name=option_name)),
+        ("role_menuitem", current_page.get_by_role("menuitem", name=option_name, exact=True)),
+        ("role_option", current_page.get_by_role("option", name=option_name, exact=True)),
         ("text_option", current_page.get_by_text(option_name, exact=True)),
     ]
+
+
+def _ptr_oracle_visible_popup_option_candidates(
+    current_page: Page,
+    option_name: str,
+) -> list[tuple[str, Locator]]:
+    page_locator = getattr(current_page, "locator", None)
+    if not callable(page_locator):
+        return []
+
+    candidates: list[tuple[str, Locator]] = []
+    popup_selectors = [
+        "[role='menu']:visible",
+        ".oj-popup:visible",
+    ]
+    for selector in popup_selectors:
+        try:
+            popup_scope = current_page.locator(selector)
+        except Exception:
+            continue
+        if popup_scope is None:
+            continue
+
+        get_by_role = getattr(popup_scope, "get_by_role", None)
+        if callable(get_by_role):
+            for role_name in ("menuitem", "link", "button", "option"):
+                try:
+                    candidates.append(
+                        (
+                            f"oracle_popup_{role_name}_{len(candidates)}",
+                            popup_scope.get_by_role(role_name, name=option_name, exact=True),
+                        )
+                    )
+                except Exception:
+                    pass
+
+        get_by_text = getattr(popup_scope, "get_by_text", None)
+        if callable(get_by_text):
+            try:
+                candidates.append(
+                    (
+                        f"oracle_popup_text_{len(candidates)}",
+                        popup_scope.get_by_text(option_name, exact=True),
+                    )
+                )
+            except Exception:
+                pass
+    return candidates
 
 
 def _ptr_wait_for_oracle_menu_trigger_option_visibility(
@@ -2486,12 +2730,22 @@ def _ptr_oracle_warning_dialog_state(page: Page | None) -> dict[str, Any]:
         "warning_text": "",
         "ok_button_visible": False,
         "any_ok_button_visible": False,
+        "ok_button_id": "",
+        "close_button_id": "",
     }
     result = _ptr_safe_page_eval(
         page,
         r"""() => {
             const selectors = ['[role="dialog"]', '[aria-modal="true"]', '.oj-dialog', '.oj-popup'];
             const normalize = (value, limit = 1200) => String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+            const buttonLabel = (button) => normalize(
+                button?.innerText
+                || button?.textContent
+                || button?.getAttribute?.("aria-label")
+                || button?.getAttribute?.("title")
+                || button?.getAttribute?.("value"),
+                80,
+            ).toLowerCase();
             const isVisible = (node) => {
                 if (!node) return false;
                 const style = window.getComputedStyle(node);
@@ -2500,37 +2754,64 @@ def _ptr_oracle_warning_dialog_state(page: Page | None) -> dict[str, Any]:
                 const rect = node.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
             };
+            const isWarningLike = (title, text) => {
+                const lowerTitle = String(title || "").toLowerCase();
+                const lowerText = String(text || "").toLowerCase();
+                return lowerTitle.includes("warning")
+                    || lowerText.startsWith("warning ")
+                    || lowerText.includes(" warning ")
+                    || lowerText.includes("duplicate")
+                    || lowerText.includes("payment terms");
+            };
+            const dialogEntry = (node) => {
+                const titleNode = node.querySelector("[role='heading'], h1, h2, h3, .oj-dialog-title");
+                const title = normalize(titleNode?.innerText || titleNode?.textContent, 160);
+                const text = normalize(node.innerText || node.textContent, 1200);
+                const buttons = Array.from(
+                    node.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']")
+                ).filter(isVisible);
+                const buttonTexts = buttons.map((button) => buttonLabel(button)).filter(Boolean);
+                const okButton = buttons.find((button) => buttonLabel(button) === "ok") || null;
+                const closeButton = buttons.find((button) => {
+                    const label = buttonLabel(button);
+                    return label === "close" || label === "x" || label === "×";
+                }) || null;
+                return {
+                    title,
+                    text,
+                    has_ok_button: buttonTexts.includes("ok"),
+                    warning_like: isWarningLike(title, text),
+                    ok_button_id: normalize(okButton?.id, 160),
+                    close_button_id: normalize(closeButton?.id, 160),
+                };
+            };
             const seen = new Set();
             const dialogs = [];
             for (const selector of selectors) {
                 for (const node of document.querySelectorAll(selector)) {
                     if (!isVisible(node) || seen.has(node)) continue;
                     seen.add(node);
-                    const titleNode = node.querySelector("[role='heading'], h1, h2, h3, .oj-dialog-title");
-                    const title = normalize(titleNode?.innerText || titleNode?.textContent, 160);
-                    const text = normalize(node.innerText || node.textContent, 1200);
-                    const buttonTexts = Array.from(node.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
-                        .filter(isVisible)
-                        .map((button) => normalize(
-                            button.innerText
-                            || button.textContent
-                            || button.getAttribute?.("aria-label")
-                            || button.getAttribute?.("value"),
-                            80,
-                        ).toLowerCase())
-                        .filter(Boolean);
-                    const lowerTitle = title.toLowerCase();
-                    const lowerText = text.toLowerCase();
-                    const warningLike = lowerTitle.includes("warning")
-                        || lowerText.startsWith("warning ")
-                        || lowerText.includes(" warning ")
-                        || lowerText.includes("duplicate");
-                    dialogs.push({
-                        title,
-                        text,
-                        has_ok_button: buttonTexts.includes("ok"),
-                        warning_like: warningLike,
-                    });
+                    dialogs.push(dialogEntry(node));
+                }
+            }
+
+            for (const button of Array.from(document.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))) {
+                if (!isVisible(button)) continue;
+                const label = buttonLabel(button);
+                if (!["ok", "close", "x", "×"].includes(label)) continue;
+                let current = button.parentElement;
+                let depth = 0;
+                while (current && depth < 8) {
+                    if (isVisible(current) && !seen.has(current)) {
+                        const entry = dialogEntry(current);
+                        if (entry.warning_like) {
+                            seen.add(current);
+                            dialogs.push(entry);
+                            break;
+                        }
+                    }
+                    current = current.parentElement;
+                    depth += 1;
                 }
             }
             const warningDialog = dialogs.find((entry) => entry.warning_like) || null;
@@ -2541,6 +2822,8 @@ def _ptr_oracle_warning_dialog_state(page: Page | None) -> dict[str, Any]:
                 warning_text: warningDialog ? warningDialog.text : "",
                 ok_button_visible: Boolean(warningDialog && warningDialog.has_ok_button),
                 any_ok_button_visible: dialogs.some((entry) => entry.has_ok_button),
+                ok_button_id: warningDialog ? String(warningDialog.ok_button_id || "") : "",
+                close_button_id: warningDialog ? String(warningDialog.close_button_id || "") : "",
             };
         }""",
     )
@@ -2553,6 +2836,8 @@ def _ptr_oracle_warning_dialog_state(page: Page | None) -> dict[str, Any]:
         "warning_text": str(result.get("warning_text") or "").strip(),
         "ok_button_visible": bool(result.get("ok_button_visible")),
         "any_ok_button_visible": bool(result.get("any_ok_button_visible")),
+        "ok_button_id": str(result.get("ok_button_id") or "").strip(),
+        "close_button_id": str(result.get("close_button_id") or "").strip(),
     }
 
 
@@ -2610,6 +2895,85 @@ def _ptr_try_skip_optional_oracle_warning_ok(
     }
 
 
+def _ptr_try_dismiss_oracle_warning_dialog(
+    page: Page | None,
+    locator: Locator | None,
+    label: str,
+    error: Any,
+    *,
+    observation: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if page is None:
+        return None
+
+    current_observation = observation or _ptr_observe(page, locator)
+    try:
+        url = str(page.url or "").strip().lower()
+    except Exception:
+        url = ""
+    title = str((current_observation or {}).get("title") or "").strip().lower()
+    if not ("/faces/" in url or "fscmui" in url or "oracle" in title):
+        return None
+
+    error_text = _ptr_normalize_text(error)
+    if not any(
+        snippet in error_text
+        for snippet in ("intercepts pointer events", "afmodalglasspane", "another element", "pointer events")
+    ):
+        return None
+
+    warning_state = _ptr_oracle_warning_dialog_state(page)
+    if not bool(warning_state.get("warning_visible")):
+        return None
+
+    candidate_specs: list[tuple[str, str]] = []
+    ok_button_id = str(warning_state.get("ok_button_id") or "").strip()
+    close_button_id = str(warning_state.get("close_button_id") or "").strip()
+    if ok_button_id:
+        candidate_specs.append(("oracle_warning_dialog_ok", ok_button_id))
+    if close_button_id and close_button_id != ok_button_id:
+        candidate_specs.append(("oracle_warning_dialog_close", close_button_id))
+
+    active_element = current_observation.get("active_element") if isinstance(current_observation, dict) else {}
+    active_element = active_element if isinstance(active_element, dict) else {}
+    active_id = str(active_element.get("id") or "").strip()
+    if active_id and active_id not in {ok_button_id, close_button_id}:
+        candidate_specs.append(("oracle_warning_dialog_active_button", active_id))
+
+    if not candidate_specs:
+        return None
+
+    page_locator = getattr(page, "locator", None)
+    if not callable(page_locator):
+        return None
+
+    for strategy_name, button_id in candidate_specs:
+        escaped_id = button_id.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            candidate = page.locator(f'[id="{escaped_id}"]')
+            resolved = candidate.first if hasattr(candidate, "first") else candidate
+            if not _ptr_locator_is_actionable(resolved, timeout_ms=1000):
+                continue
+            _ptr_record_strategy_attempt(strategy_name)
+            _ptr_strict_click(resolved)
+            page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
+            after_state = _ptr_oracle_warning_dialog_state(page)
+            if not bool(after_state.get("warning_visible")):
+                return {
+                    "label": label,
+                    "surface_type": _ptr_oracle_surface_type(page, current_observation),
+                    "warning_title": str(warning_state.get("warning_title") or "").strip(),
+                    "warning_text": _ptr_trim_debug_text(warning_state.get("warning_text"), 240),
+                    "dialog_count_before": int(warning_state.get("dialog_count") or 0),
+                    "dialog_count_after": int(after_state.get("dialog_count") or 0),
+                    "strategy_name": strategy_name,
+                    "button_id": button_id,
+                }
+        except Exception:
+            continue
+    return None
+
+
 def _ptr_page_signature(page: Page | None, observation: dict[str, Any] | None = None) -> dict[str, Any]:
     current_observation = observation or _ptr_observe(page)
     try:
@@ -2645,6 +3009,7 @@ def _ptr_failure_signature(current_page: Page | None, locator: Locator | None, e
 def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) -> dict[str, Any]:
     max_candidates = max(3, min(12, _ptr_int_env("PTR_AI_SELF_REPAIR_MAX_CANDIDATES", 8)))
     max_html_chars = max(240, min(2400, _ptr_int_env("PTR_AI_SELF_REPAIR_MAX_HTML_CHARS", 900)))
+    max_text_chars = max(120, min(600, _ptr_int_env("PTR_AI_SELF_REPAIR_MAX_TEXT_CHARS", 220)))
     raw_candidate_cap = max(max_candidates * 6, 60)
     try:
         context = current_page.evaluate(
@@ -2654,7 +3019,13 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                 const maxCandidates = Number(payload?.maxCandidates || 8);
                 const rawCandidateCap = Number(payload?.rawCandidateCap || 60);
                 const maxHtmlChars = Number(payload?.maxHtmlChars || 900);
+                const maxTextChars = Number(payload?.maxTextChars || 220);
                 const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const truncate = (value, limit) => {
+                    const text = normalize(value);
+                    if (!text || text.length <= limit) return text;
+                    return text.slice(0, Math.max(0, limit - 3)) + "...";
+                };
                 const isVisible = (candidate) => {
                     if (!candidate) return false;
                     const style = window.getComputedStyle(candidate);
@@ -2681,7 +3052,7 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                         "[aria-label='Select Date.']"
                     );
                 }
-                const selectors = [...helperSelectors, ...[
+                const generalSelectors = [
                     "select",
                     "input",
                     "textarea",
@@ -2709,7 +3080,37 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                     "oj-c-input-date",
                     "oj-text-area",
                     "oj-c-text-area",
-                ]];
+                ];
+                const menuSelectors = [
+                    "[role='menu']",
+                    "[role='menuitem']",
+                    ".oj-popup",
+                    ".oj-popup [role='menuitem']",
+                    "a",
+                    "button",
+                    "[role='button']",
+                    "[role='link']",
+                    "[role='option']",
+                ];
+                const buttonSelectors = [
+                    "oj-action-card",
+                    ".oj-actioncard",
+                    "oj-switch",
+                    "[role='switch']",
+                    "button",
+                    "a",
+                    "[role='button']",
+                    "[role='link']",
+                    "[role='tab']",
+                    "[role='checkbox']",
+                    "[role='menuitem']",
+                ];
+                let selectors = [...helperSelectors, ...generalSelectors];
+                if (helper.includes("menu")) {
+                    selectors = [...helperSelectors, ...menuSelectors];
+                } else if (helper.includes("button")) {
+                    selectors = [...helperSelectors, ...buttonSelectors];
+                }
                 const seen = new Set();
                 const results = [];
                 const labelledByText = (candidate) => {
@@ -2718,7 +3119,7 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                     const values = [];
                     for (const id of ids.split(/\s+/)) {
                         const node = document.getElementById(id);
-                        const text = normalize(node?.innerText || node?.textContent);
+                        const text = truncate(node?.innerText || node?.textContent, maxTextChars);
                         if (text) values.push(text);
                     }
                     return normalize(values.join(" "));
@@ -2727,7 +3128,7 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                     if (!candidate || seen.has(candidate) || !isVisible(candidate)) return;
                     seen.add(candidate);
                     const role = normalize(candidate.getAttribute?.("role"));
-                    const text = normalize(candidate.innerText || candidate.textContent);
+                    const text = truncate(candidate.innerText || candidate.textContent, maxTextChars);
                     const oracleHost = candidate.closest?.("oj-select-single, oj-c-select-single");
                     const entry = {
                         tag: String(candidate.tagName || "").toLowerCase(),
@@ -2737,14 +3138,14 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                         aria_label: normalize(candidate.getAttribute?.("aria-label")),
                         aria_labelledby: normalize(candidate.getAttribute?.("aria-labelledby")),
                         aria_controls: normalize(candidate.getAttribute?.("aria-controls")),
-                        labelledby_text: labelledByText(candidate),
+                        labelledby_text: truncate(labelledByText(candidate), maxTextChars),
                         label_hint: normalize(candidate.getAttribute?.("label-hint")),
                         placeholder: normalize(candidate.getAttribute?.("placeholder")),
                         title: normalize(candidate.getAttribute?.("title")),
                         data_oj_field: normalize(candidate.getAttribute?.("data-oj-field")),
                         oracle_host_tag: normalize(oracleHost?.tagName).toLowerCase(),
                         oracle_host_id: normalize(oracleHost?.id),
-                        oracle_host_text: normalize(oracleHost?.innerText || oracleHost?.textContent),
+                        oracle_host_text: truncate(oracleHost?.innerText || oracleHost?.textContent, maxTextChars),
                         oracle_host_data_oj_field: normalize(oracleHost?.getAttribute?.("data-oj-field")),
                         text,
                         html: normalize(candidate.outerHTML).slice(0, maxHtmlChars),
@@ -2777,6 +3178,7 @@ def _ptr_collect_ai_dom_candidates(current_page: Page, helper: str, label: str) 
                 "maxCandidates": max_candidates,
                 "rawCandidateCap": raw_candidate_cap,
                 "maxHtmlChars": max_html_chars,
+                "maxTextChars": max_text_chars,
             },
         )
         if not isinstance(context, dict):
@@ -2970,7 +3372,7 @@ def _ptr_capture_failure(error: Any = None) -> None:
 
 
 def _ptr_capture_step(action: str) -> None:
-    global _PTR_STEP_INDEX
+    global _PTR_STEP_INDEX, _PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG
     if not _PTR_STEP_ARTIFACTS_DIR or _PTR_LAST_PAGE is None:
         return
     try:
@@ -2978,9 +3380,15 @@ def _ptr_capture_step(action: str) -> None:
         _PTR_STEP_INDEX += 1
         filename = f"step_{_PTR_STEP_INDEX:03d}_{re.sub(r'[^A-Za-z0-9._-]+', '_', str(action or 'step')).strip('._') or 'step'}.png"
         path = Path(_PTR_STEP_ARTIFACTS_DIR) / filename
-        _PTR_LAST_PAGE.screenshot(path=str(path), full_page=_ptr_env_flag("PTR_STEP_SCREENSHOT_FULL_PAGE", "false"))
+        override_png = _PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG
+        _PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG = None
+        if isinstance(override_png, bytes) and override_png:
+            path.write_bytes(override_png)
+        else:
+            _PTR_LAST_PAGE.screenshot(path=str(path), full_page=_ptr_env_flag("PTR_STEP_SCREENSHOT_FULL_PAGE", "false"))
         _PTR_STEP_ARTIFACTS.append({"index": _PTR_STEP_INDEX, "action": str(action or "step"), "local_path": str(path)})
     except Exception:
+        _PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG = None
         return
 
 
@@ -3197,6 +3605,70 @@ def _ptr_capture_ai_context_screenshot(current_page: Page | None) -> dict[str, A
         }
 
 
+def _ptr_capture_ai_extract_context_screenshot(current_page: Page | None) -> dict[str, Any]:
+    global _PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG
+    if current_page is None:
+        return {}
+
+    wait_ms = _ptr_wait_ms("PTR_AI_EXTRACT_PRE_CAPTURE_WAIT_MS", 1200)
+    try:
+        current_page.wait_for_timeout(wait_ms)
+    except Exception:
+        pass
+
+    try:
+        _ptr_capture_page_snapshot(current_page)
+    except Exception:
+        pass
+
+    screenshot_kwargs: dict[str, Any] = {
+        "full_page": _ptr_env_flag("PTR_AI_EXTRACT_SCREENSHOT_FULL_PAGE", "false"),
+        "type": "png",
+    }
+    screenshot_scale = _ptr_normalize_text(
+        os.getenv(
+            "PTR_AI_EXTRACT_SCREENSHOT_SCALE",
+            os.getenv("PTR_AI_SELF_REPAIR_SCREENSHOT_SCALE", "css"),
+        )
+    )
+    if screenshot_scale in {"css", "device"}:
+        screenshot_kwargs["scale"] = screenshot_scale
+
+    try:
+        screenshot_bytes = current_page.screenshot(**screenshot_kwargs)
+        if not isinstance(screenshot_bytes, bytes) or not screenshot_bytes:
+            return {
+                "status": "empty",
+                "media_type": "image/png",
+                "format": "png",
+                "full_page": bool(screenshot_kwargs.get("full_page")),
+                "scale": screenshot_kwargs.get("scale") or "",
+                "pre_capture_wait_ms": wait_ms,
+            }
+        _PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG = screenshot_bytes
+        return {
+            "status": "captured",
+            "image_url": f"data:image/png;base64,{base64.b64encode(screenshot_bytes).decode('ascii')}",
+            "media_type": "image/png",
+            "format": "png",
+            "full_page": bool(screenshot_kwargs.get("full_page")),
+            "scale": screenshot_kwargs.get("scale") or "",
+            "pre_capture_wait_ms": wait_ms,
+        }
+    except Exception as exc:
+        _PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG = None
+        return {
+            "status": "capture_error",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "media_type": "image/png",
+            "format": "png",
+            "full_page": bool(screenshot_kwargs.get("full_page")),
+            "scale": screenshot_kwargs.get("scale") or "",
+            "pre_capture_wait_ms": wait_ms,
+        }
+
+
 def _ptr_request_ai_self_repair(
     current_page: Page,
     helper: str,
@@ -3374,6 +3846,306 @@ def _ptr_request_ai_self_repair(
         }
     )
     return normalized
+
+
+_PTR_AI_EXTRACTED: dict[str, str] = {}
+
+_PTR_AI_EXTRACT_SYSTEM_PROMPT = (
+    "You extract one specific value from provided web page evidence. "
+    'Return JSON only in the form {"value": "<the exact value>"}. '
+    "Return only the requested value with no labels, units, currency symbols, or "
+    "extra words. Use structured page evidence and the screenshot together when both are present. "
+    'If the value is not present in the provided evidence, return {"value": ""}.'
+)
+_PTR_AI_EXTRACT_PLACEHOLDER_RE = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+
+
+def _ptr_resolve(value: Any) -> Any:
+    """Substitute ``{{name}}`` placeholders with values captured earlier in this
+    run by ai_extract(). Non-strings and unknown placeholders pass through
+    unchanged (a stale placeholder then fails loudly at the locator, not here)."""
+    if not isinstance(value, str) or "{{" not in value:
+        return value
+
+    def _sub(match: "re.Match[str]") -> str:
+        key = match.group(1)
+        if key in _PTR_AI_EXTRACTED:
+            return _PTR_AI_EXTRACTED[key]
+        return match.group(0)
+
+    return _PTR_AI_EXTRACT_PLACEHOLDER_RE.sub(_sub, value)
+
+
+def _ptr_write_ai_extracted_outputs() -> None:
+    """Surface ai_extract() values as flow-context outputs for downstream
+    recordings (same ``PTR_SCRIPT_STEP_OUTPUT_PATH`` channel the runner reads)."""
+    output_path = str(os.getenv("PTR_SCRIPT_STEP_OUTPUT_PATH", "") or "").strip()
+    if not output_path or not _PTR_AI_EXTRACTED:
+        return
+    try:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"outputs": dict(_PTR_AI_EXTRACTED)}, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+    except Exception:
+        return
+
+
+def _ptr_normalize_ai_extract_text(value: Any, limit: int) -> str:
+    text = str(value or "").replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}..."
+
+
+def _ptr_compact_ai_extract_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+
+    compact: dict[str, Any] = {}
+    page_title = _ptr_normalize_ai_extract_text(snapshot.get("page_title"), 160)
+    page_url = _ptr_normalize_ai_extract_text(snapshot.get("page_url"), 240)
+    page_text = _ptr_normalize_ai_extract_text(snapshot.get("page_text"), 4000)
+    if page_title:
+        compact["page_title"] = page_title
+    if page_url:
+        compact["page_url"] = page_url
+    if page_text:
+        compact["page_text"] = page_text
+
+    raw_tables = snapshot.get("oracle_tables")
+    if isinstance(raw_tables, list):
+        tables: list[dict[str, Any]] = []
+        for table in raw_tables[:2]:
+            if not isinstance(table, dict):
+                continue
+            headers = [
+                _ptr_normalize_ai_extract_text(item, 120)
+                for item in (table.get("headers") or [])[:12]
+                if _ptr_normalize_ai_extract_text(item, 120)
+            ]
+            rows: list[list[str]] = []
+            for row in (table.get("rows") or [])[:5]:
+                if not isinstance(row, list):
+                    continue
+                compact_row = [
+                    _ptr_normalize_ai_extract_text(cell, 160)
+                    for cell in row[: max(1, len(headers) or 12)]
+                ]
+                if any(compact_row):
+                    rows.append(compact_row)
+            if headers or rows:
+                tables.append({"headers": headers, "rows": rows})
+        if tables:
+            compact["oracle_tables"] = tables
+
+    semantics = snapshot.get("page_semantics")
+    if isinstance(semantics, dict):
+        label_values: list[dict[str, str]] = []
+        for item in (semantics.get("label_values") or [])[:20]:
+            if not isinstance(item, dict):
+                continue
+            label = _ptr_normalize_ai_extract_text(item.get("label"), 120)
+            value = _ptr_normalize_ai_extract_text(item.get("value"), 180)
+            if label and value:
+                label_values.append({"label": label, "value": value})
+
+        text_candidates: list[str] = []
+        for item in (semantics.get("text_candidates") or [])[:30]:
+            if not isinstance(item, dict):
+                continue
+            text = (
+                _ptr_normalize_ai_extract_text(item.get("text"), 160)
+                or _ptr_normalize_ai_extract_text(item.get("title"), 160)
+                or _ptr_normalize_ai_extract_text(item.get("aria_label"), 160)
+            )
+            if text:
+                text_candidates.append(text)
+
+        dialogs: list[dict[str, str]] = []
+        for item in (semantics.get("dialogs") or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            title = _ptr_normalize_ai_extract_text(item.get("title"), 160)
+            text = _ptr_normalize_ai_extract_text(item.get("text"), 600)
+            if title or text:
+                dialogs.append({"title": title, "text": text})
+
+        if label_values or text_candidates or dialogs:
+            compact["page_semantics"] = {}
+            if label_values:
+                compact["page_semantics"]["label_values"] = label_values
+            if text_candidates:
+                compact["page_semantics"]["text_candidates"] = text_candidates
+            if dialogs:
+                compact["page_semantics"]["dialogs"] = dialogs
+
+    return compact
+
+
+def _ptr_build_ai_extract_prompt(
+    instruction: str,
+    snapshot_context: dict[str, Any] | None = None,
+    *,
+    has_screenshot: bool = False,
+) -> str:
+    parts = [
+        f"Requested extraction: {instruction}",
+        'Return JSON only in the form {"value": "<the exact value>"}.',
+        "Prefer explicit values from Oracle table rows, label-value pairs, dialogs, links, and visible page text.",
+        "If the request mentions ordering such as first row or second row, preserve that ordering exactly.",
+    ]
+    if snapshot_context:
+        parts.append("Structured page evidence:")
+        parts.append(json.dumps(snapshot_context, ensure_ascii=False))
+    if has_screenshot:
+        parts.append("A full-page screenshot is attached. Use it together with the structured page evidence.")
+    return "\n".join(parts)
+
+
+def _ptr_ai_extract(page: Page, name: str, prompt: str) -> str:
+    """Capture the current page and ask the vision LLM for the value described by
+    ``prompt``; store it under ``name`` for later ``{{name}}`` substitution and as
+    a flow-context output. Raises if AI is unavailable or returns an empty value."""
+    output_name = str(name or "").strip()
+    instruction = str(prompt or "").strip()
+    if not output_name:
+        raise ValueError("ai_extract requires a non-empty value name.")
+    if not instruction:
+        raise ValueError(f"ai_extract('{output_name}', ...) requires a non-empty prompt.")
+
+    endpoint = f"{_ptr_openai_base_url()}/responses"
+    model = _ptr_ai_self_repair_model()
+    interaction: dict[str, Any] = {
+        "feature": "ai_extract",
+        "label": output_name,
+        "model": model,
+        "endpoint": endpoint,
+        "system_prompt": _PTR_AI_EXTRACT_SYSTEM_PROMPT,
+        "user_prompt": instruction,
+    }
+
+    if not _ptr_ai_self_repair_enabled():
+        interaction["status"] = "disabled"
+        interaction["error"] = "ai_extract is unavailable: AI is disabled or OPENAI_API_KEY is missing."
+        _ptr_record_ai_interaction(interaction)
+        raise RuntimeError(
+            f"ai_extract('{output_name}') failed: AI is disabled or OPENAI_API_KEY is missing."
+        )
+
+    current_page = page or _PTR_LAST_PAGE
+    screenshot_context = _ptr_capture_ai_extract_context_screenshot(current_page) if current_page is not None else {}
+    snapshot_context: dict[str, Any] = {}
+    if current_page is not None:
+        snapshot_context = _ptr_compact_ai_extract_snapshot(dict(_PTR_LAST_PAGE_SNAPSHOT))
+        if not snapshot_context:
+            try:
+                snapshot_context = _ptr_compact_ai_extract_snapshot(_ptr_capture_page_snapshot(current_page))
+            except Exception:
+                snapshot_context = _ptr_compact_ai_extract_snapshot(dict(_PTR_LAST_PAGE_SNAPSHOT))
+    else:
+        snapshot_context = _ptr_compact_ai_extract_snapshot(dict(_PTR_LAST_PAGE_SNAPSHOT))
+    if screenshot_context:
+        interaction["page_screenshot"] = _ptr_clone_json_value(screenshot_context)
+    if snapshot_context:
+        interaction["page_snapshot"] = _ptr_clone_json_value(snapshot_context)
+
+    has_screenshot = str((screenshot_context or {}).get("status") or "").strip() == "captured"
+    user_content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": _ptr_build_ai_extract_prompt(
+                instruction,
+                snapshot_context,
+                has_screenshot=has_screenshot,
+            ),
+        }
+    ]
+    if has_screenshot:
+        image_url = str((screenshot_context or {}).get("image_url") or "").strip()
+        if image_url:
+            user_content.append({"type": "input_image", "image_url": image_url})
+
+    interaction["status"] = "requested"
+    _ptr_record_ai_interaction(interaction)
+    _ptr_record_strategy_attempt("ai_extract")
+
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": _PTR_AI_EXTRACT_SYSTEM_PROMPT}]},
+            {"role": "user", "content": user_content},
+        ],
+        "text": {"format": {"type": "json_object"}},
+        "max_output_tokens": 200,
+    }
+    request = Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {get_runner_env_value('OPENAI_API_KEY')}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    response_body = ""
+    try:
+        timeout_s = max(5.0, _ptr_wait_ms("PTR_AI_SELF_REPAIR_TIMEOUT_MS", 15000) / 1000.0)
+        with urlopen(request, timeout=timeout_s) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            parsed = json.loads(response_body)
+            _ptr_update_last_ai_interaction(
+                {
+                    "http_status": int(getattr(response, "status", 0) or 0),
+                    "api_response_body": response_body,
+                }
+            )
+    except HTTPError as exc:
+        error_body = ""
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = ""
+        _ptr_update_last_ai_interaction(
+            {"status": "request_error", "error_type": type(exc).__name__, "error": str(exc), "error_response_body": error_body}
+        )
+        raise RuntimeError(f"ai_extract('{output_name}') failed: AI request error: {exc}") from exc
+    except Exception as exc:
+        _ptr_update_last_ai_interaction(
+            {"status": "request_error", "error_type": type(exc).__name__, "error": str(exc), "api_response_body": response_body}
+        )
+        raise RuntimeError(f"ai_extract('{output_name}') failed: AI request error: {exc}") from exc
+
+    response_text = _ptr_extract_ai_output_text(parsed)
+    _ptr_update_last_ai_interaction({"response_text": response_text})
+
+    value = ""
+    try:
+        parsed_response = _ptr_parse_ai_json_response(response_text)
+        _ptr_update_last_ai_interaction({"parsed_response": parsed_response})
+        if isinstance(parsed_response, dict) and parsed_response.get("value") is not None:
+            value = str(parsed_response.get("value")).strip()
+    except Exception:
+        value = str(response_text or "").strip()
+
+    if not value:
+        _ptr_update_last_ai_interaction({"status": "empty", "extracted_value": ""})
+        raise RuntimeError(
+            f"ai_extract('{output_name}') returned an empty value for prompt: {instruction}"
+        )
+
+    _PTR_AI_EXTRACTED[output_name] = value
+    _ptr_write_ai_extracted_outputs()
+    _ptr_update_last_ai_interaction(
+        {"status": "success", "extracted_name": output_name, "extracted_value": value}
+    )
+    return value
 
 
 def _ptr_ai_text_matches_label(value: Any, label: str) -> bool:
@@ -4331,17 +5103,23 @@ def _ptr_tracked_raw_action(
 
 
 def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper: str, postcondition):
+    requested_label = str(label or "").strip()
+    resolved_label = _ptr_resolve(requested_label)
+    if resolved_label is None:
+        resolved_label = requested_label
+    label = str(resolved_label).strip() or requested_label
+
     before = _ptr_observe(page, locator)
-    debug_trace = _ptr_update_debug_detail(
-        "click_with_candidates",
-        {
-            "helper": helper,
-            "label": label,
-            "status": "strict_attempt",
-            "before": _ptr_debug_observation_summary(before),
-            "experience_attempts": [],
-        },
-    )
+    debug_payload = {
+        "helper": helper,
+        "label": label,
+        "status": "strict_attempt",
+        "before": _ptr_debug_observation_summary(before),
+        "experience_attempts": [],
+    }
+    if requested_label and requested_label != label:
+        debug_payload["requested_label"] = requested_label
+    debug_trace = _ptr_update_debug_detail("click_with_candidates", debug_payload)
     try:
         _ptr_strict_click(locator)
         after = _ptr_observe(page, locator)
@@ -4561,6 +5339,41 @@ def _ptr_click_with_candidates(page: Page, label: str, locator: Locator, helper:
             )
             return
             debug_trace["oracle_guided_action_card"] = {"status": "not_applied"}
+
+        if helper in {"click_button_target", "click_numeric_button_target"}:
+            warning_dialog_recovery = _ptr_try_dismiss_oracle_warning_dialog(
+                page,
+                locator,
+                label,
+                last_error,
+                observation=before,
+            )
+            if warning_dialog_recovery:
+                debug_trace["oracle_warning_dialog_dismiss"] = {
+                    "status": "validated",
+                    "details": _ptr_clone_json_value(warning_dialog_recovery),
+                }
+                debug_trace["resolved_by"] = "oracle_warning_dialog_dismiss"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("click_with_candidates", debug_trace)
+                _ptr_set_recovery_record(
+                    "oracle_handler",
+                    "warning_dialog_dismiss",
+                    "oracle_warning_dialog_dismiss",
+                    warning_dialog_recovery,
+                )
+                _ptr_store_experience_episode(
+                    action_type=helper,
+                    label=label,
+                    page=page,
+                    locator=locator,
+                    error=last_error,
+                    status="success",
+                    postcondition_kind="warning_dialog_dismissed",
+                    postcondition_passed=True,
+                )
+                return
+            debug_trace["oracle_warning_dialog_dismiss"] = {"status": "not_applied"}
 
         if helper == "click_button_target":
             optional_warning_skip = _ptr_try_skip_optional_oracle_warning_ok(
@@ -4793,6 +5606,41 @@ def _ptr_fill_textbox(locator: Locator, current_page: Page, label: str, value: s
             }
         if "oracle_table_active_editor_fill" not in debug_trace:
             debug_trace["oracle_table_active_editor_fill"] = {"status": "not_applied"}
+        try:
+            oracle_spinbutton_recovery = _ptr_try_oracle_spinbutton_fill(current_page, locator, label, value)
+            if oracle_spinbutton_recovery:
+                debug_trace["oracle_spinbutton_fill"] = {
+                    "status": "validated",
+                    "details": _ptr_clone_json_value(oracle_spinbutton_recovery),
+                }
+                debug_trace["resolved_by"] = "oracle_spinbutton_fill"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("fill_textbox", debug_trace)
+                _ptr_set_recovery_record(
+                    "oracle_handler",
+                    "oracle_spinbutton_fill",
+                    "oracle_spinbutton_fill",
+                    oracle_spinbutton_recovery,
+                )
+                _ptr_store_experience_episode(
+                    action_type="fill_textbox",
+                    label=label,
+                    page=current_page,
+                    locator=locator,
+                    error=direct_exc,
+                    status="success",
+                    postcondition_kind="field_value_changed",
+                    postcondition_passed=True,
+                )
+                return
+        except Exception as exc:
+            last_error = exc
+            debug_trace["oracle_spinbutton_fill"] = {
+                "status": "failed",
+                "error": _ptr_trim_debug_text(exc, 320),
+            }
+        if "oracle_spinbutton_fill" not in debug_trace:
+            debug_trace["oracle_spinbutton_fill"] = {"status": "not_applied"}
         for strategy_name, experience_locator, episode in _ptr_experience_repair_locators(current_page, "fill_textbox", label, direct_exc, locator=locator):
             try:
                 _ptr_record_strategy_attempt(strategy_name)
@@ -5223,6 +6071,60 @@ def _ptr_resolve_select_target(locator: Locator, option_args: list[Any] | None, 
     return {}
 
 
+def _ptr_resolve_select_option_by_committed_marker(locator: Locator, state: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _ptr_safe_locator_eval(
+        locator,
+        r"""(node) => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const options = Array.from(node?.options || []);
+            return {
+                options: options.map((option) => ({
+                    index: Number(option?.index),
+                    value: normalize(option?.value),
+                    label: normalize(option?.label || option?.innerText || option?.textContent),
+                })),
+            };
+        }""",
+    )
+    if not isinstance(snapshot, dict):
+        return {}
+
+    raw_options = snapshot.get("options") or []
+    options: list[dict[str, Any]] = []
+    for raw_option in raw_options if isinstance(raw_options, list) else []:
+        if not isinstance(raw_option, dict):
+            continue
+        try:
+            option_index = int(raw_option.get("index"))
+        except Exception:
+            continue
+        options.append(
+            {
+                "index": option_index,
+                "value": str(raw_option.get("value") or "").strip(),
+                "label": str(raw_option.get("label") or "").strip(),
+            }
+        )
+
+    committed_afov = _ptr_normalize_text((state or {}).get("afov"))
+    if committed_afov:
+        for option in options:
+            option_value = str(option.get("value") or "").strip()
+            if option_value and _ptr_value_matches(committed_afov, option_value):
+                return _ptr_clone_json_value(option)
+            if committed_afov == str(option.get("index")):
+                return _ptr_clone_json_value(option)
+
+    committed_title = _ptr_normalize_text((state or {}).get("title"))
+    if committed_title:
+        for option in options:
+            option_label = str(option.get("label") or "").strip()
+            if option_label and _ptr_value_matches(committed_title, option_label):
+                return _ptr_clone_json_value(option)
+
+    return {}
+
+
 def _ptr_oracle_adf_commit_events(locator: Locator) -> bool:
     result = _ptr_safe_locator_eval(
         locator,
@@ -5242,6 +6144,118 @@ def _ptr_oracle_adf_commit_events(locator: Locator) -> bool:
         }""",
     )
     return bool(result)
+
+
+def _ptr_try_oracle_adf_component_commit(locator: Locator, target: dict[str, Any]) -> dict[str, Any] | None:
+    target_value = str(target.get("value") or "").strip()
+    target_label = str(target.get("label") or "").strip()
+    target_index = target.get("index")
+    if isinstance(target_index, bool):
+        target_index = int(target_index)
+    elif not isinstance(target_index, int):
+        try:
+            target_index = int(target_index)
+        except Exception:
+            target_index = -1
+
+    result = _ptr_safe_locator_eval(
+        locator,
+        r"""(node, payload) => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            if (!node) return { ok: false, reason: "missing_node" };
+            const contentId = String(node.id || "").trim();
+            const baseId = contentId.endsWith("::content") ? contentId.slice(0, -"::content".length) : contentId;
+            const win = node.ownerDocument?.defaultView || window;
+            const adfPage = win?.AdfPage?.PAGE || null;
+            const component = (
+                adfPage?.findComponentByAbsoluteId?.(baseId)
+                || adfPage?.findComponent?.(baseId)
+                || null
+            );
+            if (!component) {
+                return { ok: false, reason: "missing_component", base_id: baseId, content_id: contentId };
+            }
+
+            const targetValue = normalize(payload?.value);
+            const targetIndex = Number(payload?.index);
+            const used = [];
+
+            try { node.focus?.(); used.push("focus"); } catch (error) {}
+            try {
+                if (Number.isInteger(targetIndex) && node.options && targetIndex >= 0 && targetIndex < node.options.length) {
+                    node.selectedIndex = targetIndex;
+                    used.push("selectedIndex");
+                } else if (targetValue) {
+                    node.value = targetValue;
+                    used.push("value");
+                }
+            } catch (error) {}
+
+            const fire = (name) => {
+                try {
+                    node.dispatchEvent(new Event(name, { bubbles: true, cancelable: true }));
+                    used.push(`event:${name}`);
+                } catch (error) {}
+            };
+
+            fire("input");
+            fire("change");
+
+            try {
+                if (typeof component.setValue === "function" && targetValue) {
+                    component.setValue(targetValue);
+                    used.push("component.setValue");
+                }
+            } catch (error) {}
+
+            try {
+                if (typeof component.processUpdates === "function") {
+                    component.processUpdates(node);
+                    used.push("component.processUpdates");
+                }
+            } catch (error) {}
+
+            try {
+                if (typeof component._handleBlur === "function") {
+                    component._handleBlur();
+                    used.push("component._handleBlur");
+                }
+            } catch (error) {}
+
+            try {
+                if (win?.AdfCustomEvent?.queue) {
+                    win.AdfCustomEvent.queue(component, "valueChange", { value: targetValue }, true);
+                    used.push("AdfCustomEvent.queue");
+                }
+            } catch (error) {}
+
+            fire("blur");
+            fire("focusout");
+
+            return {
+                ok: true,
+                base_id: baseId,
+                content_id: contentId,
+                used,
+            };
+        }""",
+        {
+            "value": target_value,
+            "index": target_index,
+        },
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+
+    return {
+        "strategy_name": "oracle_adf_select_component_commit",
+        "component_id": str(result.get("base_id") or "").strip(),
+        "content_id": str(result.get("content_id") or "").strip(),
+        "used": _ptr_clone_json_value(result.get("used") or []),
+        "target_index": target_index,
+        "target_value": target_value,
+        "target_label": target_label,
+    }
 
 
 def _ptr_reset_select_to_index(locator: Locator, index: int) -> bool:
@@ -5273,7 +6287,42 @@ def _ptr_try_commit_oracle_adf_select(
     timeout_ms = _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
     wait_ms = _ptr_wait_ms("PTR_ADF_SELECT_COMMIT_WAIT_MS", 250)
     target = _ptr_resolve_select_target(locator, option_args, option_kwargs)
+    if not target:
+        def _compact_text(value: Any) -> str:
+            return " ".join(str(value or "").split())
+
+        contradicted_index = _ptr_primary_selected_index(contradicted_state)
+        contradicted_value = _compact_text(contradicted_state.get("value"))
+        selected_values = [
+            _compact_text(value) for value in list(contradicted_state.get("selected_values") or [])
+            if _compact_text(value)
+        ]
+        selected_labels = [
+            _compact_text(value) for value in list(contradicted_state.get("selected_labels") or [])
+            if _compact_text(value)
+        ]
+        fallback_value = contradicted_value or (selected_values[0] if selected_values else "")
+        fallback_label = selected_labels[0] if selected_labels else ""
+        if contradicted_index is not None or fallback_value or fallback_label:
+            target = {
+                "index": contradicted_index if contradicted_index is not None else -1,
+                "value": fallback_value,
+                "label": fallback_label,
+            }
     before_index = _ptr_primary_selected_index(before_state)
+    inferred_committed_option: dict[str, Any] = {}
+    if before_index is None:
+        inferred_committed_option = _ptr_resolve_select_option_by_committed_marker(locator, contradicted_state)
+        inferred_index = inferred_committed_option.get("index")
+        if isinstance(inferred_index, bool):
+            before_index = int(inferred_index)
+        elif isinstance(inferred_index, int):
+            before_index = inferred_index
+        else:
+            try:
+                before_index = int(inferred_index)
+            except Exception:
+                before_index = None
     target_index = target.get("index")
     if isinstance(target_index, bool):
         target_index = int(target_index)
@@ -5304,12 +6353,33 @@ def _ptr_try_commit_oracle_adf_select(
             )
             keyboard_state = _ptr_select_option_state(locator)
             if _ptr_select_option_postcondition(before_state, keyboard_state, option_args, option_kwargs):
-                return {
+                details = {
                     "strategy_name": "oracle_adf_select_keyboard_commit",
                     "target_index": target_index,
                     "target_value": str(target.get("value") or "").strip(),
                     "target_label": str(target.get("label") or "").strip(),
                 }
+                if inferred_committed_option:
+                    details["committed_index_source"] = "adf_marker"
+                    details["committed_value"] = str(inferred_committed_option.get("value") or "").strip()
+                    details["committed_label"] = str(inferred_committed_option.get("label") or "").strip()
+                return details
+
+    component_details = _ptr_try_oracle_adf_component_commit(locator, target)
+    if component_details:
+        current_page.wait_for_timeout(wait_ms)
+        _ptr_wait_for_field_processing(
+            current_page,
+            env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+            default_ms=5000,
+        )
+        component_state = _ptr_select_option_state(locator)
+        if _ptr_select_option_postcondition(before_state, component_state, option_args, option_kwargs):
+            if inferred_committed_option:
+                component_details["committed_index_source"] = "adf_marker"
+                component_details["committed_value"] = str(inferred_committed_option.get("value") or "").strip()
+                component_details["committed_label"] = str(inferred_committed_option.get("label") or "").strip()
+            return component_details
 
     if _ptr_oracle_adf_commit_events(locator):
         current_page.wait_for_timeout(wait_ms)
@@ -5610,13 +6680,48 @@ def _ptr_select_option_target(
         direct_postcondition = _ptr_select_option_postcondition(before_state, after_state, option_args, option_kwargs)
         debug_trace["after_state"] = _ptr_clone_json_value(after_state)
         debug_trace["direct_postcondition_passed"] = direct_postcondition
+        after_state_contradicted = _ptr_adf_select_commit_contradicted(after_state)
+        debug_trace["adf_commit_contradicted"] = after_state_contradicted
         _ptr_set_debug_detail("select_option_target", debug_trace)
         if direct_postcondition:
             return
+        oracle_recovery = None
+        if after_state_contradicted:
+            oracle_recovery = _ptr_try_commit_oracle_adf_select(
+                locator,
+                current_page,
+                before_state,
+                option_args,
+                option_kwargs,
+            )
+            debug_trace["oracle_adf_commit_recovery"] = _ptr_clone_json_value(oracle_recovery)
+            _ptr_set_debug_detail("select_option_target", debug_trace)
+            if oracle_recovery:
+                _ptr_set_recovery_record(
+                    "oracle_handler",
+                    "oracle_adf_select_commit",
+                    "oracle_adf_select_commit",
+                    oracle_recovery,
+                )
+                _ptr_store_experience_episode(
+                    action_type="select_option_target",
+                    label=label,
+                    page=current_page,
+                    locator=locator,
+                    error=None,
+                    status="success",
+                    postcondition_kind="option_selected",
+                    postcondition_passed=True,
+                )
+                return
         semantic_target = initial_target or _ptr_resolve_select_target(locator, option_args, option_kwargs)
         semantic_label = str(semantic_target.get("label") or "").strip()
         debug_trace["semantic_target"] = _ptr_clone_json_value(semantic_target)
-        semantic_match = bool(semantic_label) and _ptr_oracle_label_value_matches(current_page, label, semantic_label)
+        semantic_match = (
+            not after_state_contradicted
+            and bool(semantic_label)
+            and _ptr_oracle_label_value_matches(current_page, label, semantic_label)
+        )
         debug_trace["semantic_label_match"] = semantic_match
         _ptr_set_debug_detail("select_option_target", debug_trace)
         if semantic_match:
@@ -5640,33 +6745,9 @@ def _ptr_select_option_target(
                 postcondition_passed=True,
             )
             return
-        oracle_recovery = _ptr_try_commit_oracle_adf_select(
-            locator,
-            current_page,
-            before_state,
-            option_args,
-            option_kwargs,
-        )
-        debug_trace["oracle_adf_commit_recovery"] = _ptr_clone_json_value(oracle_recovery)
-        _ptr_set_debug_detail("select_option_target", debug_trace)
-        if oracle_recovery:
-            _ptr_set_recovery_record(
-                "oracle_handler",
-                "oracle_adf_select_commit",
-                "oracle_adf_select_commit",
-                oracle_recovery,
-            )
-            _ptr_store_experience_episode(
-                action_type="select_option_target",
-                label=label,
-                page=current_page,
-                locator=locator,
-                error=None,
-                status="success",
-                postcondition_kind="option_selected",
-                postcondition_passed=True,
-            )
-            return
+        if "oracle_adf_commit_recovery" not in debug_trace:
+            debug_trace["oracle_adf_commit_recovery"] = None
+            _ptr_set_debug_detail("select_option_target", debug_trace)
         oracle_searchselect_recovery = _ptr_try_oracle_searchselect_select_option_recovery(
             locator,
             current_page,
@@ -6477,6 +7558,147 @@ def _ptr_wait_for_oracle_searchselect_query(
         page.wait_for_timeout(min(100, max(1, int((deadline - time.time()) * 1000))))
 
 
+def _ptr_try_oracle_lov_trigger_direct_entry(
+    trigger: Locator,
+    current_page: Page,
+    title: str,
+    option_name: str,
+    *,
+    fill_value: str | None = None,
+) -> dict[str, Any] | None:
+    normalized_title = str(title or "").strip()
+    if not normalized_title.lower().startswith("search:"):
+        return None
+
+    field_label = normalized_title.split(":", 1)[1].strip()
+    requested_value = str(fill_value or option_name or "").strip()
+    if not field_label or not requested_value:
+        return None
+
+    metadata = _ptr_extract_locator_metadata(trigger)
+    trigger_id = str(metadata.get("id") or "").strip()
+    candidate_builders: list[tuple[str, Locator]] = []
+
+    page_locator = getattr(current_page, "locator", None)
+    if trigger_id.endswith("::lovIconId") and callable(page_locator):
+        base_id = trigger_id[: -len("::lovIconId")]
+        if base_id:
+            candidate_builders.append(
+                (
+                    "oracle_lov_icon_content_id",
+                    current_page.locator(f'[id="{base_id}::content"]'),
+                )
+            )
+
+    get_by_role = getattr(current_page, "get_by_role", None)
+    if callable(get_by_role):
+        try:
+            candidate_builders.append(
+                ("oracle_lov_combobox_label", current_page.get_by_role("combobox", name=field_label, exact=True))
+            )
+        except Exception:
+            pass
+        try:
+            candidate_builders.append(
+                ("oracle_lov_textbox_label", current_page.get_by_role("textbox", name=field_label, exact=True))
+            )
+        except Exception:
+            pass
+
+    timeout_ms = _ptr_wait_ms("PTR_ACTION_TIMEOUT_MS", 3000)
+    for strategy_name, candidate in candidate_builders:
+        try:
+            resolved = candidate.first if hasattr(candidate, "first") else candidate
+            candidate_metadata = _ptr_extract_locator_metadata(resolved)
+            candidate_tag = str(candidate_metadata.get("tag") or "").strip().lower()
+            candidate_role = str(candidate_metadata.get("role") or "").strip().lower()
+            if candidate_tag not in {"input", "textarea", "select"} and candidate_role not in {"combobox", "textbox"}:
+                continue
+            if str(candidate_metadata.get("disabled") or "").strip().lower() == "true":
+                continue
+            if str(candidate_metadata.get("aria_disabled") or "").strip().lower() == "true":
+                continue
+            if not _ptr_locator_visible(resolved, timeout_ms=300):
+                continue
+
+            _ptr_record_strategy_attempt(strategy_name)
+            _ptr_enter_search_value(
+                resolved,
+                requested_value,
+                timeout_ms=_ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000),
+                current_page=current_page,
+                label=field_label,
+            )
+            try:
+                resolved.press("Tab", timeout=timeout_ms)
+            except TypeError:
+                resolved.press("Tab")
+            current_page.wait_for_timeout(_ptr_wait_ms("PTR_LOV_DIRECT_ENTRY_COMMIT_WAIT_MS", 350))
+            _ptr_wait_for_field_processing(
+                current_page,
+                env_name="PTR_DROPDOWN_CHANGE_PROCESSING_WAIT_MS",
+                default_ms=5000,
+            )
+            observed = _ptr_locator_value(resolved) or _ptr_locator_text(resolved)
+            if _ptr_value_matches(option_name, observed) or _ptr_oracle_label_value_matches(current_page, field_label, option_name):
+                return {
+                    "strategy_name": strategy_name,
+                    "field_label": field_label,
+                    "requested_value": requested_value,
+                    "observed_value": observed,
+                }
+        except Exception:
+            continue
+    return None
+
+
+def _ptr_wait_for_search_option_surface(
+    page: Page | None,
+    option: Locator,
+    *,
+    timeout_ms: int | None = None,
+) -> dict[str, bool]:
+    timeout = _ptr_resolve_wait_override_ms(timeout_ms, "PTR_SEARCH_SURFACE_TIMEOUT_MS", 1500)
+    deadline = time.time() + max(timeout, 0) / 1000.0
+    poll_ms = max(100, _ptr_wait_ms("PTR_SEARCH_SURFACE_POLL_MS", 150))
+
+    while True:
+        option_visible = _ptr_locator_visible(option, timeout_ms=min(250, max(timeout, 0)))
+        popup_open = bool(
+            _ptr_safe_page_eval(
+                page,
+                r"""(selectors) => {
+                    const isVisible = (node) => {
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        if (!style) return false;
+                        if (style.display === "none" || style.visibility === "hidden") return false;
+                        const rect = node.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+
+                    for (const selector of selectors || []) {
+                        const nodes = Array.from(document.querySelectorAll(selector.replace(/:visible/g, "")));
+                        if (nodes.some(isVisible)) return true;
+                    }
+                    return false;
+                }""",
+                list(_PTR_POPUP_SCOPE_SELECTORS),
+            )
+        )
+        if option_visible or popup_open or time.time() >= deadline:
+            return {
+                "option_visible": option_visible,
+                "popup_open": popup_open,
+            }
+        if page is None:
+            return {
+                "option_visible": option_visible,
+                "popup_open": popup_open,
+            }
+        page.wait_for_timeout(min(poll_ms, max(1, int((deadline - time.time()) * 1000))))
+
+
 def _ptr_select_search_trigger_option(
     trigger: Locator,
     option: Locator,
@@ -6503,6 +7725,7 @@ def _ptr_select_search_trigger_option(
     )
     search_timeout_ms = _ptr_wait_ms("PTR_TEXT_ENTRY_TIMEOUT_MS", 3000)
     raw_option_timeout_ms = _ptr_wait_ms("PTR_SEARCH_RESULT_TIMEOUT_MS", 6000)
+    option_candidate_timeout_ms = _ptr_wait_ms("PTR_SEARCH_OPTION_CANDIDATE_TIMEOUT_MS", 1500)
     option_already_visible = False
     if fill_value is not None:
         _ptr_enter_search_value(
@@ -6591,6 +7814,62 @@ def _ptr_select_search_trigger_option(
             f'Oracle search-select "{title}" returned no matches for query "{query_text}" '
             f'while looking for option "{option_name}". Visible state: {visible_state}'
         )
+    search_surface = {"option_visible": False, "popup_open": False}
+    oracle_lov_direct_entry: dict[str, Any] | None = None
+    if fill_value is None and not bool(oracle_search_state.get("open")):
+        search_surface = _ptr_wait_for_search_option_surface(
+            current_page,
+            option,
+            timeout_ms=_ptr_wait_ms("PTR_SEARCH_SURFACE_TIMEOUT_MS", 1500),
+        )
+        debug_trace["search_surface"] = dict(search_surface)
+        if not search_surface.get("option_visible") and not search_surface.get("popup_open"):
+            oracle_lov_direct_entry = _ptr_try_oracle_lov_trigger_direct_entry(
+                trigger,
+                current_page,
+                title,
+                option_name,
+                fill_value=fill_value,
+            )
+            if oracle_lov_direct_entry:
+                debug_trace["oracle_lov_direct_entry"] = {
+                    "status": "validated",
+                    "details": _ptr_clone_json_value(oracle_lov_direct_entry),
+                }
+                debug_trace["resolved_by"] = "oracle_lov_direct_entry"
+                debug_trace["status"] = "success"
+                _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
+                _ptr_set_recovery_record(
+                    "oracle_handler",
+                    "oracle_lov_direct_entry",
+                    "oracle_lov_direct_entry",
+                    {
+                        "title": title,
+                        "option_name": option_name,
+                        **oracle_lov_direct_entry,
+                    },
+                )
+                _ptr_store_experience_episode(
+                    action_type="select_search_trigger_option",
+                    label=str(option_name or "").strip(),
+                    page=current_page,
+                    locator=trigger,
+                    error=None,
+                    status="success",
+                    postcondition_kind="option_selected",
+                    postcondition_passed=True,
+                )
+                return
+            debug_trace["oracle_lov_direct_entry"] = {"status": "not_applied"}
+            debug_trace["status"] = "failed"
+            debug_trace["final_error"] = _ptr_trim_debug_text(
+                f'Search trigger "{title}" did not open a visible search surface for option "{option_name}".',
+                320,
+            )
+            _ptr_set_debug_detail("select_search_trigger_option", debug_trace)
+            raise RuntimeError(
+                f'Search trigger "{title}" did not open a visible search surface for option "{option_name}".'
+            )
     last_error: Exception | None = None
     option_target = str(option_name or "").strip()
     option_candidates = [
@@ -6610,7 +7889,7 @@ def _ptr_select_search_trigger_option(
             resolved = candidate.first if hasattr(candidate, "first") else candidate
             _ptr_record_strategy_attempt(strategy_name)
             before = _ptr_observe(current_page, resolved)
-            timeout_ms = raw_option_timeout_ms if strategy_name == "raw_option" else None
+            timeout_ms = raw_option_timeout_ms if strategy_name == "raw_option" else option_candidate_timeout_ms
             _ptr_strict_click(resolved, timeout_ms=timeout_ms)
             current_page.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))
             after = _ptr_observe(current_page, resolved)
@@ -6854,7 +8133,12 @@ def _ptr_select_adf_menu_panel_option(
     option_candidates = _ptr_menu_panel_option_candidates(current_page, option, option_name)
     if is_completion:
         option_candidates = option_candidates[:2]
-    if not _ptr_wait_for_oracle_menu_trigger_option_visibility(current_page, option_candidates, trigger_label):
+    menu_option_visible = _ptr_wait_for_oracle_menu_trigger_option_visibility(
+        current_page,
+        option_candidates,
+        trigger_label,
+    )
+    if not menu_option_visible and not is_completion:
         debug_trace["status"] = "failed"
         debug_trace["final_error"] = _ptr_trim_debug_text(
             _ptr_menu_trigger_failure_message(trigger_label, option_name),
@@ -6862,6 +8146,11 @@ def _ptr_select_adf_menu_panel_option(
         )
         _ptr_set_debug_detail("select_adf_menu_panel_option", debug_trace)
         raise RuntimeError(_ptr_menu_trigger_failure_message(trigger_label, option_name))
+    if not menu_option_visible and is_completion:
+        debug_trace["menu_visibility_probe"] = "not_visible_continuing_with_completion_candidates"
+        popup_candidates = _ptr_oracle_visible_popup_option_candidates(current_page, option_name)
+        if popup_candidates:
+            option_candidates = popup_candidates + option_candidates
     last_error: Exception | None = None
     semantic_failure_after_click = False
     option_target = str(option_name or "").strip()
@@ -6953,7 +8242,10 @@ def _ptr_select_adf_menu_panel_option(
                     }
                 )
     if last_error is None:
-        last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
+        if is_completion:
+            last_error = RuntimeError(_ptr_menu_trigger_failure_message(trigger_label, option_name))
+        else:
+            last_error = RuntimeError(_ptr_menu_option_failure_message(trigger_label, option_name))
     if semantic_failure_after_click:
         debug_trace["status"] = "failed"
         debug_trace["final_error"] = _ptr_trim_debug_text(last_error, 320)

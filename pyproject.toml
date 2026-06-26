@@ -1,6 +1,6 @@
 [project]
 name = "test-runner"
-version = "3.0.10"
+version = "4.0.16"
 description = "Aetherion agent for executing Playwright-generated Python scripts as test suites"
 authors = [{ name = "Calfus Inc.", email = "cloudops@calfus.com" }]
 requires-python = ">=3.12.10,<3.13"

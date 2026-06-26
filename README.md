@@ -44,6 +44,54 @@ Environment variables:
 - `OPENAI_FAILURE_SUMMARY_ENABLED=false` disables the feature without removing the key.
 - `OPENAI_BASE_URL` optionally points to a compatible Responses API base URL.
 
+## AI extraction in recordings (`ai_extract`)
+
+Playwright recordings can read a value straight off the rendered page with a
+vision-LLM call, for cases where no stable locator or parameter exists (e.g. the
+transaction number of the first row in a freshly loaded table).
+
+In the recording, call it as a top-level statement:
+
+```python
+ai_extract("transaction_number", "extract the transaction number from the first row of the table")
+```
+
+- First argument is the **name** to store the value under; second is the
+  **prompt** describing what to read. (Order mirrors `api_helpers.extract(name, value)`.)
+- At that point in the run, the runner settles the page, screenshots it, sends
+  the screenshot + prompt to the vision model, and stores the returned value.
+- **Do not import `ai_extract`** — it is rewritten by the AST pipeline, not a
+  module function.
+
+Using the extracted value:
+
+- **Same recording** — reference `{{transaction_number}}` later in the *same*
+  script (e.g. inside a locator name or fill value). It resolves at runtime:
+
+  ```python
+  page.get_by_role("link", name="{{transaction_number}}").click()
+  ```
+
+- **Another recording** — the value is published to the run's extracted outputs /
+  Flow Context, so a later recording in a **sequential** suite can consume it the
+  same way it consumes any upstream output.
+
+Requirements:
+
+- `OPENAI_API_KEY` must be set, and `PTR_AI_SELF_REPAIR_ENABLED=true` (the AI gate
+  this feature shares). If either is missing, the step fails rather than silently
+  skipping.
+- If a slow page (e.g. an Oracle work area) is captured before it finishes
+  rendering, raise the recording's `after_action_wait_ms` (or
+  `PTR_AFTER_ACTION_WAIT_MS`) so the screenshot matches the visible step.
+
+Troubleshooting:
+
+- `NameError: name 'ai_extract' is not defined` in a report means the run executed
+  your **raw recording** because AST preparation was skipped — almost always a
+  **stale worker** running code from before `ai_extract` existed. Restart the
+  worker (or republish the image) from current source. It is never a missing import.
+
 ## Design docs
 
 - [`RUNNER_EXPERIENCE_SYSTEM.md`](/Users/shubhammore/Documents/act-v2/test_runner/RUNNER_EXPERIENCE_SYSTEM.md)

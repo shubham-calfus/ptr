@@ -547,6 +547,52 @@ def test_generate_html_report_content_renders_debug_settings_and_step_debug_trac
     assert "page_text_snapshot_max_chars" in html
 
 
+def test_generate_html_report_content_compacts_long_dom_candidates() -> None:
+    html = generate_html_report_content(
+        test_suite_id="PO_Invoice",
+        parent_run_id="run-dom-candidates",
+        results=[
+            _result(
+                recording_name="PO_Invoice",
+                status="failed",
+                action_log=[
+                    _action(
+                        step=35,
+                        action="adf_menu_select",
+                        label="Invoice Actions",
+                        status="failed",
+                        failure_context={
+                            "helper": "adf_menu_select",
+                            "page_title": "Create Invoice",
+                            "ready_state": "complete",
+                            "busy_indicator_count": 0,
+                            "dom_context": {
+                                "candidates": [
+                                    {
+                                        "tag": "a",
+                                        "role": "menuitem",
+                                        "text": "Invoice Actions",
+                                    },
+                                    {
+                                        "tag": "select",
+                                        "title": "USD - US Dollar",
+                                        "text": "USD - US Dollar EUR - Euro GBP - Pound Sterling JPY - Yen " * 10,
+                                    },
+                                ]
+                            },
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert "DOM Candidates (2)" in html
+    assert "Show full" in html
+    assert 'title="USD - US Dollar EUR - Euro GBP - Pound Sterling' in html
+    assert "Invoice Actions" in html
+
+
 def test_generate_html_report_content_formats_duration_cards_with_small_units() -> None:
     html = generate_html_report_content(
         test_suite_id="HCM_Durations",

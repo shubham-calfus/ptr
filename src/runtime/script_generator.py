@@ -15,12 +15,18 @@ Preparation no longer embeds a giant helper blob into each generated script.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 try:
     from .parser import Action, LocatorStep
 except ImportError:  # pragma: no cover - published/runtime fallback
     from src.runtime.parser import Action, LocatorStep
+
+
+# Placeholders left after param substitution are runtime values (produced by
+# ai_extract() during the run), so they must resolve at execution time.
+_RUNTIME_PLACEHOLDER_RE = re.compile(r"\{\{[A-Za-z0-9_]+\}\}")
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +75,15 @@ def _escape(value: Any) -> str:
     return repr(value)
 
 
+def _escape_resolved(value: Any) -> str:
+    """Like _escape, but wraps strings holding a runtime ``{{placeholder}}`` in a
+    ``_ptr_resolve(...)`` call so the value is substituted at execution time from
+    ai_extract() results, instead of being baked in as a literal."""
+    if isinstance(value, str) and _RUNTIME_PLACEHOLDER_RE.search(value):
+        return f"_ptr_resolve({_escape(value)})"
+    return _escape(value)
+
+
 def _build_locator_expr(page_var: str, steps: list[LocatorStep]) -> str:
     """Build a Playwright locator expression from steps.
 
@@ -79,8 +94,8 @@ def _build_locator_expr(page_var: str, steps: list[LocatorStep]) -> str:
         if step.is_property:
             parts.append(f".{step.method}")
         else:
-            args_parts = [_escape(a) for a in step.args]
-            kwargs_parts = [f"{k}={_escape(v)}" for k, v in step.kwargs.items()]
+            args_parts = [_escape_resolved(a) for a in step.args]
+            kwargs_parts = [f"{k}={_escape_resolved(v)}" for k, v in step.kwargs.items()]
             all_parts = args_parts + kwargs_parts
             parts.append(f".{step.method}({', '.join(all_parts)})")
     return "".join(parts)
@@ -379,7 +394,7 @@ def _gen_fill(action: Action, page_var: str) -> list[str]:
             "fill_textbox",
             label,
             "_ptr_raw_fill",
-            [locator_expr, page_var, _escape(label), _escape(action.value)],
+            [locator_expr, page_var, _escape(label), _escape_resolved(action.value)],
             page_var,
             primary_locator_expr=locator_expr,
             extra={"value": action.value},
@@ -391,7 +406,7 @@ def _gen_fill(action: Action, page_var: str) -> list[str]:
         "fill_textbox",
         label,
         "_ptr_fill_textbox",
-        [locator_expr, page_var, _escape(label), _escape(action.value)],
+        [locator_expr, page_var, _escape(label), _escape_resolved(action.value)],
         page_var,
         primary_locator_expr=locator_expr,
         extra={"value": action.value},
@@ -709,7 +724,7 @@ def _gen_fill_and_submit(action: Action, page_var: str) -> list[str]:
         "fill_textbox",
         label,
         "_ptr_fill_textbox",
-        [locator_expr, page_var, _escape(label), _escape(action.value)],
+        [locator_expr, page_var, _escape(label), _escape_resolved(action.value)],
         page_var,
         primary_locator_expr=locator_expr,
         extra={"value": action.value},
@@ -963,6 +978,22 @@ def _gen_close_browser(action: Action, page_var: str) -> list[str]:
     return ["    browser.close()"]
 
 
+def _gen_ai_extract(action: Action, page_var: str) -> list[str]:
+    """Emit a vision-extract step: screenshot the page, ask the LLM for the value
+    described by the prompt, and store it under ``name`` for later {{name}} use."""
+    name = str(action.name or "")
+    prompt = str(action.ai_prompt or "")
+    return _tracked_action_lines(
+        action,
+        "ai_extract",
+        name,
+        "_ptr_ai_extract",
+        [page_var, _escape(name), _escape(prompt)],
+        page_var,
+        extra={"ai_extract_name": name, "ai_extract_prompt": prompt},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Generator dispatch
 # ---------------------------------------------------------------------------
@@ -997,6 +1028,7 @@ _GENERATORS: dict[str, Any] = {
     "navigation_button": _gen_navigation_button,
     "numeric_button": _gen_numeric_button,
     "login_and_redirect": _gen_login_and_redirect,
+    "ai_extract": _gen_ai_extract,
 }
 
 

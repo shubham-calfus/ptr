@@ -1,3 +1,7 @@
-from .html_report_generator import generate_html_report_content
+"""Utility package for the test runner.
 
-__all__ = ["generate_html_report_content"]
+Keep this package import-light. Runtime helpers import submodules from here
+inside worker processes that may not have optional report/storage dependencies.
+"""
+
+__all__: list[str] = []

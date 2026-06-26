@@ -80,6 +80,9 @@ class Action:
     exact: bool | None = None  # exact= kwarg
     selector: str | None = None  # raw CSS selector if locator()
 
+    # -- AI extract (ai_extract(name, prompt)) --
+    ai_prompt: str | None = None  # the LLM extraction instruction; `name` holds the store key
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "type": self.type,
@@ -125,6 +128,8 @@ class Action:
             d["exact"] = self.exact
         if self.selector:
             d["selector"] = self.selector
+        if self.ai_prompt is not None:
+            d["ai_prompt"] = self.ai_prompt
         d["raw"] = self.raw
         return d
 
@@ -364,6 +369,39 @@ def _classify_setup_assignment(stmt: ast.Assign, raw_line: str) -> Action | None
         raw=raw_line,
         page_var=target_name,
         page_source_var=page_source_var,
+    )
+
+
+def _classify_ai_extract(call: ast.Call, raw_line: str, line_no: int) -> Action | None:
+    """Classify a top-level ``ai_extract(name, prompt)`` call.
+
+    ``ai_extract`` is a bare function call (not a ``page.*`` chain). At runtime it
+    screenshots the current page, asks the vision LLM for the value described by
+    ``prompt``, and stores it under ``name`` so later ``{{name}}`` placeholders in
+    the same recording resolve to it (and it is also surfaced as a flow-context
+    output for downstream recordings).
+    """
+    if not isinstance(call.func, ast.Name) or call.func.id != "ai_extract":
+        return None
+
+    args, kwargs = _extract_call_args(call)
+    name = kwargs.get("name") if "name" in kwargs else (args[0] if len(args) >= 1 else None)
+    prompt = kwargs.get("prompt") if "prompt" in kwargs else (args[1] if len(args) >= 2 else None)
+
+    name = str(name).strip() if name is not None else ""
+    prompt = str(prompt).strip() if prompt is not None else ""
+    if not name or not prompt:
+        raise ParseCoverageError(
+            f"ai_extract() at line {line_no} must be called as "
+            'ai_extract("value_name", "extraction prompt").'
+        )
+
+    return Action(
+        type="ai_extract",
+        line=line_no,
+        raw=raw_line,
+        name=name,
+        ai_prompt=prompt,
     )
 
 
@@ -651,6 +689,10 @@ def parse_script(source: str) -> list[Action]:
 
         # --- Expression statements: page.get_by_role(...).click() etc. ---
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            ai_extract_action = _classify_ai_extract(stmt.value, raw_line, stmt.lineno)
+            if ai_extract_action is not None:
+                actions.append(ai_extract_action)
+                continue
             chain = _unwind_chain(stmt.value)
             action = _classify_action(chain, raw_line, stmt.lineno)
             if action is not None:

@@ -60,6 +60,12 @@ _CLOSE_ACTION_TYPES = frozenset({
     "close_browser",
 })
 
+_SETUP_ACTION_TYPES = frozenset({
+    "setup_browser",
+    "setup_context",
+    "setup_page",
+})
+
 
 def _normalize(value: str) -> str:
     return " ".join(str(value or "").lower().split())
@@ -136,6 +142,18 @@ def _is_close_action(action: Action | None) -> bool:
     return bool(action and action.type in _CLOSE_ACTION_TYPES)
 
 
+def _is_setup_action(action: Action | None) -> bool:
+    return bool(action and action.type in _SETUP_ACTION_TYPES)
+
+
+def _next_non_setup_action(actions: list[Action], start_index: int) -> Action | None:
+    for idx in range(start_index, len(actions)):
+        candidate = actions[idx]
+        if not _is_setup_action(candidate):
+            return candidate
+    return None
+
+
 def _same_locator(a: Action, b: Action) -> bool:
     """Check if two actions target the same element."""
     if a.page_var != b.page_var:
@@ -206,10 +224,25 @@ def optimize(actions: list[Action]) -> list[Action]:
         action = actions[i]
         next_action = actions[i + 1] if i + 1 < n else None
 
+        # --- Pattern: top-level recorded idle before first navigation on a fresh page ---
+        if (
+            action.type == "wait"
+            and action.wait_ms is not None
+            and all(_is_setup_action(existing) for existing in result)
+        ):
+            next_non_setup = _next_non_setup_action(actions, i + 1)
+            if (
+                next_non_setup
+                and next_non_setup.type == "goto"
+                and next_non_setup.page_var == action.page_var
+            ):
+                i += 1
+                continue
+
         # --- Pattern: redundant textbox click used only for focus ---
         if (
             action.type == "click"
-            and action.role in ("textbox", "spinbutton")
+            and action.role == "textbox"
             and not _is_login_field(action.name)
         ):
             if next_action is None or _is_close_action(next_action):

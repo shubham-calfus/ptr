@@ -148,6 +148,13 @@ def _safe_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _truncate_display_text(value: Any, limit: int) -> str:
+    text = _safe_text(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
 _SENSITIVE_NAME_RE = re.compile(
     r"\b(password|passcode|secret|api[\s_-]?key|access[\s_-]?key|secret[\s_-]?key|auth[\s_-]?token|token)\b",
     re.IGNORECASE,
@@ -770,7 +777,7 @@ def _candidate_cards(candidates: list[dict[str, Any]]) -> str:
 
     items: list[str] = []
     for candidate in candidates:
-        label = (
+        full_label = (
             candidate.get("labelledby_text")
             or candidate.get("text")
             or candidate.get("title")
@@ -779,6 +786,7 @@ def _candidate_cards(candidates: list[dict[str, Any]]) -> str:
             or candidate.get("tag")
             or "candidate"
         )
+        label = _truncate_display_text(full_label, 72)
 
         chips: list[str] = []
         tag = _safe_text(candidate.get("tag"))
@@ -804,10 +812,22 @@ def _candidate_cards(candidates: list[dict[str, Any]]) -> str:
             text = _safe_text(value)
             if not text:
                 continue
+            preview = _truncate_display_text(text, 180)
+            details_html = ""
+            if preview != text:
+                details_html = (
+                    '<details class="cand-more">'
+                    '<summary>Show full</summary>'
+                    f'<div class="cand-field-full {tone}">{escape(text)}</div>'
+                    "</details>"
+                )
             fields.append(
                 '<div class="cand-field">'
                 f'<span class="cand-field-k">{escape(key)}</span>'
-                f'<span class="cand-field-v {tone}">{escape(text)}</span>'
+                '<div class="cand-field-copy">'
+                f'<span class="cand-field-v {tone}" title="{escape(text, quote=True)}">{escape(preview)}</span>'
+                f"{details_html}"
+                "</div>"
                 "</div>"
             )
 
@@ -816,7 +836,7 @@ def _candidate_cards(candidates: list[dict[str, Any]]) -> str:
         items.append(
             '<div class="cand-item">'
             '<div class="cand-top">'
-            f'<div class="cand-head">{escape(str(label))}</div>'
+            f'<div class="cand-head" title="{escape(str(full_label), quote=True)}">{escape(str(label))}</div>'
             f'<div class="cand-chips">{"".join(chips)}</div>'
             "</div>"
             f"{fields_html}"
@@ -856,11 +876,15 @@ def _failure_context_block(action: dict[str, Any]) -> str:
         )
 
     candidates_html = ""
-    candidates = ((context.get("dom_context") or {}).get("candidates") or [])[:8]
+    all_candidates = list((context.get("dom_context") or {}).get("candidates") or [])
+    candidates = all_candidates[:6]
     if candidates:
+        title = f"DOM Candidates ({len(candidates)})"
+        if len(all_candidates) > len(candidates):
+            title = f"{title} of {len(all_candidates)}"
         candidates_html = (
             '<div class="detail-card">'
-            '<div class="dc-title">DOM Candidates</div>'
+            f'<div class="dc-title">{escape(title)}</div>'
             f"{_candidate_cards(candidates)}"
             "</div>"
         )
@@ -2402,6 +2426,7 @@ body::before{
   background:#fff;
   border:1px solid rgba(120,140,180,.14);
 }
+.cand-field-copy{min-width:0;display:grid;gap:6px}
 .cand-field-k{
   font-size:10px;
   font-weight:800;
@@ -2416,6 +2441,27 @@ body::before{
   color:var(--text-mid);
   word-break:break-word;
 }
+.cand-more{
+  border-top:1px dashed rgba(120,140,180,.22);
+  padding-top:6px;
+}
+.cand-more summary{
+  cursor:pointer;
+  font-size:11px;
+  font-weight:700;
+  color:var(--blue);
+  list-style:none;
+}
+.cand-more summary::-webkit-details-marker{display:none}
+.cand-field-full{
+  margin-top:6px;
+  font-size:12px;
+  line-height:1.65;
+  color:var(--text-mid);
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+.cand-field-full.soft{color:var(--text-dim)}
 .cand-field-v.soft{color:var(--text-dim)}
 .cand-head{
   font-size:14px;
@@ -2424,6 +2470,10 @@ body::before{
   line-height:1.45;
   flex:1;
   min-width:0;
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
 }
 .rail-section{margin-bottom:24px}
 .rail-title{

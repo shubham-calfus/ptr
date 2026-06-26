@@ -43,6 +43,34 @@ def run(playwright):
     assert any(action.type == "close_browser" for action in optimized)
 
 
+def test_optimize_preserves_spinbutton_click_before_fill() -> None:
+    script = """
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("spinbutton", name="Picked Quantity").click()
+    page.get_by_role("spinbutton", name="Picked Quantity").fill("1")
+    browser.close()
+"""
+
+    optimized = optimize(parse_script(script))
+
+    assert [action.type for action in optimized] == [
+        "setup_browser",
+        "setup_context",
+        "setup_page",
+        "click",
+        "fill",
+        "close_browser",
+    ]
+    assert optimized[3].role == "spinbutton"
+    assert optimized[3].name == "Picked Quantity"
+    assert optimized[4].role == "spinbutton"
+    assert optimized[4].name == "Picked Quantity"
+    assert optimized[4].value == "1"
+
+
 def test_optimize_does_not_merge_plain_nav_link_with_following_text_click() -> None:
     script = """
 def run(playwright):
@@ -133,3 +161,26 @@ def run(playwright):
     assert date_pick.action_kwargs["day_label"] == "3"
     assert date_pick.action_kwargs["day_role"] == "button"
     assert date_pick.action_kwargs["day_exact"] is True
+
+
+def test_optimize_drops_leading_timeout_wait_before_first_goto() -> None:
+    script = """
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.wait_for_timeout(180000)
+    page.goto("https://example.test/login")
+    browser.close()
+"""
+
+    optimized = optimize(parse_script(script))
+
+    assert [action.type for action in optimized] == [
+        "setup_browser",
+        "setup_context",
+        "setup_page",
+        "goto",
+        "close_browser",
+    ]
+    assert optimized[3].url == "https://example.test/login"

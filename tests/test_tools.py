@@ -1,10 +1,13 @@
 import subprocess
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
 from src.tools.tools import (
     UnsupportedActionCoverageError,
     _apply_recording_debug_env_overrides,
+    _build_runtime_diagnostics_manifest_payload,
     _call_openai_failure_summary,
     _classify_recording_script,
     _collect_unresolved_execution_parameters,
@@ -134,6 +137,33 @@ def test_store_executed_script_artifact_uploads_prepared_script(monkeypatch) -> 
     assert captured["content_type"] == "text/x-python"
 
 
+def test_build_runtime_diagnostics_manifest_payload_preserves_debug_details() -> None:
+    payload = _build_runtime_diagnostics_manifest_payload(
+        {
+            "page_url": "https://example.test/create-invoice",
+            "runtime_debug": {
+                "settings": {"debug_trace": True},
+                "last_strategy_state": {"strategy": "oracle_spinbutton_keyboard_fill"},
+            },
+            "step_artifacts": [{"index": 1, "action": "fill_textbox", "local_path": "/tmp/step-1.png"}],
+        },
+        diagnostics_s3_key="artifacts/demo/diagnostics.json",
+        uploaded_step_artifacts=[
+            {
+                "index": 1,
+                "action": "fill_textbox",
+                "screenshot_s3_key": "artifacts/demo/steps/step_001_fill_textbox.png",
+            }
+        ],
+    )
+
+    assert payload["diagnostics_s3_key"] == "artifacts/demo/diagnostics.json"
+    assert payload["runtime_debug"]["settings"]["debug_trace"] is True
+    assert payload["runtime_debug"]["last_strategy_state"]["strategy"] == "oracle_spinbutton_keyboard_fill"
+    assert payload["uploaded_step_artifacts"][0]["screenshot_s3_key"].endswith("step_001_fill_textbox.png")
+    assert payload["step_artifacts"][0]["local_path"] == "/tmp/step-1.png"
+
+
 def test_resolve_executable_script_falls_back_to_substituted_raw_script(monkeypatch) -> None:
     script = """
 from playwright.sync_api import Playwright, sync_playwright
@@ -171,6 +201,92 @@ with sync_playwright() as playwright:
     assert preparation_warning is not None
     assert 'page.goto("https://example.com/app")' in executable_script
     assert 'page.locator(".xen").first.click()' in executable_script
+
+
+def test_prepare_script_prefers_src_runtime_modules_over_stale_runtime_package(monkeypatch) -> None:
+    script = """
+from playwright.sync_api import Playwright, sync_playwright
+
+
+def run(playwright: Playwright) -> None:
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://example.test/order")
+    ai_extract("order_number", "extract order number only")
+    page.get_by_title("{{order_number}}").click()
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
+"""
+
+    fake_runtime = types.ModuleType("runtime")
+    fake_parser = types.ModuleType("runtime.parser")
+    fake_optimizer = types.ModuleType("runtime.optimizer")
+    fake_script_generator = types.ModuleType("runtime.script_generator")
+
+    class _FakeParseCoverageError(ValueError):
+        pass
+
+    def _fake_parse_script(_source: str):
+        raise _FakeParseCoverageError("stale runtime parser rejected ai_extract")
+
+    fake_parser.ParseCoverageError = _FakeParseCoverageError
+    fake_parser.parse_script = _fake_parse_script
+    fake_optimizer.optimize = lambda actions: actions
+    fake_script_generator.CoverageError = ValueError
+    fake_script_generator.generate_full_script = lambda actions: "SHOULD NOT BE USED"
+
+    monkeypatch.setitem(sys.modules, "runtime", fake_runtime)
+    monkeypatch.setitem(sys.modules, "runtime.parser", fake_parser)
+    monkeypatch.setitem(sys.modules, "runtime.optimizer", fake_optimizer)
+    monkeypatch.setitem(sys.modules, "runtime.script_generator", fake_script_generator)
+
+    prepared = _prepare_script_for_execution(script)
+
+    assert "_ptr_ai_extract, page, 'order_number', 'extract order number only'" in prepared
+    assert "stale runtime parser rejected ai_extract" not in prepared
+
+
+def test_resolve_executable_script_raw_fallback_injects_ai_extract_and_runtime_resolve(monkeypatch) -> None:
+    script = """
+from playwright.sync_api import Playwright, sync_playwright
+
+
+def run(playwright: Playwright) -> None:
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://example.test/order")
+    ai_extract("transaction_number", "extract transaction number from the table, of first row")
+    page.get_by_role("link", name="{{transaction_number}}").click()
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
+"""
+
+    def _raise_unsupported(_normalized: str) -> str:
+        raise UnsupportedActionCoverageError(
+            "Recording contains actions the AST runner does not safely support yet.\n"
+            '- line 18 (Expr): ai_extract("transaction_number", "extract transaction number from the table, of first row")'
+        )
+
+    monkeypatch.setattr(
+        "src.tools.tools._prepare_normalized_script_for_execution",
+        _raise_unsupported,
+    )
+
+    executable_script, execution_mode, preparation_warning = _resolve_executable_script(script)
+
+    assert execution_mode == "raw_script_fallback"
+    assert preparation_warning is not None
+    assert "from src.runtime.helpers_v2 import *" in executable_script
+    assert "def ai_extract(name, prompt):" in executable_script
+    assert 'page.get_by_role("link", name=_ptr_resolve("{{transaction_number}}")).click()' in executable_script
 
 
 def test_classify_recording_script_treats_non_playwright_python_as_script_step() -> None:

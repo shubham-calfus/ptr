@@ -1,9 +1,11 @@
+import importlib
 import json
 import os
 import sys
 from itertools import chain, repeat
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -41,6 +43,16 @@ def test_prepare_script_via_ast_imports_runtime_helpers_v2() -> None:
 
     assert "from src.runtime.helpers_v2 import *" in prepared
     assert "def _ptr_wait_for_initial_page_settle" not in prepared
+
+
+def test_importing_helpers_v2_does_not_eagerly_import_html_report_generator(monkeypatch) -> None:
+    monkeypatch.delitem(sys.modules, "src.runtime.helpers_v2", raising=False)
+    monkeypatch.delitem(sys.modules, "src.utils", raising=False)
+    monkeypatch.delitem(sys.modules, "src.utils.html_report_generator", raising=False)
+
+    importlib.import_module("src.runtime.helpers_v2")
+
+    assert "src.utils.html_report_generator" not in sys.modules
 
 
 def test_legacy_inject_runtime_helpers_shims_to_v2_import() -> None:
@@ -144,7 +156,7 @@ class _CheckboxLocator:
 
 class _FakeHandle:
     def evaluate(self, expression: str, arg=None):
-        if "node.value" in expression:
+        if "const readValue" in expression:
             return "fast-value"
         return "fast text"
 
@@ -165,6 +177,18 @@ class _FastSnapshotLocator:
 
     def text_content(self) -> str:
         raise AssertionError("raw text_content should not be used")
+
+
+class _NestedValueHandle:
+    def evaluate(self, expression: str, arg=None):
+        if "aria-valuenow" in expression and "querySelector" in expression:
+            return "1"
+        return ""
+
+
+class _NestedValueLocator:
+    def element_handle(self, timeout: int):
+        return _NestedValueHandle()
 
 
 class _NamedLocator:
@@ -259,6 +283,20 @@ class _DateLocator:
     @property
     def first(self):
         return self
+
+
+class _WarningDialogPage:
+    def __init__(self) -> None:
+        self.url = "https://example.com/fscmUI/faces/ap/invoice"
+        self.waits: list[int] = []
+        self.locator_calls: list[str] = []
+
+    def locator(self, selector: str):
+        self.locator_calls.append(selector)
+        return _DateLocator(f"locator:{selector}")
+
+    def wait_for_timeout(self, ms: int) -> None:
+        self.waits.append(ms)
 
 
 class _FilteredLocatorCollection:
@@ -520,10 +558,14 @@ class _AIScreenshotPage(_PromptPage):
     def __init__(self) -> None:
         super().__init__()
         self.screenshot_calls: list[dict[str, object]] = []
+        self.waits: list[int] = []
 
     def screenshot(self, **kwargs):
         self.screenshot_calls.append(dict(kwargs))
         return b"fake-jpeg-bytes"
+
+    def wait_for_timeout(self, ms: int) -> None:
+        self.waits.append(ms)
 
 
 class _NavigationPage:
@@ -596,6 +638,9 @@ class _SearchOptionPage:
         self.waits: list[int] = []
         self.role_calls: list[tuple[str, str | None, bool | None]] = []
         self.text_calls: list[tuple[str, bool | None]] = []
+        self.locator_calls: list[str] = []
+        self.scoped_role_calls: list[tuple[str, str, str | None, bool | None]] = []
+        self.scoped_text_calls: list[tuple[str, str, bool | None]] = []
 
     def get_by_role(self, role: str, name: str | None = None, exact: bool | None = None):
         self.role_calls.append((role, name, exact))
@@ -605,8 +650,46 @@ class _SearchOptionPage:
         self.text_calls.append((text, exact))
         return _SearchOptionLocator(f"text:{text}:{exact}")
 
+    def locator(self, selector: str):
+        self.locator_calls.append(selector)
+        return _ScopedSearchOptionScope(self, selector)
+
     def wait_for_timeout(self, ms: int) -> None:
         self.waits.append(ms)
+
+
+class _ScopedSearchOptionScope:
+    def __init__(self, page: _SearchOptionPage, selector: str) -> None:
+        self.page = page
+        self.selector = selector
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool | None = None):
+        self.page.scoped_role_calls.append((self.selector, role, name, exact))
+        return _SearchOptionLocator(f"scope:{self.selector}:{role}:{name}:{exact}")
+
+    def get_by_text(self, text: str, exact: bool | None = None):
+        self.page.scoped_text_calls.append((self.selector, text, exact))
+        return _SearchOptionLocator(f"scope:{self.selector}:text:{text}:{exact}")
+
+
+class _OracleLovDirectEntryInputLocator(_SearchOptionLocator):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.presses: list[tuple[str, int | None]] = []
+
+    def press(self, key: str, *, timeout: int | None = None) -> None:
+        self.presses.append((key, timeout))
+
+
+class _OracleLovDirectEntryPage(_SearchOptionPage):
+    def __init__(self, input_locator: _OracleLovDirectEntryInputLocator) -> None:
+        super().__init__()
+        self.input_locator = input_locator
+        self.locator_calls: list[str] = []
+
+    def locator(self, selector: str):
+        self.locator_calls.append(selector)
+        return self.input_locator
 
 
 class _CompletionPage(_SearchOptionPage):
@@ -899,12 +982,34 @@ def test_write_diagnostics_persists_oracle_tables(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(helpers_v2, "_PTR_FAILURE_SCREENSHOT_PATH", None)
     monkeypatch.setattr(helpers_v2, "_PTR_STEP_ARTIFACTS", [])
     monkeypatch.setattr(helpers_v2, "_PTR_ACTION_LOG", [])
+    monkeypatch.setattr(
+        helpers_v2,
+        "_PTR_CURRENT_STRATEGY",
+        {
+            "helper": "fill_textbox",
+            "strategy": "oracle_spinbutton_keyboard_fill",
+            "label": "Picked Quantity",
+            "attempts": ["direct", "oracle_spinbutton_keyboard_fill"],
+            "ai_interactions": [],
+            "experience_interactions": [],
+            "script_data": {"tracked_action": "fill_textbox"},
+            "recovery": {"handler_name": "oracle_spinbutton_fill"},
+            "debug": {"fill_textbox": {"status": "success"}},
+        },
+    )
+    monkeypatch.setenv("PTR_DEBUG_TRACE", "true")
+    monkeypatch.setenv("PTR_CAPTURE_STEPS", "true")
+    monkeypatch.setenv("PTR_TEXT_ENTRY_TIMEOUT_MS", "4500")
 
     helpers_v2._ptr_write_diagnostics()
 
     payload = json.loads(diagnostics_path.read_text(encoding="utf-8"))
     assert payload["oracle_tables"][0]["rows"][0][1] == "1006"
     assert payload["page_semantics"]["label_values"][0]["value"] == "1006"
+    assert payload["runtime_debug"]["settings"]["debug_trace"] is True
+    assert payload["runtime_debug"]["settings"]["text_entry_timeout_ms"] == 4500
+    assert payload["runtime_debug"]["snapshot_summary"]["oracle_table_count"] == 1
+    assert payload["runtime_debug"]["last_strategy_state"]["strategy"] == "oracle_spinbutton_keyboard_fill"
 
 
 def test_capture_live_snapshot_before_close_persists_latest_live_page(tmp_path, monkeypatch) -> None:
@@ -924,6 +1029,23 @@ def test_capture_live_snapshot_before_close_persists_latest_live_page(tmp_path, 
     payload = json.loads(diagnostics_path.read_text(encoding="utf-8"))
     assert payload["page_url"] == page.url
     assert payload["oracle_tables"][0]["rows"][0][1] == "1003"
+
+
+def test_capture_step_uses_override_png_bytes(tmp_path, monkeypatch) -> None:
+    page = _AIScreenshotPage()
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE", page)
+    monkeypatch.setattr(helpers_v2, "_PTR_STEP_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setattr(helpers_v2, "_PTR_STEP_INDEX", 0)
+    monkeypatch.setattr(helpers_v2, "_PTR_STEP_ARTIFACTS", [])
+    monkeypatch.setattr(helpers_v2, "_PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG", b"override-png-bytes")
+
+    helpers_v2._ptr_capture_step("ai_extract")
+
+    assert page.screenshot_calls == []
+    assert helpers_v2._PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG is None
+    assert len(helpers_v2._PTR_STEP_ARTIFACTS) == 1
+    artifact_path = Path(helpers_v2._PTR_STEP_ARTIFACTS[0]["local_path"])
+    assert artifact_path.read_bytes() == b"override-png-bytes"
 
 
 def test_option_selection_postcondition_accepts_trigger_value_match(monkeypatch) -> None:
@@ -1031,12 +1153,17 @@ def test_wait_for_oracle_menu_trigger_option_visibility_accepts_menuitem_when_ra
         option_candidates,
         "Invoice Actions",
     ) is True
-    assert ("menuitem", "Validate", None) in page.role_calls
+    assert ("menuitem", "Validate", True) in page.role_calls
     assert ("Validate", True) in page.text_calls
 
 
 def test_value_matches_requires_non_empty_observed_value() -> None:
     assert helpers_v2._ptr_value_matches("Project Manager", "") is False
+
+
+def test_value_matches_requires_empty_observed_value_for_empty_expected() -> None:
+    assert helpers_v2._ptr_value_matches("", "1") is False
+    assert helpers_v2._ptr_value_matches("", "") is True
 
 
 def test_check_target_marks_checkbox_checked_via_raw_check(monkeypatch) -> None:
@@ -1423,6 +1550,262 @@ def test_try_commit_oracle_adf_select_uses_keyboard_commit(monkeypatch) -> None:
     assert page.waits == [250]
 
 
+def test_try_commit_oracle_adf_select_infers_previous_committed_index_from_adf_markers(monkeypatch) -> None:
+    locator = _OracleKeyboardSelectLocator()
+    page = _NavigationPage()
+    waited: list[str] = []
+    states = iter(
+        [
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "title": "Inventory",
+                "afov": "0",
+                "is_adf": True,
+            },
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "title": "Receipts",
+                "afov": "2",
+                "is_adf": True,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_target",
+        lambda *args, **kwargs: {"index": 2, "value": "2", "label": "Receipts"},
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_option_by_committed_marker",
+        lambda *args, **kwargs: {"index": 0, "value": "0", "label": "Inventory"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_reset_select_to_index", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_field_processing",
+        lambda *args, **kwargs: waited.append("done"),
+    )
+
+    details = helpers_v2._ptr_try_commit_oracle_adf_select(
+        locator,
+        page,
+        {},
+        ["2"],
+        {},
+    )
+
+    assert details == {
+        "strategy_name": "oracle_adf_select_keyboard_commit",
+        "target_index": 2,
+        "target_value": "2",
+        "target_label": "Receipts",
+        "committed_index_source": "adf_marker",
+        "committed_value": "0",
+        "committed_label": "Inventory",
+    }
+    assert locator.focused is True
+    assert locator.events == [("focus", 3000), ("press", "ArrowDown"), ("press", "ArrowDown"), ("press", "Tab")]
+    assert waited == ["done"]
+    assert page.waits == [250]
+
+
+def test_try_commit_oracle_adf_select_uses_contradicted_state_as_target_when_initial_target_missing(monkeypatch) -> None:
+    locator = _OracleKeyboardSelectLocator()
+    page = _NavigationPage()
+    waited: list[str] = []
+    states = iter(
+        [
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "title": "Inventory",
+                "afov": "0",
+                "is_adf": True,
+            },
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "title": "Receipts",
+                "afov": "2",
+                "is_adf": True,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(helpers_v2, "_ptr_resolve_select_target", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_option_by_committed_marker",
+        lambda *args, **kwargs: {"index": 0, "value": "0", "label": "Inventory"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_reset_select_to_index", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_field_processing",
+        lambda *args, **kwargs: waited.append("done"),
+    )
+
+    details = helpers_v2._ptr_try_commit_oracle_adf_select(
+        locator,
+        page,
+        {},
+        ["2"],
+        {},
+    )
+
+    assert details == {
+        "strategy_name": "oracle_adf_select_keyboard_commit",
+        "target_index": 2,
+        "target_value": "2",
+        "target_label": "Receipts",
+        "committed_index_source": "adf_marker",
+        "committed_value": "0",
+        "committed_label": "Inventory",
+    }
+    assert locator.focused is True
+    assert locator.events == [("focus", 3000), ("press", "ArrowDown"), ("press", "ArrowDown"), ("press", "Tab")]
+    assert waited == ["done"]
+    assert page.waits == [250]
+
+
+def test_try_oracle_adf_component_commit_returns_component_details(monkeypatch) -> None:
+    locator = object()
+
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_safe_locator_eval",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "base_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1",
+            "content_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1::content",
+            "used": ["focus", "selectedIndex", "component.setValue", "component.processUpdates"],
+        },
+    )
+
+    details = helpers_v2._ptr_try_oracle_adf_component_commit(
+        locator,
+        {"index": 2, "value": "2", "label": "Receipts"},
+    )
+
+    assert details == {
+        "strategy_name": "oracle_adf_select_component_commit",
+        "component_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1",
+        "content_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1::content",
+        "used": ["focus", "selectedIndex", "component.setValue", "component.processUpdates"],
+        "target_index": 2,
+        "target_value": "2",
+        "target_label": "Receipts",
+    }
+
+
+def test_try_commit_oracle_adf_select_falls_back_to_component_commit(monkeypatch) -> None:
+    locator = _OracleKeyboardSelectLocator()
+    page = _NavigationPage()
+    waited: list[str] = []
+    states = iter(
+        [
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "title": "Inventory",
+                "afov": "0",
+                "is_adf": True,
+            },
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "title": "Inventory",
+                "afov": "0",
+                "is_adf": True,
+            },
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "title": "Receipts",
+                "afov": "2",
+                "is_adf": True,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(helpers_v2, "_ptr_resolve_select_target", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_option_by_committed_marker",
+        lambda *args, **kwargs: {"index": 0, "value": "0", "label": "Inventory"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_reset_select_to_index", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_field_processing",
+        lambda *args, **kwargs: waited.append("done"),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_try_oracle_adf_component_commit",
+        lambda *args, **kwargs: {
+            "strategy_name": "oracle_adf_select_component_commit",
+            "component_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1",
+            "content_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1::content",
+            "used": ["focus", "selectedIndex", "component.setValue", "component.processUpdates"],
+            "target_index": 2,
+            "target_value": "2",
+            "target_label": "Receipts",
+        },
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_oracle_adf_commit_events",
+        lambda *args, **kwargs: pytest.fail("plain event commit should not run after component commit succeeds"),
+    )
+
+    details = helpers_v2._ptr_try_commit_oracle_adf_select(
+        locator,
+        page,
+        {},
+        ["2"],
+        {},
+    )
+
+    assert details == {
+        "strategy_name": "oracle_adf_select_component_commit",
+        "component_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1",
+        "content_id": "_FOpt1:_FOr1:0:_FONSr2:0:_FOTRaT:0:soc1::content",
+        "used": ["focus", "selectedIndex", "component.setValue", "component.processUpdates"],
+        "target_index": 2,
+        "target_value": "2",
+        "target_label": "Receipts",
+        "committed_index_source": "adf_marker",
+        "committed_value": "0",
+        "committed_label": "Inventory",
+    }
+    assert locator.focused is True
+    assert locator.events == [("focus", 3000), ("press", "ArrowDown"), ("press", "ArrowDown"), ("press", "Tab")]
+    assert waited == ["done", "done"]
+    assert page.waits == [250, 250]
+
+
 def test_select_option_target_uses_oracle_adf_commit_before_ai(monkeypatch) -> None:
     locator = object()
     page = _NavigationPage()
@@ -1486,6 +1869,81 @@ def test_select_option_target_uses_oracle_adf_commit_before_ai(monkeypatch) -> N
             "target_index": 1,
             "target_value": "1",
             "target_label": "Credit memo",
+        },
+    }
+    assert stored["status"] == "success"
+    assert stored["postcondition_kind"] == "option_selected"
+
+
+def test_select_option_target_does_not_false_pass_on_semantic_match_when_adf_markers_contradict(monkeypatch) -> None:
+    locator = object()
+    page = _NavigationPage()
+    recovery: dict[str, object] = {}
+    stored: dict[str, object] = {}
+    states = iter(
+        [
+            {},
+            {
+                "value": "2",
+                "selected_values": ["2"],
+                "selected_labels": ["Receipts"],
+                "selected_indexes": [2],
+                "text": "Inventory Counts Receipts",
+                "title": "Inventory",
+                "afov": "0",
+                "is_adf": True,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_apply_select_option", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_select_option_state", lambda *args, **kwargs: next(states))
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_resolve_select_target",
+        lambda *args, **kwargs: {"index": 2, "value": "2", "label": "Receipts"},
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_oracle_label_value_matches", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_try_commit_oracle_adf_select",
+        lambda *args, **kwargs: {
+            "strategy_name": "oracle_adf_select_keyboard_commit",
+            "target_index": 2,
+            "target_value": "2",
+            "target_label": "Receipts",
+            "committed_index_source": "adf_marker",
+            "committed_value": "0",
+            "committed_label": "Inventory",
+        },
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_searchselect_select_option_recovery", lambda *args, **kwargs: pytest.fail("searchselect recovery should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: pytest.fail("experience should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: pytest.fail("ai should not run"))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: stored.update(kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+
+    helpers_v2._ptr_select_option_target(locator, page, "Show Tasks", ["2"], {})
+
+    assert recovery == {
+        "source": "oracle_handler",
+        "kind": "oracle_adf_select_commit",
+        "handler_name": "oracle_adf_select_commit",
+        "details": {
+            "strategy_name": "oracle_adf_select_keyboard_commit",
+            "target_index": 2,
+            "target_value": "2",
+            "target_label": "Receipts",
+            "committed_index_source": "adf_marker",
+            "committed_value": "0",
+            "committed_label": "Inventory",
         },
     }
     assert stored["status"] == "success"
@@ -1853,6 +2311,168 @@ def test_fill_textbox_uses_oracle_table_active_editor_when_row_scoped_locator_do
         debug_trace = helpers_v2._PTR_CURRENT_STRATEGY["debug"]["fill_textbox"]
         assert debug_trace["oracle_table_active_editor_fill"]["status"] == "validated"
         assert debug_trace["resolved_by"] == "oracle_table_active_editor_fill"
+        assert captured["status"] == "success"
+        assert captured["postcondition_passed"] is True
+    finally:
+        helpers_v2._ptr_set_script_data(previous_script_data)
+        helpers_v2._PTR_CURRENT_STRATEGY.clear()
+        helpers_v2._PTR_CURRENT_STRATEGY.update(previous_strategy)
+
+
+def test_locator_value_reads_nested_spinbutton_value_from_oracle_host() -> None:
+    assert helpers_v2._ptr_locator_value(_NestedValueLocator()) == "1"
+
+
+def test_fill_textbox_uses_oracle_spinbutton_keyboard_fill_when_direct_fill_does_not_reflect_value(monkeypatch) -> None:
+    locator = object()
+    spinbutton = _OracleTableEditorLocator()
+    page = _NavigationPage()
+    waited: list[str] = []
+    captured: dict[str, object] = {}
+    previous_script_data = helpers_v2._ptr_clone_json_value(helpers_v2._PTR_SCRIPT_DATA)
+    previous_strategy = helpers_v2._ptr_clone_json_value(helpers_v2._PTR_CURRENT_STRATEGY)
+    try:
+        helpers_v2._ptr_set_script_data(
+            {
+                "tracked_action": "fill_textbox",
+                "parsed_action": {
+                    "type": "fill",
+                    "locator_steps": [
+                        {"method": "get_by_role", "args": ["spinbutton"], "kwargs": {"name": "Picked Quantity"}},
+                    ],
+                },
+                "primary_locator_steps": [
+                    {"method": "get_by_role", "args": ["spinbutton"], "kwargs": {"name": "Picked Quantity"}},
+                ],
+            }
+        )
+        helpers_v2._ptr_reset_strategy_tracking("fill_textbox", "Picked Quantity")
+
+        monkeypatch.setattr(helpers_v2, "_ptr_strict_fill", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_wait_for_field_processing",
+            lambda *args, **kwargs: waited.append("done"),
+        )
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_active_spinbutton_locator",
+            lambda current_page: (
+                {
+                    "id": "ui-id-544|input",
+                    "role": "spinbutton",
+                },
+                spinbutton,
+            ),
+        )
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_locator_value",
+            lambda current_locator: (
+                spinbutton.current_value if current_locator is spinbutton else ""
+            ),
+        )
+        monkeypatch.setattr(helpers_v2, "_ptr_locator_text", lambda *args, **kwargs: "")
+        monkeypatch.setattr(helpers_v2, "_ptr_oracle_label_value_matches", lambda *args, **kwargs: False)
+        monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: [])
+        monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: [])
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_store_experience_episode",
+            lambda **kwargs: captured.update(kwargs),
+        )
+
+        helpers_v2._ptr_fill_textbox(locator, page, "Picked Quantity", "1")
+
+        assert ("press", "ControlOrMeta+A", 3000) in spinbutton.events
+        assert ("press", "Backspace", 3000) in spinbutton.events
+        assert ("press_sequentially", "1", 40, 3000) in spinbutton.events
+        assert ("press", "Tab", 3000) in spinbutton.events
+        assert waited == ["done", "done"]
+        assert helpers_v2._PTR_CURRENT_STRATEGY["recovery"]["handler_name"] == "oracle_spinbutton_fill"
+        debug_trace = helpers_v2._PTR_CURRENT_STRATEGY["debug"]["fill_textbox"]
+        assert debug_trace["oracle_spinbutton_fill"]["status"] == "validated"
+        assert debug_trace["resolved_by"] == "oracle_spinbutton_fill"
+        assert captured["status"] == "success"
+        assert captured["postcondition_passed"] is True
+    finally:
+        helpers_v2._ptr_set_script_data(previous_script_data)
+        helpers_v2._PTR_CURRENT_STRATEGY.clear()
+        helpers_v2._PTR_CURRENT_STRATEGY.update(previous_strategy)
+
+
+def test_fill_textbox_does_not_treat_preexisting_spinbutton_value_as_fill_success(monkeypatch) -> None:
+    locator = object()
+    spinbutton = _OracleTableEditorLocator()
+    spinbutton.current_value = "1"
+    page = _NavigationPage()
+    waited: list[str] = []
+    captured: dict[str, object] = {}
+    previous_script_data = helpers_v2._ptr_clone_json_value(helpers_v2._PTR_SCRIPT_DATA)
+    previous_strategy = helpers_v2._ptr_clone_json_value(helpers_v2._PTR_CURRENT_STRATEGY)
+    try:
+        helpers_v2._ptr_set_script_data(
+            {
+                "tracked_action": "fill_textbox",
+                "parsed_action": {
+                    "type": "fill",
+                    "locator_steps": [
+                        {"method": "get_by_role", "args": ["spinbutton"], "kwargs": {"name": "Picked Quantity"}},
+                    ],
+                },
+                "primary_locator_steps": [
+                    {"method": "get_by_role", "args": ["spinbutton"], "kwargs": {"name": "Picked Quantity"}},
+                ],
+            }
+        )
+        helpers_v2._ptr_reset_strategy_tracking("fill_textbox", "Picked Quantity")
+
+        monkeypatch.setattr(helpers_v2, "_ptr_strict_fill", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_wait_for_field_processing",
+            lambda *args, **kwargs: waited.append("done"),
+        )
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_active_spinbutton_locator",
+            lambda current_page: (
+                {
+                    "id": "ui-id-544|input",
+                    "role": "spinbutton",
+                },
+                spinbutton,
+            ),
+        )
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_locator_value",
+            lambda current_locator: (
+                spinbutton.current_value if current_locator is spinbutton else ""
+            ),
+        )
+        monkeypatch.setattr(helpers_v2, "_ptr_locator_text", lambda *args, **kwargs: "")
+        monkeypatch.setattr(helpers_v2, "_ptr_oracle_label_value_matches", lambda *args, **kwargs: False)
+        monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", lambda *args, **kwargs: [])
+        monkeypatch.setattr(helpers_v2, "_ptr_ai_repair_locators", lambda *args, **kwargs: [])
+        monkeypatch.setattr(
+            helpers_v2,
+            "_ptr_store_experience_episode",
+            lambda **kwargs: captured.update(kwargs),
+        )
+
+        helpers_v2._ptr_fill_textbox(locator, page, "Picked Quantity", "1")
+
+        assert ("press", "ControlOrMeta+A", 3000) in spinbutton.events
+        assert ("press", "Backspace", 3000) in spinbutton.events
+        assert ("press_sequentially", "1", 40, 3000) in spinbutton.events
+        assert ("press", "Tab", 3000) in spinbutton.events
+        assert waited == ["done", "done"]
+        assert helpers_v2._PTR_CURRENT_STRATEGY["strategy"] == "oracle_spinbutton_keyboard_fill"
+        assert helpers_v2._PTR_CURRENT_STRATEGY["recovery"]["handler_name"] == "oracle_spinbutton_fill"
+        debug_trace = helpers_v2._PTR_CURRENT_STRATEGY["debug"]["fill_textbox"]
+        assert debug_trace["oracle_spinbutton_fill"]["status"] == "validated"
+        assert debug_trace["resolved_by"] == "oracle_spinbutton_fill"
         assert captured["status"] == "success"
         assert captured["postcondition_passed"] is True
     finally:
@@ -2308,6 +2928,134 @@ def test_select_search_trigger_option_preserves_exact_text_matching_when_request
 
     assert page.text_calls == [("Wan Fu", True)]
     assert clicked[-1] == "text:Wan Fu:True"
+
+
+def test_select_search_trigger_option_fails_fast_when_title_search_trigger_opens_no_surface(monkeypatch) -> None:
+    trigger = _SearchOptionLocator("search")
+    option = _SearchOptionLocator("raw-option")
+    page = _SearchOptionPage()
+    clicked: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", lambda locator, timeout_ms=None: clicked.append(locator.name))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_search_option_surface",
+        lambda *args, **kwargs: {"option_visible": False, "popup_open": False},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match='Search trigger "Search: Receipt Method" did not open a visible search surface',
+    ):
+        helpers_v2._ptr_select_search_trigger_option(
+            trigger,
+            option,
+            page,
+            "Search: Receipt Method",
+            "Checking Account Receipt.",
+        )
+
+    assert clicked == ["search"]
+
+
+def test_select_search_trigger_option_uses_oracle_lov_direct_entry_when_surface_never_opens(monkeypatch) -> None:
+    trigger = _SearchOptionLocator("search")
+    option = _SearchOptionLocator("raw-option")
+    input_locator = _OracleLovDirectEntryInputLocator("receipt-method-input")
+    page = _OracleLovDirectEntryPage(input_locator)
+    entered: list[tuple[str, str, str]] = []
+    clicked: list[str] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", lambda locator, timeout_ms=None: clicked.append(locator.name))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_extract_locator_metadata",
+        lambda locator: {
+            "id": "pt1:_FOr1:1:_FONSr2:0:MAnt2:1:pt1:RCF1:0:ap1:receiptMethodId::lovIconId",
+            "tag": "a",
+            "role": "",
+        }
+        if locator is trigger
+        else {
+            "id": "pt1:_FOr1:1:_FONSr2:0:MAnt2:1:pt1:RCF1:0:ap1:receiptMethodId::content",
+            "tag": "input",
+            "role": "combobox",
+            "disabled": "",
+            "aria_disabled": "",
+        },
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_search_option_surface",
+        lambda *args, **kwargs: {"option_visible": False, "popup_open": False},
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_enter_search_value",
+        lambda locator, value, timeout_ms=None, current_page=None, label="": entered.append((locator.name, value, label)),
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_oracle_label_value_matches",
+        lambda current_page, label, expected_value: label == "Receipt Method" and expected_value == "Checking Account Receipt.",
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_value", lambda locator: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_locator_text", lambda locator: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_set_recovery_record", lambda *args, **kwargs: None)
+
+    helpers_v2._ptr_select_search_trigger_option(
+        trigger,
+        option,
+        page,
+        "Search: Receipt Method",
+        "Checking Account Receipt.",
+    )
+
+    assert clicked == ["search"]
+    assert page.locator_calls == ['[id="pt1:_FOr1:1:_FONSr2:0:MAnt2:1:pt1:RCF1:0:ap1:receiptMethodId::content"]']
+    assert entered == [("receipt-method-input", "Checking Account Receipt.", "Receipt Method")]
+    assert input_locator.presses == [("Tab", 3000)]
+
+
+def test_select_search_trigger_option_bounds_non_raw_candidate_timeout(monkeypatch) -> None:
+    trigger = _SearchOptionLocator("search")
+    option = _SearchOptionLocator("raw-option")
+    page = _SearchOptionPage()
+    clicked: list[tuple[str, int | None]] = []
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_search_option_surface",
+        lambda *args, **kwargs: {"option_visible": False, "popup_open": True},
+    )
+
+    def _fake_click(locator, timeout_ms=None):
+        clicked.append((locator.name, timeout_ms))
+        if locator.name == "raw-option":
+            raise RuntimeError("raw candidate miss")
+
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _fake_click)
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: {"dialog_count": 1, "body_marker": "state"})
+    monkeypatch.setattr(helpers_v2, "_ptr_option_selection_postcondition", lambda *args, **kwargs: True)
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+
+    helpers_v2._ptr_select_search_trigger_option(
+        trigger,
+        option,
+        page,
+        "Search: Receipt Method",
+        "Checking Account Receipt.",
+    )
+
+    assert clicked[1:] == [
+        ("raw-option", 6000),
+        ("option:Checking Account Receipt.", 1500),
+    ]
 
 
 def test_wait_for_oracle_searchselect_query_polls_until_requested_value_reflects(monkeypatch) -> None:
@@ -2962,6 +3710,52 @@ def test_rank_ai_dom_candidates_prioritizes_select_for_select_option() -> None:
     assert ranked[0]["id"] == "businessUnitId"
 
 
+def test_rank_ai_dom_candidates_demotes_large_unrelated_select_for_menu_helper() -> None:
+    ranked = helpers_v2._ptr_rank_ai_dom_candidates(
+        "adf_menu_select",
+        "Invoice Actions",
+        [
+            {
+                "tag": "select",
+                "role": "",
+                "text": "USD - US Dollar EUR - Euro GBP - Pound Sterling JPY - Yen " * 8,
+                "aria_label": "",
+                "labelledby_text": "",
+                "oracle_host_text": "",
+                "oracle_host_data_oj_field": "",
+                "title": "USD - US Dollar",
+                "label_hint": "",
+                "placeholder": "",
+                "name": "",
+                "id": "currencySelect",
+                "html": "<select id='currencySelect'></select>",
+                "data_oj_field": "",
+                "oracle_host_tag": "",
+            },
+            {
+                "tag": "a",
+                "role": "menuitem",
+                "text": "Invoice Actions",
+                "aria_label": "Invoice Actions",
+                "labelledby_text": "",
+                "oracle_host_text": "",
+                "oracle_host_data_oj_field": "",
+                "title": "",
+                "label_hint": "",
+                "placeholder": "",
+                "name": "",
+                "id": "invoiceActionsTrigger",
+                "html": "<a role='menuitem' aria-label='Invoice Actions'>Invoice Actions</a>",
+                "data_oj_field": "",
+                "oracle_host_tag": "",
+            },
+        ],
+        2,
+    )
+
+    assert ranked[0]["id"] == "invoiceActionsTrigger"
+
+
 def test_select_adf_menu_panel_option_fails_when_completion_action_does_not_advance_flow(monkeypatch) -> None:
     monkeypatch.setenv("PTR_TRANSACTION_COMPLETE_POSTCONDITION_TIMEOUT_MS", "0")
     trigger = _SearchOptionLocator("trigger")
@@ -3018,6 +3812,145 @@ def test_select_adf_menu_panel_option_fails_when_completion_action_does_not_adva
         )
 
     assert clicked == ["trigger", "raw-option", "menuitem:Complete and Review"]
+
+
+def test_select_adf_menu_panel_option_completion_continues_when_menu_visibility_probe_misses_direct_submit(monkeypatch) -> None:
+    monkeypatch.setenv("PTR_TRANSACTION_COMPLETE_POSTCONDITION_TIMEOUT_MS", "0")
+    trigger = _SearchOptionLocator("trigger")
+    option = _SearchOptionLocator("raw-option")
+    page = _CompletionPage(title_text="Create Receipt - Accounts Receivable - Oracle Fusion Cloud Applications")
+    clicked: list[str] = []
+    state = {
+        "primary_heading": "Create Receipt",
+        "body_marker": "Create Receipt Status Incomplete",
+    }
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_wait_for_oracle_menu_trigger_option_visibility",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_oracle_visible_popup_option_candidates",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_locator_is_actionable",
+        lambda locator, timeout_ms=None: getattr(locator, "name", "") == "raw-option",
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")),
+    )
+
+    def _observe(*args, **kwargs):
+        return {
+            "url": page.url,
+            "title": page.title_text,
+            "guided_step": "",
+            "guided_flow": {"primary_heading": state["primary_heading"]},
+            "dialog_count": 1,
+            "body_marker": state["body_marker"],
+        }
+
+    def _strict_click(locator, timeout_ms=None):
+        clicked.append(locator.name)
+        if locator.name == "raw-option":
+            state["primary_heading"] = "Review Receipt"
+            state["body_marker"] = "Review Receipt Status Complete"
+
+    monkeypatch.setattr(helpers_v2, "_ptr_current_guided_step", lambda current_page: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_guided_flow_state", lambda current_page: {"primary_heading": state["primary_heading"]})
+    monkeypatch.setattr(helpers_v2, "_ptr_body_marker", lambda current_page: state["body_marker"])
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", _observe)
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+
+    helpers_v2._ptr_select_adf_menu_panel_option(
+        trigger,
+        option,
+        page,
+        "Submit and Create Another",
+        "Submit",
+        trigger_kind="title",
+    )
+
+    assert clicked == ["trigger", "raw-option"]
+    assert page.waits == [350, 250]
+
+
+def test_select_adf_menu_panel_option_completion_uses_visible_popup_submit_when_page_wide_candidates_miss(monkeypatch) -> None:
+    monkeypatch.setenv("PTR_TRANSACTION_COMPLETE_POSTCONDITION_TIMEOUT_MS", "0")
+    trigger = _SearchOptionLocator("trigger")
+    option = _SearchOptionLocator("raw-option")
+    page = _CompletionPage(title_text="Create Receipt - Accounts Receivable - Oracle Fusion Cloud Applications")
+    clicked: list[str] = []
+    state = {
+        "primary_heading": "Create Receipt",
+        "body_marker": "Create Receipt Status Incomplete",
+    }
+
+    monkeypatch.setattr(helpers_v2, "_ptr_record_strategy_attempt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(helpers_v2, "_ptr_wait_for_field_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_locator_is_actionable",
+        lambda locator, timeout_ms=None: getattr(locator, "name", "") == "scope:[role='menu']:visible:menuitem:Submit:True",
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")),
+    )
+
+    def _observe(*args, **kwargs):
+        return {
+            "url": page.url,
+            "title": page.title_text,
+            "guided_step": "",
+            "guided_flow": {"primary_heading": state["primary_heading"]},
+            "dialog_count": 1,
+            "body_marker": state["body_marker"],
+        }
+
+    def _strict_click(locator, timeout_ms=None):
+        clicked.append(locator.name)
+        if locator.name == "scope:[role='menu']:visible:menuitem:Submit:True":
+            state["primary_heading"] = "Review Receipt"
+            state["body_marker"] = "Review Receipt Status Complete"
+
+    monkeypatch.setattr(helpers_v2, "_ptr_current_guided_step", lambda current_page: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_guided_flow_state", lambda current_page: {"primary_heading": state["primary_heading"]})
+    monkeypatch.setattr(helpers_v2, "_ptr_body_marker", lambda current_page: state["body_marker"])
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", _observe)
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+
+    helpers_v2._ptr_select_adf_menu_panel_option(
+        trigger,
+        option,
+        page,
+        "Submit and Create Another",
+        "Submit",
+        trigger_kind="title",
+    )
+
+    assert clicked == ["trigger", "scope:[role='menu']:visible:menuitem:Submit:True"]
+    assert ("menuitem", "Submit", True) in page.role_calls
+    assert ("[role='menu']:visible", "menuitem", "Submit", True) in page.scoped_role_calls
 
 
 def test_select_adf_menu_panel_option_completion_uses_menuitem_row_when_text_cell_advances_nothing(monkeypatch) -> None:
@@ -3915,6 +4848,104 @@ def test_click_with_candidates_keeps_failing_ok_when_warning_dialog_is_visible(m
     assert stored == {}
 
 
+def test_click_with_candidates_dismisses_visible_oracle_warning_dialog_before_ai(monkeypatch) -> None:
+    page = _WarningDialogPage()
+    locator = _DateLocator("apply")
+    recovery: dict[str, object] = {}
+    stored: dict[str, object] = {}
+    clicked: list[str] = []
+    warning_states = iter(
+        [
+            {
+                "dialog_count": 1,
+                "warning_visible": True,
+                "warning_title": "Warning",
+                "warning_text": "The payment terms for this invoice differ from the payment terms on the purchase order.",
+                "ok_button_visible": True,
+                "any_ok_button_visible": True,
+                "ok_button_id": "warning-ok-id",
+                "close_button_id": "",
+            },
+            {
+                "dialog_count": 0,
+                "warning_visible": False,
+                "warning_title": "",
+                "warning_text": "",
+                "ok_button_visible": False,
+                "any_ok_button_visible": False,
+                "ok_button_id": "",
+                "close_button_id": "",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_observe",
+        lambda *args, **kwargs: {
+            "dialog_count": 0,
+            "title": "Create Invoice - Oracle Fusion Cloud Applications",
+            "active_element": {"id": "warning-ok-id"},
+        },
+    )
+
+    def _strict_click(target, timeout_ms=None):
+        clicked.append(target.name)
+        if target.name == "apply":
+            raise RuntimeError(
+                "Locator.click: Timeout 30000ms exceeded.\n"
+                "Call log:\n"
+                "  - <div class=\"AFModalGlassPane\"></div> intercepts pointer events"
+            )
+
+    monkeypatch.setattr(helpers_v2, "_ptr_strict_click", _strict_click)
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_locator_is_actionable",
+        lambda locator, timeout_ms=None: getattr(locator, "name", "") == 'locator:[id="warning-ok-id"]',
+    )
+    monkeypatch.setattr(helpers_v2, "_ptr_try_expand_oracle_quick_actions", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_home_search", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_guided_action_card", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_notification_badge", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_quick_action_exact_match", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_recorded_button_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_oracle_warning_dialog_state", lambda *args, **kwargs: next(warning_states))
+    monkeypatch.setattr(helpers_v2, "_ptr_store_experience_episode", lambda **kwargs: stored.update(kwargs))
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_set_recovery_record",
+        lambda source, kind, handler_name, details=None: recovery.update(
+            {"source": source, "kind": kind, "handler_name": handler_name, "details": details or {}}
+        ),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_experience_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("experience should not run")),
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_ai_repair_locators",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ai should not run")),
+    )
+
+    helpers_v2._ptr_click_with_candidates(
+        page,
+        "Apply",
+        locator,
+        "click_button_target",
+        lambda before, after: False,
+    )
+
+    assert clicked == ["apply", 'locator:[id="warning-ok-id"]']
+    assert recovery["handler_name"] == "oracle_warning_dialog_dismiss"
+    assert recovery["kind"] == "warning_dialog_dismiss"
+    assert recovery["details"]["strategy_name"] == "oracle_warning_dialog_ok"
+    assert stored["status"] == "success"
+    assert stored["postcondition_kind"] == "warning_dialog_dismissed"
+
+
 def test_click_with_candidates_does_not_skip_non_ok_button_when_dialog_is_absent(monkeypatch) -> None:
     page = _OracleHomePage()
     locator = _DateLocator("save")
@@ -4585,3 +5616,201 @@ def test_navigation_button_on_non_guided_page_succeeds_when_generic_effect_has_n
     monkeypatch.setattr(helpers_v2, "_ptr_strict_click", lambda *args, **kwargs: None)
 
     helpers_v2._ptr_click_navigation_button(locator, page, "Submit")
+
+
+def test_ptr_resolve_substitutes_ai_extracted_values(monkeypatch) -> None:
+    monkeypatch.setattr(helpers_v2, "_PTR_AI_EXTRACTED", {"order_number": "5724"})
+    assert helpers_v2._ptr_resolve("{{order_number}}") == "5724"
+    assert helpers_v2._ptr_resolve("PO {{order_number}} confirmed") == "PO 5724 confirmed"
+    # Unknown placeholders are left intact (fail loudly at the locator, not here).
+    assert helpers_v2._ptr_resolve("{{missing}}") == "{{missing}}"
+    # Non-strings pass through unchanged.
+    assert helpers_v2._ptr_resolve(1234) == 1234
+
+
+def test_click_text_target_resolves_placeholder_label_for_recovery(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(helpers_v2, "_PTR_AI_EXTRACTED", {"transaction_number": "15900"})
+    monkeypatch.setattr(helpers_v2, "_ptr_register_page", lambda page: page)
+    monkeypatch.setattr(helpers_v2, "_ptr_observe", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_strict_click",
+        lambda locator: (_ for _ in ()).throw(RuntimeError("strict failed")),
+    )
+
+    def _capture_expand(page, label):
+        captured["expand_label"] = label
+        return False
+
+    def _capture_experience(page, helper, label, last_error, locator=None):
+        captured["experience_label"] = label
+        return []
+
+    def _capture_ai(*, current_page, helper, label, last_error, locator, postcondition_kind, failure_message, execute_locator):
+        captured["ai_label"] = label
+        return None, RuntimeError("no match")
+
+    monkeypatch.setattr(helpers_v2, "_ptr_try_expand_oracle_quick_actions", _capture_expand)
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_quick_action_exact_match", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_notification_badge", lambda *args, **kwargs: "")
+    monkeypatch.setattr(helpers_v2, "_ptr_try_oracle_home_search", lambda *args, **kwargs: False)
+    monkeypatch.setattr(helpers_v2, "_ptr_experience_repair_locators", _capture_experience)
+    monkeypatch.setattr(helpers_v2, "_ptr_execute_ai_repair_rounds", _capture_ai)
+
+    with pytest.raises(RuntimeError, match='15900'):
+        helpers_v2._ptr_click_text_target(SimpleNamespace(), SimpleNamespace(), "{{transaction_number}}")
+
+    assert captured["expand_label"] == "15900"
+    assert captured["experience_label"] == "15900"
+    assert captured["ai_label"] == "15900"
+
+
+class _FakeAiResponse:
+    status = 200
+
+    def __init__(self, body: str) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body.encode("utf-8")
+
+    def __enter__(self) -> "_FakeAiResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def test_ptr_ai_extract_stores_value_and_writes_flow_output(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(helpers_v2, "_PTR_AI_EXTRACTED", {})
+    output_path = tmp_path / "script_step_output.json"
+    monkeypatch.setenv("PTR_SCRIPT_STEP_OUTPUT_PATH", str(output_path))
+
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_self_repair_enabled", lambda: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "get_runner_env_value",
+        lambda key: "sk-test" if key == "OPENAI_API_KEY" else "",
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_capture_ai_extract_context_screenshot",
+        lambda page: {"status": "captured", "image_url": "data:image/png;base64,AAAA"},
+    )
+    body = json.dumps({"output_text": json.dumps({"value": "5724"})})
+    monkeypatch.setattr(helpers_v2, "urlopen", lambda *args, **kwargs: _FakeAiResponse(body))
+
+    value = helpers_v2._ptr_ai_extract(SimpleNamespace(), "order_number", "extract order number only")
+
+    assert value == "5724"
+    assert helpers_v2._PTR_AI_EXTRACTED["order_number"] == "5724"
+    assert json.loads(output_path.read_text(encoding="utf-8")) == {"outputs": {"order_number": "5724"}}
+
+
+def test_ptr_capture_ai_extract_context_screenshot_waits_before_capture(monkeypatch) -> None:
+    page = _AIScreenshotPage()
+    monkeypatch.setenv("PTR_AI_EXTRACT_PRE_CAPTURE_WAIT_MS", "750")
+    monkeypatch.setenv("PTR_AI_EXTRACT_SCREENSHOT_FULL_PAGE", "false")
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE_SNAPSHOT", {})
+    monkeypatch.setattr(helpers_v2, "_PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG", None)
+
+    context = helpers_v2._ptr_capture_ai_extract_context_screenshot(page)
+
+    assert page.waits == [750]
+    assert page.screenshot_calls == [{"full_page": False, "type": "png", "scale": "css"}]
+    assert context["status"] == "captured"
+    assert context["format"] == "png"
+    assert context["full_page"] is False
+    assert context["pre_capture_wait_ms"] == 750
+    assert helpers_v2._PTR_NEXT_STEP_SCREENSHOT_OVERRIDE_PNG == b"fake-jpeg-bytes"
+
+
+def test_ptr_ai_extract_includes_structured_page_context_in_request(monkeypatch) -> None:
+    monkeypatch.setattr(helpers_v2, "_PTR_AI_EXTRACTED", {})
+    monkeypatch.setattr(helpers_v2, "_PTR_LAST_PAGE_SNAPSHOT", {})
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_self_repair_enabled", lambda: True)
+    monkeypatch.setattr(
+        helpers_v2,
+        "get_runner_env_value",
+        lambda key: "sk-test" if key == "OPENAI_API_KEY" else "",
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_capture_page_snapshot",
+        lambda page: {
+            "page_title": "Transactions - Billing - Oracle Fusion Cloud Applications",
+            "page_url": "https://oracle.example.com/fscmUI/redwood/receivables/transactions",
+            "page_text": "Transaction Number 1045 Complete Invoice Example Customer",
+            "oracle_tables": [
+                {
+                    "headers": ["Transaction Number", "Status"],
+                    "rows": [["1045", "Complete"], ["1044", "Draft"]],
+                }
+            ],
+            "page_semantics": {
+                "label_values": [{"label": "Transaction Number", "value": "1045"}],
+                "text_candidates": [{"text": "Complete"}, {"text": "Invoice"}],
+                "dialogs": [],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        helpers_v2,
+        "_ptr_capture_ai_extract_context_screenshot",
+        lambda page: {
+            "status": "captured",
+            "image_url": "data:image/png;base64,AAAA",
+            "pre_capture_wait_ms": 1200,
+            "format": "png",
+            "media_type": "image/png",
+            "full_page": False,
+            "scale": "css",
+        },
+    )
+
+    captured_request: dict[str, Any] = {}
+
+    def _fake_urlopen(request, timeout=0):
+        captured_request["payload"] = json.loads(request.data.decode("utf-8"))
+        captured_request["timeout"] = timeout
+        return _FakeAiResponse(json.dumps({"output_text": json.dumps({"value": "1045"})}))
+
+    monkeypatch.setattr(helpers_v2, "urlopen", _fake_urlopen)
+
+    value = helpers_v2._ptr_ai_extract(
+        SimpleNamespace(),
+        "transaction_number",
+        "extract transaction number from the table, of first row",
+    )
+
+    assert value == "1045"
+    user_content = captured_request["payload"]["input"][1]["content"]
+    assert user_content[0]["type"] == "input_text"
+    assert "Structured page evidence:" in user_content[0]["text"]
+    assert '"oracle_tables"' in user_content[0]["text"]
+    assert "Transactions - Billing - Oracle Fusion Cloud Applications" in user_content[0]["text"]
+    assert "1045" in user_content[0]["text"]
+    assert "first row" in user_content[0]["text"]
+    assert user_content[1]["type"] == "input_image"
+    assert user_content[1]["image_url"] == "data:image/png;base64,AAAA"
+
+
+def test_ptr_ai_extract_raises_on_empty_value(monkeypatch) -> None:
+    monkeypatch.setattr(helpers_v2, "_PTR_AI_EXTRACTED", {})
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_self_repair_enabled", lambda: True)
+    monkeypatch.setattr(helpers_v2, "get_runner_env_value", lambda key: "sk-test")
+    monkeypatch.setattr(helpers_v2, "_ptr_capture_ai_extract_context_screenshot", lambda page: {})
+    body = json.dumps({"output_text": json.dumps({"value": ""})})
+    monkeypatch.setattr(helpers_v2, "urlopen", lambda *args, **kwargs: _FakeAiResponse(body))
+
+    with pytest.raises(RuntimeError, match="empty value"):
+        helpers_v2._ptr_ai_extract(SimpleNamespace(), "order_number", "extract order number only")
+
+
+def test_ptr_ai_extract_raises_when_ai_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(helpers_v2, "_PTR_AI_EXTRACTED", {})
+    monkeypatch.setattr(helpers_v2, "_ptr_ai_self_repair_enabled", lambda: False)
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        helpers_v2._ptr_ai_extract(SimpleNamespace(), "order_number", "extract order number only")

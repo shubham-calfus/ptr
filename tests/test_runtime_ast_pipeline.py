@@ -101,6 +101,25 @@ def test_prepare_script_via_ast_tracks_goto_and_press_actions() -> None:
     ) in prepared
 
 
+def test_prepare_script_via_ast_drops_leading_timeout_wait_before_first_goto() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.wait_for_timeout(180000)
+    page.goto("https://example.test/login")
+    browser.close()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    assert "page.wait_for_timeout(180000)" not in prepared
+    assert (
+        "_ptr_tracked_action('goto', 'https://example.test/login', _ptr_goto_page, "
+        "page, 'https://example.test/login')"
+    ) in prepared
+
+
 def test_generate_full_script_inlines_raw_fallback_for_unsafe_generic_locator_click() -> None:
     script = """
 def run(playwright):
@@ -379,3 +398,53 @@ def test_prepare_script_via_ast_preserves_exact_day_match_for_date_pick() -> Non
         "page.get_by_title('Select Date.'), page.get_by_role('button', name='3', exact=True), "
         "page, 'Select Date.', '3')"
     ) in prepared
+
+
+def test_ai_extract_parses_into_action() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://example.test/order")
+    ai_extract("order_number", "extract order number only, which is a 4 digit number")
+    page.get_by_title("{{order_number}}").click()"""
+    )
+
+    actions = parse_script(script)
+    extracts = [a for a in actions if a.type == "ai_extract"]
+    assert len(extracts) == 1
+    assert extracts[0].name == "order_number"
+    assert extracts[0].ai_prompt == "extract order number only, which is a 4 digit number"
+
+
+def test_ai_extract_rejects_missing_prompt() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://example.test/order")
+    ai_extract("order_number")"""
+    )
+
+    with pytest.raises(ParseCoverageError):
+        parse_script(script)
+
+
+def test_ai_extract_generates_helper_and_runtime_resolve() -> None:
+    script = _full_recording(
+        """    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://example.test/order")
+    ai_extract("order_number", "extract order number only")
+    page.get_by_title("{{order_number}}").click()"""
+    )
+
+    prepared = _prepare_script_via_ast(script)
+
+    # The extract step calls the runtime vision helper with (page, name, prompt).
+    assert "_ptr_ai_extract, page, 'order_number', 'extract order number only'" in prepared
+    # The later locator resolves the placeholder at runtime, not at prep time.
+    assert "page.get_by_title(_ptr_resolve('{{order_number}}'))" in prepared
+    # The runtime helpers are importable in the prepared script.
+    assert "from src.runtime.helpers_v2 import *" in prepared
