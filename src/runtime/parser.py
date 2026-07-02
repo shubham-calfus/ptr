@@ -25,6 +25,28 @@ class ParseCoverageError(ValueError):
     """Raised when the AST parser encounters run() statements it cannot model safely."""
 
 
+@dataclass(frozen=True)
+class SourceExpr:
+    """A source expression that must stay live in generated Python."""
+
+    source: str
+
+
+def _serialize_source_value(value: Any) -> Any:
+    if isinstance(value, SourceExpr):
+        return value.source
+    if isinstance(value, list):
+        return [_serialize_source_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_serialize_source_value(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _serialize_source_value(key): _serialize_source_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 @dataclass
 class LocatorStep:
     """One segment in a Playwright locator chain.
@@ -91,7 +113,7 @@ class Action:
         if self.url is not None:
             d["url"] = self.url
         if self.goto_kwargs:
-            d["goto_kwargs"] = self.goto_kwargs
+            d["goto_kwargs"] = _serialize_source_value(self.goto_kwargs)
         if self.page_var != "page":
             d["page_var"] = self.page_var
         if self.page_source_var is not None:
@@ -100,20 +122,20 @@ class Action:
             d["locator_steps"] = [
                 {
                     "method": s.method,
-                    **({"args": s.args} if s.args else {}),
-                    **({"kwargs": s.kwargs} if s.kwargs else {}),
+                    **({"args": _serialize_source_value(s.args)} if s.args else {}),
+                    **({"kwargs": _serialize_source_value(s.kwargs)} if s.kwargs else {}),
                     **({"is_property": True} if s.is_property else {}),
                 }
                 for s in self.locator_steps
             ]
         if self.value is not None:
-            d["value"] = self.value
+            d["value"] = _serialize_source_value(self.value)
         if self.key is not None:
-            d["key"] = self.key
+            d["key"] = _serialize_source_value(self.key)
         if self.option_value is not None:
-            d["option_value"] = self.option_value
+            d["option_value"] = _serialize_source_value(self.option_value)
         if self.option_kwargs:
-            d["option_kwargs"] = self.option_kwargs
+            d["option_kwargs"] = _serialize_source_value(self.option_kwargs)
         if self.wait_state is not None:
             d["wait_state"] = self.wait_state
         if self.wait_ms is not None:
@@ -134,6 +156,30 @@ class Action:
         return d
 
 
+@dataclass
+class MultiLineLoop:
+    """A supported repeatable line-item loop over runtime `multi_line` rows."""
+
+    line: int
+    raw: str
+    index_var: str
+    row_var: str
+    body: list[Action] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "multi_line_loop",
+            "line": self.line,
+            "index_var": self.index_var,
+            "row_var": self.row_var,
+            "body": [action.to_dict() for action in self.body],
+            "raw": self.raw,
+        }
+
+
+ParsedItem = Action | MultiLineLoop
+
+
 # ---------------------------------------------------------------------------
 # AST helpers
 # ---------------------------------------------------------------------------
@@ -151,15 +197,15 @@ def _const_value(node: ast.expr) -> Any:
             _const_value(k) if k is not None else None: _const_value(v)
             for k, v in zip(node.keys, node.values)
         }
-    if isinstance(node, (ast.Name, ast.Attribute)):
-        return ast.unparse(node)
+    if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript, ast.Call, ast.JoinedStr)):
+        return SourceExpr(ast.unparse(node))
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         inner = _const_value(node.operand)
         if isinstance(inner, (int, float)):
             return -inner
     # Fall back to source representation
     try:
-        return ast.unparse(node)
+        return SourceExpr(ast.unparse(node))
     except Exception:
         return "<expr>"
 
@@ -169,6 +215,12 @@ def _extract_call_args(node: ast.Call) -> tuple[list[Any], dict[str, Any]]:
     args = [_const_value(a) for a in node.args]
     kwargs = {kw.arg: _const_value(kw.value) for kw in node.keywords if kw.arg is not None}
     return args, kwargs
+
+
+def _string_or_expr(value: Any) -> Any:
+    if isinstance(value, SourceExpr):
+        return value
+    return str(value) if value is not None else None
 
 
 @dataclass
@@ -430,7 +482,7 @@ def _classify_action(
 
         # page.goto("url")
         if method == "goto" and base_var not in _SETUP_VARS:
-            url = str(args[0]) if args else None
+            url = _string_or_expr(args[0]) if args else None
             goto_kwargs = dict(kwargs)
             return Action(
                 type="goto",
@@ -463,7 +515,7 @@ def _classify_action(
 
         # page.wait_for_load_state("networkidle")
         if method == "wait_for_load_state" and base_var not in _SETUP_VARS:
-            state = str(args[0]) if args else "load"
+            state = _string_or_expr(args[0]) if args else "load"
             return Action(
                 type="wait",
                 line=line_no,
@@ -555,12 +607,12 @@ def _classify_action(
 
     # Populate typed fields based on action type
     if action_method == "fill":
-        action.value = str(action_args[0]) if action_args else None
+        action.value = _string_or_expr(action_args[0]) if action_args else None
     elif action_method == "press":
-        action.key = str(action_args[0]) if action_args else None
+        action.key = _string_or_expr(action_args[0]) if action_args else None
     elif action_method == "select_option":
         if action_args:
-            action.option_value = str(action_args[0]) if isinstance(action_args[0], str) else None
+            action.option_value = _string_or_expr(action_args[0])
         action.option_kwargs = action_kwargs
 
     # Enrich with locator metadata
@@ -639,6 +691,69 @@ def _get_raw_line(source_lines: list[str], node: ast.stmt) -> str:
     return "\n".join(line for line in lines).strip()
 
 
+def _supported_multi_line_loop_signature() -> str:
+    return 'for index, line in enumerate(multi_line, start=1):'
+
+
+def _classify_multi_line_loop(
+    stmt: ast.For,
+    source_lines: list[str],
+) -> tuple[MultiLineLoop | None, list[tuple[int, str, str]]]:
+    raw_line = _get_raw_line(source_lines, stmt)
+    preview = _format_statement_preview(raw_line)
+    unsupported_preview = (
+        f"{preview} [supported shape: {_supported_multi_line_loop_signature()}]"
+    )
+
+    if stmt.orelse:
+        return None, [(stmt.lineno, type(stmt).__name__, unsupported_preview)]
+
+    if not isinstance(stmt.target, ast.Tuple) or len(stmt.target.elts) != 2:
+        return None, [(stmt.lineno, type(stmt).__name__, unsupported_preview)]
+    if not all(isinstance(part, ast.Name) for part in stmt.target.elts):
+        return None, [(stmt.lineno, type(stmt).__name__, unsupported_preview)]
+
+    if not isinstance(stmt.iter, ast.Call):
+        return None, [(stmt.lineno, type(stmt).__name__, unsupported_preview)]
+    if not isinstance(stmt.iter.func, ast.Name) or stmt.iter.func.id != "enumerate":
+        return None, [(stmt.lineno, type(stmt).__name__, unsupported_preview)]
+
+    enum_args = list(stmt.iter.args)
+    enum_kwargs = {kw.arg: kw.value for kw in stmt.iter.keywords if kw.arg is not None}
+    if not enum_args or not isinstance(enum_args[0], ast.Name) or enum_args[0].id != "multi_line":
+        return None, [(stmt.lineno, type(stmt).__name__, unsupported_preview)]
+
+    start_value: Any = 1
+    if len(enum_args) >= 2:
+        start_value = _const_value(enum_args[1])
+    elif "start" in enum_kwargs:
+        start_value = _const_value(enum_kwargs["start"])
+    if start_value != 1:
+        return None, [(stmt.lineno, type(stmt).__name__, unsupported_preview)]
+
+    loop_body, unsupported = _collect_supported_items(
+        stmt.body,
+        source_lines,
+        allow_multi_line_loop=False,
+    )
+    if unsupported:
+        return None, unsupported
+
+    index_var = stmt.target.elts[0].id
+    row_var = stmt.target.elts[1].id
+    body_actions = [item for item in loop_body if isinstance(item, Action)]
+    return (
+        MultiLineLoop(
+            line=stmt.lineno,
+            raw=raw_line,
+            index_var=index_var,
+            row_var=row_var,
+            body=body_actions,
+        ),
+        [],
+    )
+
+
 def _find_run_function(tree: ast.Module) -> ast.FunctionDef | None:
     """Find the run(playwright) function in the AST."""
     for node in ast.walk(tree):
@@ -648,7 +763,54 @@ def _find_run_function(tree: ast.Module) -> ast.FunctionDef | None:
     return None
 
 
-def parse_script(source: str) -> list[Action]:
+def _collect_supported_items(
+    statements: list[ast.stmt],
+    source_lines: list[str],
+    *,
+    allow_multi_line_loop: bool,
+) -> tuple[list[ParsedItem], list[tuple[int, str, str]]]:
+    items: list[ParsedItem] = []
+    unsupported_statements: list[tuple[int, str, str]] = []
+
+    for stmt in statements:
+        raw_line = _get_raw_line(source_lines, stmt)
+
+        if isinstance(stmt, ast.Assign):
+            setup_action = _classify_setup_assignment(stmt, raw_line)
+            if setup_action is not None:
+                items.append(setup_action)
+                continue
+
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            ai_extract_action = _classify_ai_extract(stmt.value, raw_line, stmt.lineno)
+            if ai_extract_action is not None:
+                items.append(ai_extract_action)
+                continue
+            chain = _unwind_chain(stmt.value)
+            action = _classify_action(chain, raw_line, stmt.lineno)
+            if action is not None:
+                items.append(action)
+                continue
+
+        if allow_multi_line_loop and isinstance(stmt, ast.For):
+            loop_item, loop_unsupported = _classify_multi_line_loop(stmt, source_lines)
+            if loop_item is not None:
+                items.append(loop_item)
+                continue
+            unsupported_statements.extend(loop_unsupported)
+            continue
+
+        if _is_ignorable_statement(stmt):
+            continue
+
+        unsupported_statements.append(
+            (stmt.lineno, type(stmt).__name__, _format_statement_preview(raw_line))
+        )
+
+    return items, unsupported_statements
+
+
+def parse_script(source: str) -> list[ParsedItem]:
     """Parse a Playwright recording script into a list of Actions.
 
     This is the main entry point. It:
@@ -674,37 +836,11 @@ def parse_script(source: str) -> list[Action]:
             "The script must define a function named 'run' or 'main'."
         )
 
-    actions: list[Action] = []
-    unsupported_statements: list[tuple[int, str, str]] = []
-
-    for stmt in run_func.body:
-        raw_line = _get_raw_line(source_lines, stmt)
-
-        # --- Assignment: browser = playwright.chromium.launch(...) etc. ---
-        if isinstance(stmt, ast.Assign):
-            setup_action = _classify_setup_assignment(stmt, raw_line)
-            if setup_action is not None:
-                actions.append(setup_action)
-                continue
-
-        # --- Expression statements: page.get_by_role(...).click() etc. ---
-        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            ai_extract_action = _classify_ai_extract(stmt.value, raw_line, stmt.lineno)
-            if ai_extract_action is not None:
-                actions.append(ai_extract_action)
-                continue
-            chain = _unwind_chain(stmt.value)
-            action = _classify_action(chain, raw_line, stmt.lineno)
-            if action is not None:
-                actions.append(action)
-                continue
-
-        if _is_ignorable_statement(stmt):
-            continue
-
-        unsupported_statements.append(
-            (stmt.lineno, type(stmt).__name__, _format_statement_preview(raw_line))
-        )
+    actions, unsupported_statements = _collect_supported_items(
+        run_func.body,
+        source_lines,
+        allow_multi_line_loop=True,
+    )
 
     if unsupported_statements:
         details = "\n".join(

@@ -10,15 +10,8 @@ from typing import Any
 
 from common_lib.storage.storage_client import RetrievalMode, storage
 
-_AETHERION_HEADER_ICON = (
-    "data:image/svg+xml;utf8,"
-    "<svg xmlns='http://www.w3.org/2000/svg' width='174' height='30' viewBox='0 0 174 30' fill='none'>"
-    "<rect x='1' y='1' width='28' height='28' rx='8' fill='%23F4F7FF' stroke='%23D7E0F4'/>"
-    "<path d='M9 10.5 15 7l6 3.5v7L15 21l-6-3.5v-7Z' stroke='%23172233' stroke-width='1.7' stroke-linejoin='round' fill='none'/>"
-    "<path d='M15 11.2v7.1M9.7 10.8 15 14l5.3-3.2' stroke='%23172233' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/>"
-    "<text x='40' y='20' font-family='Syne, Arial, sans-serif' font-size='12' font-weight='700' fill='%23172233'>Aetherion</text>"
-    "</svg>"
-)
+from ._brand_assets import AETHERION_HEADER_ICON as _AETHERION_HEADER_ICON
+from .recording_suggestions import attach_recording_suggestions
 
 
 def _get_bucket_name() -> str:
@@ -189,17 +182,10 @@ def _result_sensitive_literals(result: dict[str, Any]) -> set[str]:
         if value and not value.startswith("{{"):
             literals.add(value)
 
-    for item in (result.get("flow_input_status") or {}).values():
-        if not any(_is_sensitive_name(item.get(field)) for field in ("name", "label")):
+    for name, raw_value in (result.get("extracted_outputs") or {}).items():
+        if not _is_sensitive_name(name):
             continue
-        value = _safe_text(item.get("value"))
-        if value and not value.startswith("{{"):
-            literals.add(value)
-
-    for item in result.get("flow_output_results") or []:
-        if not any(_is_sensitive_name(item.get(field)) for field in ("name", "label")):
-            continue
-        value = _safe_text(item.get("value"))
+        value = _safe_text(raw_value)
         if value and not value.startswith("{{"):
             literals.add(value)
 
@@ -893,7 +879,9 @@ def _failure_context_block(action: dict[str, Any]) -> str:
         return ""
 
     return (
-        '<div class="detail-card failure-context-card">'
+        # Developer-only: the active-element / DOM-candidate detail is debugging context,
+        # not something an end user needs (the failure callout already states what failed).
+        '<div class="detail-card failure-context-card dev-only">'
         '<div class="failure-context-head">'
         '<div class="dc-title">Failure Context</div>'
         f'<div class="kv-row">{"".join(rows)}</div>'
@@ -903,11 +891,79 @@ def _failure_context_block(action: dict[str, Any]) -> str:
     )
 
 
+def _recording_suggestion_block(action: dict[str, Any]) -> str:
+    """Advisory "fix your recording" card (Tier 1 deterministic + optional Tier 2 AI). Shown in
+    BOTH report views -- it is the actionable guidance a recording owner wants, not dev internals.
+    The recording stays read-only; this only suggests the edit."""
+    suggestion = action.get("recording_suggestion") or {}
+    if not suggestion:
+        return ""
+    severity = _safe_text(suggestion.get("severity")) or "info"
+    tone = {"error": "reco-error", "warning": "reco-warn", "info": "reco-info"}.get(
+        severity, "reco-info"
+    )
+    label = {"error": "Fix recording", "warning": "Improve recording", "info": "Heads up"}.get(
+        severity, "Heads up"
+    )
+
+    recovered = _safe_text(suggestion.get("recovered_locator"))
+    recovered_html = (
+        '<div class="reco-row"><span class="reco-k">Runner recovered with</span>'
+        f'<pre class="code-block reco-code">{escape(recovered)}</pre></div>'
+        if recovered
+        else ""
+    )
+
+    ai = suggestion.get("ai") or {}
+    ai_html = ""
+    if ai:
+        root_cause = _safe_text(ai.get("root_cause"))
+        suggested_edit = _safe_text(ai.get("suggested_edit"))
+        confidence = ai.get("confidence")
+        conf_html = (
+            f'<span class="reco-conf">confidence {escape(str(confidence))}</span>'
+            if isinstance(confidence, (int, float))
+            else ""
+        )
+        edit_html = (
+            f'<pre class="code-block reco-code">{escape(suggested_edit)}</pre>'
+            if suggested_edit
+            else ""
+        )
+        cause_html = f'<div class="reco-cause">{escape(root_cause)}</div>' if root_cause else ""
+        ai_html = (
+            '<div class="reco-ai">'
+            '<div class="reco-ai-head"><span class="reco-ai-tag">AI suggestion</span>'
+            '<span class="reco-ai-note">unverified</span>'
+            f"{conf_html}</div>"
+            f"{cause_html}"
+            f"{edit_html}"
+            "</div>"
+        )
+
+    return (
+        f'<div class="detail-card reco-card {tone}">'
+        '<div class="reco-head">'
+        f'<span class="reco-badge">{escape(label)}</span>'
+        f'<span class="reco-title">{escape(_safe_text(suggestion.get("title")))}</span>'
+        "</div>"
+        f'<div class="reco-diagnosis">{escape(_safe_text(suggestion.get("diagnosis")))}</div>'
+        f'<div class="reco-recommended"><strong>Suggested fix:</strong> '
+        f'{escape(_safe_text(suggestion.get("recommended")))}</div>'
+        f"{recovered_html}"
+        f"{ai_html}"
+        "</div>"
+    )
+
+
 def _script_block(action: dict[str, Any]) -> str:
     raw = _safe_text((action.get("script_data") or {}).get("raw"))
     if not raw:
         return ""
     return (
+        # Visible in the End User view too: the per-step recorded script is the one
+        # "coding" detail end users want (what each step actually did). Other dev
+        # diagnostics (Debug Trace, Executed Script, AI internals) stay dev-only.
         '<div class="detail-card">'
         '<div class="dc-title">Recorded Script</div>'
         f'<pre class="code-block">{escape(raw)}</pre>'
@@ -927,7 +983,7 @@ def _executed_script_block(result: dict[str, Any]) -> str:
     elif execution_mode == "script_step":
         subtitle = "Plain Python script step executed with runner parameter context."
     return (
-        '<details class="recording-script-block executed-script-details">'
+        '<details class="recording-script-block executed-script-details dev-only">'
         '<summary class="executed-script-summary">'
         '<div class="executed-script-summary-main">'
         '<div class="trace-title">Executed Script</div>'
@@ -954,8 +1010,10 @@ def _debug_block(title: str, payload: Any) -> str:
     body = _debug_json_text(payload)
     if not body:
         return ""
+    # Developer-only: both callers ("Debug Settings", "Debug Trace") are raw
+    # diagnostic JSON, hidden in the End User view (toggled by the report's view tabs).
     return (
-        '<div class="detail-card debug-card">'
+        '<div class="detail-card debug-card dev-only">'
         f'<div class="dc-title">{escape(title)}</div>'
         f"{_highlight_json(body)}"
         "</div>"
@@ -967,7 +1025,7 @@ def _preparation_warning_block(result: dict[str, Any]) -> str:
     if not warning:
         return ""
     return (
-        '<div class="detail-card">'
+        '<div class="detail-card dev-only">'
         '<div class="dc-title">Preparation Fallback</div>'
         '<div class="dc-copy">AST coverage did not handle this recording, so the runner executed the substituted raw script instead.</div>'
         f'<pre class="code-block">{escape(warning)}</pre>'
@@ -975,147 +1033,62 @@ def _preparation_warning_block(result: dict[str, Any]) -> str:
     )
 
 
-def _flow_context_request_payload_json(interaction: dict[str, Any]) -> str:
-    payload: dict[str, Any] = {}
-    for field in ("model", "feature", "status", "reason"):
-        value = interaction.get(field)
-        if value not in (None, "", [], {}):
-            payload[field] = value
-    for field in ("system_prompt", "user_prompt"):
-        value = _safe_text(interaction.get(field))
-        if value:
-            payload[field] = value
-    return json.dumps(payload, indent=2, ensure_ascii=False)
-
-
 def _flow_context_block(result: dict[str, Any]) -> str:
-    input_status = result.get("flow_input_status") or {}
-    output_results = result.get("flow_output_results") or []
+    # Outputs are produced explicitly by the recording via ai_extract() / api_helpers.extract()
+    # and surfaced here as extracted_outputs; they feed downstream {{placeholders}} via Flow Context.
     extracted_outputs = result.get("extracted_outputs") or {}
-    if not input_status and not output_results and not extracted_outputs:
+    output_cards = [
+        '<div class="ctx-output-card">'
+        '<div class="ctx-output-top">'
+        f'<span class="ctx-name">{escape(str(name))}</span>'
+        '<span class="ctx-state ok">extracted</span>'
+        "</div>"
+        f'<div class="ctx-output-value">{escape(str(value))}</div>'
+        '<div class="ctx-output-source">script step</div>'
+        "</div>"
+        for name, value in extracted_outputs.items()
+        if str(name or "").strip()
+    ]
+    if not output_cards:
         return ""
-
-    input_rows = ""
-    if input_status:
-        input_rows = "".join(
-            '<div class="ctx-row">'
-            f'<span class="ctx-name">{escape(str(item.get("label") or item.get("name") or ""))}</span>'
-            f'<span class="ctx-state {"ok" if item.get("status") == "available" else "fail"}">{escape(str(item.get("status") or ""))}</span>'
-            f'<span class="ctx-meta">{escape(str(item.get("value") or item.get("error") or ""))}</span>'
-            "</div>"
-            for item in input_status.values()
-        )
-        input_rows = (
-            '<div class="ctx-section">'
-            '<div class="dc-title">Inputs</div>'
-            f'<div class="ctx-list">{input_rows}</div>'
-            "</div>"
-        )
-
-    output_cards: list[str] = []
-    rendered_output_names: set[str] = set()
-    for item in output_results:
-        output_name = str(item.get("name") or "").strip()
-        if output_name:
-            rendered_output_names.add(output_name)
-        attempts = item.get("attempts") or []
-        attempt_html = ""
-        if attempts:
-            attempt_html = (
-                '<div class="ctx-attempts">'
-                + "".join(
-                    '<span class="ctx-attempt">'
-                    f'<span class="ctx-attempt-source">{escape(str(attempt.get("source") or ""))}</span>'
-                    f'<span class="ctx-attempt-status">{escape(str(attempt.get("status") or ""))}</span>'
-                    f'<span class="ctx-attempt-detail">{escape(_safe_text(attempt.get("detail")) or "")}</span>'
-                    "</span>"
-                    for attempt in attempts
-                )
-                + "</div>"
-            )
-
-        ai_interaction = item.get("ai_interaction") or {}
-        ai_blocks = ""
-        if ai_interaction:
-            response_text = _safe_text(ai_interaction.get("response_text"))
-            if not response_text and ai_interaction.get("parsed_response"):
-                response_text = json.dumps(ai_interaction.get("parsed_response"), indent=2, ensure_ascii=False)
-            ai_blocks = (
-                '<div class="ctx-ai-block">'
-                + _ai_block(
-                    "Request Sent to AI",
-                    _flow_context_request_payload_json(ai_interaction),
-                    icon=(
-                        '<svg viewBox="0 0 24 24" aria-hidden="true">'
-                        '<path d="M4 12h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
-                        '<path d="M11 5l7 7-7 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
-                        "</svg>"
-                    ),
-                    tone="blue",
-                    render_json=True,
-                )
-                + _ai_block(
-                    "Model Output",
-                    response_text,
-                    icon=(
-                        '<svg viewBox="0 0 24 24" aria-hidden="true">'
-                        '<path d="M7 7h10v10H7z" fill="none" stroke="currentColor" stroke-width="1.8"/>'
-                        '<path d="M9.5 11.5h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
-                        '<path d="M9.5 14.5h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
-                        "</svg>"
-                    ),
-                    tone="green",
-                    render_json=True,
-                )
-                + "</div>"
-            )
-
-        output_cards.append(
-            '<div class="ctx-output-card">'
-            '<div class="ctx-output-top">'
-            f'<span class="ctx-name">{escape(str(item.get("label") or item.get("name") or ""))}</span>'
-            f'<span class="ctx-state {"ok" if item.get("status") == "extracted" else "fail"}">{escape(str(item.get("status") or ""))}</span>'
-            "</div>"
-            f'<div class="ctx-output-value">{escape(str(item.get("value") or item.get("error") or ""))}</div>'
-            f'<div class="ctx-output-source">{escape(str(item.get("source") or ""))}</div>'
-            f"{attempt_html}"
-            f"{ai_blocks}"
-            "</div>"
-        )
-
-    for name, value in extracted_outputs.items():
-        output_name = str(name or "").strip()
-        if not output_name or output_name in rendered_output_names:
-            continue
-        output_cards.append(
-            '<div class="ctx-output-card">'
-            '<div class="ctx-output-top">'
-            f'<span class="ctx-name">{escape(output_name)}</span>'
-            '<span class="ctx-state ok">extracted</span>'
-            "</div>"
-            f'<div class="ctx-output-value">{escape(str(value))}</div>'
-            '<div class="ctx-output-source">script step</div>'
-            "</div>"
-        )
-
-    output_section = ""
-    if output_cards:
-        output_section = (
-            '<div class="ctx-section">'
-            '<div class="dc-title">Extracted Outputs</div>'
-            f'<div class="ctx-output-grid">{"".join(output_cards)}</div>'
-            "</div>"
-        )
 
     return (
         '<div class="recording-params-block">'
         '<div class="trace-head">'
-        '<div class="trace-title">Flow Context</div>'
-        '<div class="trace-subtitle">Resolved parent inputs and extracted outputs for this recording run.</div>'
+        '<div class="trace-title">Extracted Outputs</div>'
         "</div>"
-        f"{input_rows}{output_section}"
+        '<div class="ctx-section">'
+        '<div class="dc-title">Extracted Outputs</div>'
+        f'<div class="ctx-output-grid">{"".join(output_cards)}</div>'
+        "</div>"
         "</div>"
     )
+
+
+def _resolved_control_type(action: dict[str, Any]) -> str:
+    """The Oracle control type resolved for this step, dug out of the debug observation
+    (active_element / target ``control_type``) so it can be shown in the Execution Path.
+    Prefers a value that named an Oracle component over a generic ``classic <...>``."""
+    found: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            value = node.get("control_type")
+            if isinstance(value, str) and value.strip():
+                found.append(value.strip())
+            for child in node.values():
+                _walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                _walk(child)
+
+    _walk(action.get("debug"))
+    if not found:
+        return ""
+    for value in found:
+        if "Redwood" in value or "Oracle JET" in value:
+            return value
+    return found[0]
 
 
 def _execution_path_block(action: dict[str, Any]) -> str:
@@ -1244,7 +1217,7 @@ def _execution_path_block(action: dict[str, Any]) -> str:
             f'<span class="path-ai-model">attempt {index}</span>' if len(interactions) > 1 else ""
         )
         ai_blocks.append(
-            '<div class="path-ai-inline">'
+            '<div class="path-ai-inline dev-only">'
             '<div class="path-ai-head">'
             '<span class="path-ai-icon">'
             '<svg viewBox="0 0 24 24" aria-hidden="true">'
@@ -1267,6 +1240,14 @@ def _execution_path_block(action: dict[str, Any]) -> str:
             "</div>"
         )
 
+    control_type = _resolved_control_type(action)
+    control_stat = (
+        f'<div class="path-stat"><span class="kk">Control</span>'
+        f'<span class="kv2">{escape(control_type)}</span></div>'
+        if control_type
+        else ""
+    )
+
     return (
         '<div class="detail-card path-card">'
         '<div class="path-head">'
@@ -1276,6 +1257,7 @@ def _execution_path_block(action: dict[str, Any]) -> str:
         f'<div class="path-stat"><span class="kk">Duration</span><span class="kv2">{escape(_format_duration_ms(action.get("duration_ms")))}</span></div>'
         f'<div class="path-stat"><span class="kk">Attempts</span><span class="kv2">{escape(str(action.get("fallback_attempt_count") or 1))}</span></div>'
         f'<div class="path-stat"><span class="kk">Status</span><span class="kv2 {"r" if status == "failed" else "g"}">{escape(status)}</span></div>'
+        f"{control_stat}"
         "</div>"
         "</div>"
         f'<div class="chain-flow">{"".join(nodes)}</div>'
@@ -1344,6 +1326,7 @@ def _step_item(action: dict[str, Any], action_index: int, result: dict[str, Any]
     detail_blocks = "".join(
         block
         for block in [
+            _recording_suggestion_block(action),
             _execution_path_block(action),
             _script_block(action),
             _debug_block("Debug Trace", action.get("debug")),
@@ -1453,7 +1436,6 @@ def _recording_item(result: dict[str, Any], result_index: int) -> str:
             '<div class="recording-params-block">'
             '<div class="trace-head">'
             '<div class="trace-title">Parameters</div>'
-            '<div class="trace-subtitle">Resolved parameter keys used for this recording run.</div>'
             "</div>"
             f'<div class="params">{params_html}</div>'
             "</div>"
@@ -1519,6 +1501,9 @@ def generate_html_report_content(
     results: list[dict[str, Any]],
 ) -> str:
     normalized_results = list(results or [])
+    # Advisory "fix your recording" suggestions (Tier 1 deterministic + optional Tier 2 AI),
+    # computed once here off the captured action log so per-step rendering stays a pure read.
+    attach_recording_suggestions(normalized_results)
     sensitive_literals: set[str] = set()
     for result in normalized_results:
         sensitive_literals.update(_result_sensitive_literals(result))
@@ -1545,18 +1530,6 @@ def generate_html_report_content(
     )
     first_failed = first_failed_entry[1] if first_failed_entry else None
     first_failed_index = first_failed_entry[0] if first_failed_entry else 0
-
-    rail_rows = [
-        ("Status", suite_status, "r" if suite_status == "failed" else "g"),
-        ("Run ID", parent_run_id or "run", ""),
-        ("Recordings", str(total_runs), ""),
-        ("Logged Actions", str(total_actions), ""),
-        ("Passed", str(passed_runs), "g"),
-        ("Failed", str(failed_runs), "r" if failed_runs else "g"),
-        ("Duration", _format_duration_seconds(total_duration), ""),
-        ("AI Repairs", str(total_ai_repairs), ""),
-        ("Fallback Steps", str(total_fallbacks), ""),
-    ]
 
     styles = """
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -1611,22 +1584,24 @@ body::before{
   position:sticky;
   top:0;
   z-index:100;
-  height:52px;
+  height:64px;
   background:rgba(244,246,251,.88);
   backdrop-filter:blur(16px) saturate(180%);
   border-bottom:1px solid var(--border);
-  display:flex;
+  display:grid;
+  grid-template-columns:300px 1fr;
   align-items:center;
-  gap:14px;
-  padding:0 24px;
 }
-.nav-logo{display:flex;align-items:center;gap:12px;font-weight:700;font-size:14px}
-.brand-mark{height:28px;width:auto;display:block}
-.nav-divider{width:1px;height:16px;background:var(--border2)}
+.nav-logo{display:flex;align-items:center;gap:12px;font-weight:700;font-size:14px;padding-left:20px}
+.brand-mark{height:30px;width:auto;display:block}
+.nav-suite{display:flex;align-items:center;gap:12px;min-width:0;height:100%;border-left:1px solid var(--border);padding-left:28px}
 .nav-run-name{
-  font-size:12px;
-  color:var(--text-dim);
-  max-width:360px;
+  font-family:'Syne',sans-serif;
+  font-size:19px;
+  font-weight:800;
+  letter-spacing:-.02em;
+  color:var(--text);
+  max-width:620px;
   overflow:hidden;
   text-overflow:ellipsis;
   white-space:nowrap;
@@ -1636,28 +1611,27 @@ body::before{
   z-index:1;
   display:grid;
   grid-template-columns:300px 1fr;
-  min-height:calc(100vh - 52px);
+  min-height:calc(100vh - 64px);
 }
 .main{
   min-width:0;
-  padding:28px 28px 80px;
+  padding:20px 28px 80px;
   border-left:1px solid var(--border);
 }
 .rail{
   position:sticky;
-  top:52px;
-  height:calc(100vh - 52px);
+  top:64px;
+  height:calc(100vh - 64px);
   overflow-y:auto;
   padding:24px 20px;
   background:rgba(244,246,251,.55);
 }
-.hero{margin-bottom:24px}
+.hero{margin-bottom:12px}
 .hero-title-row{
   display:flex;
   align-items:center;
   gap:12px;
   flex-wrap:wrap;
-  margin-bottom:6px;
 }
 .hero-title{
   font-size:35px;
@@ -1684,7 +1658,7 @@ body::before{
   background:var(--green-bg);
   color:var(--green);
 }
-.hero-sub{font-size:11px;color:var(--text-dim);line-height:1.7}
+.hero-sub{font-size:11px;color:var(--text-dim);line-height:1.4}
 .stat-row{
   display:grid;
   grid-template-columns:repeat(4,1fr);
@@ -1841,6 +1815,31 @@ body::before{
   cursor:pointer;
 }
 .ftab.on{background:var(--s3);color:var(--text)}
+/* Report view tabs (End User / Developer). End User is the default; Developer
+   reveals the .dev-only blocks (Executed Script, Debug Settings, Recorded Script,
+   Debug Trace, AI self-repair internals). All debug data stays embedded either way. */
+.view-tabs{
+  display:flex;
+  gap:4px;
+  padding:5px;
+  border-radius:var(--r);
+  border:1px solid var(--border);
+  background:var(--s2);
+  margin-left:auto;
+}
+.vtab{
+  border:none;
+  background:none;
+  padding:7px 16px;
+  border-radius:8px;
+  font-family:'Syne',sans-serif;
+  font-size:12px;
+  font-weight:700;
+  color:var(--text-dim);
+  cursor:pointer;
+}
+.vtab.on{background:var(--s3);color:var(--text)}
+body.view-user .dev-only{display:none!important}
 .recording-list{display:flex;flex-direction:column;gap:12px}
 .recording-item{
   background:var(--s1);
@@ -1849,6 +1848,9 @@ body::before{
   overflow:hidden;
   box-shadow:0 8px 22px rgba(23,32,51,.05);
 }
+/* Small status shadow on the collapsed suite-run card (no top border): green passed / red failed. */
+.recording-item[data-failed="false"]{box-shadow:0 6px 18px rgba(14,159,110,.12)}
+.recording-item[data-failed="true"]{box-shadow:0 6px 18px rgba(224,60,75,.14)}
 .recording-item.hidden{display:none!important}
 .recording-item[open]{border-color:var(--border2)}
 .recording-summary{
@@ -2152,6 +2154,50 @@ body::before{
   white-space:pre-wrap;
   word-break:break-all;
 }
+.reco-card{display:grid;gap:10px;border-left-width:4px}
+.reco-card.reco-error{border-left-color:var(--red);background:var(--red-bg)}
+.reco-card.reco-warn{border-left-color:var(--amber);background:var(--amber-bg)}
+.reco-card.reco-info{border-left-color:var(--blue);background:var(--blue-bg)}
+.reco-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.reco-badge{
+  font-size:10px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  padding:3px 8px;
+  border-radius:999px;
+  color:#fff;
+}
+.reco-error .reco-badge{background:var(--red)}
+.reco-warn .reco-badge{background:var(--amber)}
+.reco-info .reco-badge{background:var(--blue)}
+.reco-title{font-size:14px;font-weight:700;color:var(--text)}
+.reco-diagnosis{font-size:14px;color:var(--text-mid);line-height:1.7}
+.reco-recommended{font-size:14px;color:var(--text);line-height:1.7}
+.reco-row{display:grid;gap:6px}
+.reco-k{
+  font-size:10px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.09em;
+  color:var(--text-dim);
+}
+.reco-code{margin:0}
+.reco-ai{display:grid;gap:8px;border-top:1px dashed var(--border2);padding-top:10px}
+.reco-ai-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.reco-ai-tag{
+  font-size:10px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  color:#fff;
+  background:var(--violet);
+  padding:3px 8px;
+  border-radius:999px;
+}
+.reco-ai-note{font-size:11px;color:var(--text-dim);font-style:italic}
+.reco-conf{font-size:11px;color:var(--text-dim);margin-left:auto}
+.reco-cause{font-size:14px;color:var(--text-mid);line-height:1.7}
 .path-card{display:grid;gap:14px}
 .path-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}
 .path-meta{display:flex;flex-wrap:wrap;gap:16px;row-gap:10px}
@@ -2667,6 +2713,8 @@ body::before{
   .page{grid-template-columns:1fr}
   .main{border-left:none}
   .rail{position:static;height:auto;border-bottom:1px solid var(--border)}
+  .nav{grid-template-columns:auto 1fr}
+  .nav-suite{border-left:none;padding-left:14px}
 }
 @media(max-width:700px){
   .stat-row{grid-template-columns:repeat(2,1fr)}
@@ -2694,26 +2742,19 @@ body::before{
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>{styles}</style>
 </head>
-<body>
+<body class="view-user">
 <nav class="nav">
   <div class="nav-logo">
     <img src="{escape(_AETHERION_HEADER_ICON, quote=True)}" alt="Aetherion" class="brand-mark" />
   </div>
-  <div class="nav-divider"></div>
-  <div class="nav-run-name">{escape(test_suite_id)}</div>
+  <div class="nav-suite">
+    <span class="nav-run-name">{escape(title_text)}</span>
+    <span class="hero-status-pill {"ok" if suite_status == "passed" else ""}">{escape(suite_status)}</span>
+  </div>
 </nav>
 
 <div class="page">
   <aside class="rail">
-    <div class="rail-section">
-      <div class="rail-title">Run Details</div>
-      <div class="rail-card">
-        {"".join(
-            f'<div class="rc-row"><span class="rc-k">{escape(label)}</span><span class="rc-v {cls}">{escape(value)}</span></div>'
-            for label, value, cls in rail_rows
-        )}
-      </div>
-    </div>
     <div class="rail-section">
       <div class="rail-title">Runs</div>
       <div class="run-links">
@@ -2731,10 +2772,12 @@ body::before{
   <main class="main">
     <div class="hero">
       <div class="hero-title-row">
-        <div class="hero-title">{escape(title_text)}</div>
-        <span class="hero-status-pill {"ok" if suite_status == "passed" else ""}">{escape(suite_status)}</span>
+        <div class="hero-sub">Run ID: {escape(parent_run_id or "run")} · {total_runs} recording{"s" if total_runs != 1 else ""} · {total_actions} logged actions</div>
+        <div class="view-tabs" role="tablist" aria-label="Report view">
+          <button class="vtab on" id="vt-user" onclick="setView('user')">End User</button>
+          <button class="vtab" id="vt-dev" onclick="setView('dev')">Developer</button>
+        </div>
       </div>
-      <div class="hero-sub">Run ID: {escape(parent_run_id or "run")} · {total_runs} recording{"s" if total_runs != 1 else ""} · {total_actions} logged actions</div>
     </div>
 
     <div class="stat-row">
@@ -2791,6 +2834,13 @@ function tog(domId) {{
   if (!panel) return;
   const open = panel.classList.toggle('open');
   if (chev) chev.classList.toggle('open', open);
+}}
+
+function setView(mode) {{
+  document.body.classList.toggle('view-user', mode === 'user');
+  document.body.classList.toggle('view-dev', mode === 'dev');
+  document.querySelectorAll('.vtab').forEach(button => button.classList.remove('on'));
+  document.getElementById('vt-' + mode)?.classList.add('on');
 }}
 
 function setFilter(filterName) {{

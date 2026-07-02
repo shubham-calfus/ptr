@@ -20,13 +20,13 @@ def get_runtime_params() -> dict[str, Any]:
         params = get_runtime_params()
         username = params["username"]
     """
-    raw = str(os.getenv("PTR_EXECUTION_PARAMETERS_JSON", "") or "").strip()
+    raw = str(os.getenv("ACT_EXECUTION_PARAMETERS_JSON", "") or "").strip()
     if not raw:
         return {}
     try:
         values = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("PTR_EXECUTION_PARAMETERS_JSON was not valid JSON.") from exc
+        raise RuntimeError("ACT_EXECUTION_PARAMETERS_JSON was not valid JSON.") from exc
     return dict(values) if isinstance(values, dict) else {}
 
 
@@ -40,7 +40,7 @@ def extract(name: str, value: Any) -> None:
         raise ValueError("extract name must be a non-empty string")
     _EXTRACTED_OUTPUTS[output_name] = value
 
-    output_path = str(os.getenv("PTR_SCRIPT_STEP_OUTPUT_PATH", "") or "").strip()
+    output_path = str(os.getenv("ACT_SCRIPT_STEP_OUTPUT_PATH", "") or "").strip()
     if not output_path:
         return
     path = Path(output_path)

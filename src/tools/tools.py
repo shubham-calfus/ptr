@@ -47,22 +47,9 @@ _MAX_AI_LOG_CHARS = 3_000
 _MAX_AI_IMAGE_BYTES = 700_000
 _MAX_AI_STEP_IMAGES = 2
 _MAX_OPENAI_ERROR_CHARS = 1_600
-_MAX_FLOW_CONTEXT_PAGE_TEXT_CHARS = 5_000
 _RUNNER_CONFIG_LINE_RE = re.compile(
     r"^\s*(?:export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.*?)\s*$"
 )
-_FLOW_CONTEXT_SHEET_ALIASES = {
-    "flow_context",
-    "flowcontext",
-    "flow_io",
-    "flowio",
-    "context_io",
-    "contextio",
-    "input_output",
-    "inputoutput",
-    "output_input",
-    "outputinput",
-}
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
 _RUNTIME_PLACEHOLDER_LITERAL_RE = re.compile(r"""(?P<quote>["'])\{\{[A-Za-z0-9_]+\}\}(?P=quote)""")
 _OBVIOUS_JS_RECORDING_MARKERS = (
@@ -88,6 +75,7 @@ _PLAYWRIGHT_PYTHON_MARKERS = (
 _RUNNER_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _RUNNER_CONFIG_PATH = _RUNNER_PROJECT_ROOT / "configs.txt"
 _RUNNER_DATA_DIR = _RUNNER_PROJECT_ROOT / ".runner_data"
+_DEFAULT_MULTI_LINE_SHEET_NAME = "multi_line"
 
 
 def _get_bucket_name() -> str:
@@ -205,9 +193,9 @@ def _apply_recording_debug_env_overrides(
 ) -> dict[str, str]:
     updated = dict(env)
     bool_mappings = {
-        "debug_trace": "PTR_DEBUG_TRACE",
-        "debug_record_video": "PTR_RECORD_VIDEO",
-        "debug_full_page_steps": "PTR_STEP_SCREENSHOT_FULL_PAGE",
+        "debug_trace": "ACT_DEBUG_TRACE",
+        "debug_record_video": "ACT_RECORD_VIDEO",
+        "debug_full_page_steps": "ACT_STEP_SCREENSHOT_FULL_PAGE",
     }
     for recording_key, env_key in bool_mappings.items():
         resolved = _resolve_recording_bool_override(recording, recording_key)
@@ -216,7 +204,7 @@ def _apply_recording_debug_env_overrides(
 
     debug_page_text_max_chars = _resolve_recording_nonnegative_int(recording, "debug_page_text_max_chars")
     if debug_page_text_max_chars is not None:
-        updated["PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS"] = str(debug_page_text_max_chars)
+        updated["ACT_PAGE_TEXT_SNAPSHOT_MAX_CHARS"] = str(debug_page_text_max_chars)
     return updated
 
 
@@ -229,15 +217,15 @@ def _resolve_env_nonnegative_int(value: Any, default: int) -> int:
 
 def _effective_debug_settings(env: dict[str, str]) -> dict[str, Any]:
     return {
-        "after_action_wait_ms": _resolve_env_nonnegative_int(env.get("PTR_AFTER_ACTION_WAIT_MS"), 10_000),
-        "capture_steps": _env_flag(env.get("PTR_CAPTURE_STEPS"), True),
-        "record_video": _env_flag(env.get("PTR_RECORD_VIDEO"), False),
-        "step_screenshot_full_page": _env_flag(env.get("PTR_STEP_SCREENSHOT_FULL_PAGE"), False),
+        "after_action_wait_ms": _resolve_env_nonnegative_int(env.get("ACT_AFTER_ACTION_WAIT_MS"), 0),
+        "capture_steps": _env_flag(env.get("ACT_CAPTURE_STEPS"), True),
+        "record_video": _env_flag(env.get("ACT_RECORD_VIDEO"), False),
+        "step_screenshot_full_page": _env_flag(env.get("ACT_STEP_SCREENSHOT_FULL_PAGE"), False),
         "page_text_snapshot_max_chars": _resolve_env_nonnegative_int(
-            env.get("PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS"),
+            env.get("ACT_PAGE_TEXT_SNAPSHOT_MAX_CHARS"),
             12_000,
         ),
-        "debug_trace": _env_flag(env.get("PTR_DEBUG_TRACE"), False),
+        "debug_trace": _env_flag(env.get("ACT_DEBUG_TRACE"), False),
     }
 
 
@@ -296,7 +284,7 @@ def _storage_put_bytes(object_key: str, data: bytes, *, content_type: str) -> tu
 
 def _load_script_bytes(object_key: str) -> bytes:
     if not object_key.lower().endswith(".py"):
-        raise ValueError(f"Unsupported recording artifact: {object_key}. test_runner can only execute .py recordings.")
+        raise ValueError(f"Unsupported recording artifact: {object_key}. ACT Agent can only execute .py recordings.")
     return _storage_get_bytes(object_key)
 
 
@@ -574,12 +562,179 @@ def _extract_table_parameters(rows: list[tuple[Any, ...]]) -> dict[str, str]:
     return dict(parameter_sets[0].get("values") or {})
 
 
+def _extract_table_rows(rows: list[tuple[Any, ...]]) -> list[dict[str, str]]:
+    normalized_rows: list[list[str]] = []
+    for row in rows:
+        values = [str(cell or "").strip() for cell in row]
+        if any(values):
+            normalized_rows.append(values)
+
+    if len(normalized_rows) < 2:
+        return []
+
+    headers = [_normalize_param_name(header) for header in normalized_rows[0]]
+    extracted: list[dict[str, str]] = []
+    for data_row in normalized_rows[1:]:
+        row_values: dict[str, str] = {}
+        for idx, header in enumerate(headers):
+            if not header or idx >= len(data_row):
+                continue
+            value = data_row[idx]
+            if not value:
+                continue
+            row_values[header] = value
+        if row_values:
+            extracted.append(row_values)
+    return extracted
+
+
+def _normalize_multi_line_sheet_name(value: Any) -> str:
+    normalized = _normalize_param_name(str(value or ""))
+    return normalized or _DEFAULT_MULTI_LINE_SHEET_NAME
+
+
+def _normalize_repeatable_block_match_key(value: Any) -> str:
+    return _normalize_param_name(str(value or ""))
+
+
+def _normalize_repeatable_block_config(payload: Any) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = {"enabled": True, "sheet_name": _DEFAULT_MULTI_LINE_SHEET_NAME, "prompt": text}
+    if not isinstance(payload, dict):
+        return None
+    enabled = payload.get("enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in {"0", "false", "no", "off", ""}
+    if not enabled:
+        return None
+    return {
+        "enabled": True,
+        "sheet_name": _normalize_multi_line_sheet_name(payload.get("sheet_name")),
+        "prompt": str(payload.get("prompt") or "").strip(),
+        "match_key": _normalize_repeatable_block_match_key(payload.get("match_key")),
+    }
+
+
+def _normalize_repeatable_blocks_config(
+    payload: Any = None,
+    *,
+    legacy_payload: Any = None,
+) -> list[dict[str, Any]]:
+    raw = payload if payload is not None else legacy_payload
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        if "repeatable_blocks" in raw:
+            raw = raw.get("repeatable_blocks")
+        else:
+            raw = [raw]
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            raw = [text]
+        else:
+            raw = parsed.get("repeatable_blocks") if isinstance(parsed, dict) and "repeatable_blocks" in parsed else parsed
+    if not isinstance(raw, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for item in raw:
+        normalized = _normalize_repeatable_block_config(item)
+        if normalized:
+            blocks.append(normalized)
+    return blocks
+
+
+def _repeatable_blocks_from_recording_config(recording_config: dict[str, Any] | None) -> list[dict[str, Any]]:
+    config = recording_config if isinstance(recording_config, dict) else {}
+    blocks = _normalize_repeatable_blocks_config(config.get("repeatable_blocks"))
+    if blocks:
+        return blocks
+    return _normalize_repeatable_blocks_config(legacy_payload=config.get("repeatable_line_items"))
+
+
+def _extract_match_value(row: dict[str, Any], match_key: str) -> str:
+    normalized_match_key = _normalize_repeatable_block_match_key(match_key)
+    if not normalized_match_key or not isinstance(row, dict):
+        return ""
+    for key, value in row.items():
+        if _normalize_param_name(str(key or "")) != normalized_match_key:
+            continue
+        return str(value or "").strip()
+    return ""
+
+
+def _recording_config_key_for_file(file_key: str) -> str | None:
+    raw = str(file_key or "").strip()
+    if not raw:
+        return None
+    script_path = Path(raw)
+    if script_path.suffix.lower() != ".py":
+        return None
+    return str(script_path.with_name(f"{script_path.stem}_recording_config.json"))
+
+
+def _derive_recording_config_file_candidates(file_key: str) -> list[str]:
+    raw = str(file_key or "").strip()
+    if not raw:
+        return []
+
+    bucket_name = ""
+    normalized_key = raw
+    if raw.lower().startswith("s3://"):
+        bucket_name, normalized_key = _split_storage_object_ref(raw)
+    else:
+        try:
+            bucket_name, normalized_key = _split_storage_object_ref(raw)
+        except Exception:
+            normalized_key = raw.lstrip("/")
+    config_key = _recording_config_key_for_file(normalized_key)
+    if not config_key:
+        return []
+
+    candidates: list[str] = []
+    raw_uses_s3_uri = raw.lower().startswith("s3://")
+    raw_uses_bucket_prefix = bool(bucket_name) and raw.startswith(f"{bucket_name}/")
+    if raw_uses_s3_uri:
+        candidates.append(f"s3://{bucket_name}/{config_key}")
+    elif raw_uses_bucket_prefix:
+        candidates.append(f"{bucket_name}/{config_key}")
+    candidates.append(config_key)
+    return list(dict.fromkeys(candidates))
+
+
+def _load_recording_config(file_key: str) -> dict[str, Any]:
+    for candidate in _derive_recording_config_file_candidates(file_key):
+        try:
+            raw_bytes = _storage_get_bytes(candidate)
+        except Exception:
+            continue
+        try:
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+        except Exception:
+            logger.warning("Ignoring malformed recording config for %s", candidate)
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _parse_excel_parameter_sets(raw_bytes: bytes) -> list[dict[str, Any]]:
     import io
     import openpyxl  # lazy import — only needed when a parameters file is provided
 
     wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
-    ws = wb.active
+    ws = wb["params"] if "params" in wb.sheetnames else wb.active
     parameter_sets = _extract_table_parameter_sets(list(ws.iter_rows(values_only=True)))
     wb.close()
     return parameter_sets
@@ -592,135 +747,27 @@ def _parse_excel_parameters(raw_bytes: bytes) -> dict[str, str]:
     return dict(parameter_sets[0].get("values") or {})
 
 
-def _coerce_flow_context_bool(value: Any, *, default: bool) -> bool:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return default
-    return raw not in {"0", "false", "no", "off"}
-
-
-def _coerce_flow_context_int(value: Any, *, default: int | None) -> int | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _parse_flow_context_aliases(value: Any) -> list[str]:
-    if isinstance(value, (list, tuple, set)):
-        aliases: list[str] = []
-        seen: set[str] = set()
-        for item in value:
-            for alias in _parse_flow_context_aliases(item):
-                normalized = alias.lower()
-                if normalized in seen:
-                    continue
-                seen.add(normalized)
-                aliases.append(alias)
-        return aliases
-
-    raw = str(value or "").strip()
-    if not raw:
-        return []
-    parts = re.split(r"[|,\n;\r]+", raw)
-    aliases: list[str] = []
-    seen: set[str] = set()
-    for part in parts:
-        cleaned = re.sub(r"\s+", " ", str(part or "").strip())
-        if not cleaned:
-            continue
-        normalized = cleaned.lower()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        aliases.append(cleaned)
-    return aliases
-
-
-def _extract_flow_context_sheet_specs(rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
-    normalized_rows: list[tuple[int, tuple[str, ...]]] = []
-    for row_index, row in enumerate(rows, start=1):
-        values = tuple(str(value if value is not None else "").strip() for value in row)
-        if any(values):
-            normalized_rows.append((row_index, values))
-
-    if len(normalized_rows) < 2:
-        return []
-
-    _, header_row = normalized_rows[0]
-    header_map: dict[str, int] = {}
-    for index, cell in enumerate(header_row):
-        normalized = _normalize_param_name(cell)
-        if normalized:
-            header_map.setdefault(normalized, index)
-
-    def _row_value(row: tuple[str, ...], *aliases: str) -> str:
-        for alias in aliases:
-            idx = header_map.get(alias)
-            if idx is None or idx >= len(row):
-                continue
-            value = row[idx]
-            if value:
-                return value
-        return ""
-
-    specs: list[dict[str, Any]] = []
-    for row_index, row in normalized_rows[1:]:
-        kind = _row_value(row, "kind", "direction", "type").lower() or "output"
-        if kind not in {"input", "output"}:
-            continue
-        name = _normalize_param_name(_row_value(row, "name", "field", "key"))
-        label = _row_value(row, "label", "title", "display_name")
-        source = _row_value(row, "source", "extract_from", "surface").lower() or "auto"
-        if not name and not label:
-            continue
-        if not name:
-            name = _normalize_param_name(label)
-        if not name:
-            continue
-        row_value = _row_value(row, "row")
-        table_value = _row_value(row, "table_index", "table")
-        specs.append(
-            {
-                "row_index": row_index,
-                "kind": kind,
-                "name": name,
-                "label": label,
-                "aliases": _parse_flow_context_aliases(
-                    _row_value(row, "aliases", "alias", "alternate_labels", "alternate_label")
-                ),
-                "source": source,
-                "pattern": _row_value(row, "pattern", "regex"),
-                "group": _coerce_flow_context_int(_row_value(row, "group"), default=1),
-                "column": _row_value(row, "column", "header"),
-                "row": _coerce_flow_context_int(row_value, default=None if not row_value else 0),
-                "table_index": _coerce_flow_context_int(table_value, default=None if not table_value else 0),
-                "required": _coerce_flow_context_bool(_row_value(row, "required", "is_required"), default=(kind == "output")),
-                "prompt": _row_value(row, "prompt", "hint", "description", "instructions"),
-                "value_type": _row_value(row, "value_type", "datatype", "data_type").lower() or "text",
-                "use_ai": _coerce_flow_context_bool(_row_value(row, "use_ai", "allow_ai"), default=True),
-            }
-        )
-
-    return specs
-
-
-def _parse_excel_flow_context_specs(raw_bytes: bytes) -> list[dict[str, Any]]:
+def _parse_excel_multi_line_rows(
+    raw_bytes: bytes,
+    *,
+    sheet_name: str = _DEFAULT_MULTI_LINE_SHEET_NAME,
+) -> list[dict[str, str]]:
     import io
-    import openpyxl  # lazy import — only needed when a workbook is provided
+    import openpyxl
 
+    normalized_sheet_name = _normalize_multi_line_sheet_name(sheet_name)
     wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
-    try:
-        for ws in wb.worksheets:
-            if _normalize_param_name(ws.title) not in _FLOW_CONTEXT_SHEET_ALIASES:
-                continue
-            return _extract_flow_context_sheet_specs(list(ws.iter_rows(values_only=True)))
-    finally:
+    target_sheet = None
+    for candidate in wb.sheetnames:
+        if _normalize_multi_line_sheet_name(candidate) == normalized_sheet_name:
+            target_sheet = wb[candidate]
+            break
+    if target_sheet is None:
         wb.close()
-    return []
+        return []
+    rows = _extract_table_rows(list(target_sheet.iter_rows(values_only=True)))
+    wb.close()
+    return rows
 
 
 def _parse_csv_parameter_sets(raw_bytes: bytes) -> list[dict[str, Any]]:
@@ -753,14 +800,6 @@ def _load_parameters_from_file(file_key: str) -> dict[str, str]:
     if not parameter_sets:
         return {}
     return dict(parameter_sets[0].get("values") or {})
-
-
-def _load_flow_context_specs_from_file(file_key: str) -> list[dict[str, Any]]:
-    raw_bytes = _storage_get_bytes(file_key)
-    lower = file_key.lower()
-    if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        return _parse_excel_flow_context_specs(raw_bytes)
-    return []
 
 
 def _derive_parameters_file_candidates(file_key: str) -> list[str]:
@@ -799,16 +838,46 @@ def _load_recording_parameters(
     return dict(parameter_sets[0].get("values") or {}), loaded_from
 
 
+def _load_recording_runtime_inputs(
+    recording: dict[str, Any],
+    file_key: str,
+) -> tuple[dict[str, str], str | None, list[dict[str, str]]]:
+    parameters, loaded_from = _load_recording_parameters(recording, file_key)
+    if not loaded_from or not loaded_from.lower().endswith((".xlsx", ".xls")):
+        return parameters, loaded_from, []
+
+    recording_config = _load_recording_config(file_key)
+    repeatable_blocks = _repeatable_blocks_from_recording_config(recording_config)
+    repeatable = repeatable_blocks[0] if repeatable_blocks else None
+    configured_sheet_name = ""
+    if isinstance(repeatable, dict):
+        configured_sheet_name = str(repeatable.get("sheet_name") or "").strip()
+    sheet_name = configured_sheet_name or _DEFAULT_MULTI_LINE_SHEET_NAME
+
+    try:
+        raw_bytes = _storage_get_bytes(loaded_from)
+        multi_line_rows = _parse_excel_multi_line_rows(raw_bytes, sheet_name=sheet_name)
+    except Exception as exc:
+        logger.warning("Failed to load multi-line sheet from %s: %s", loaded_from, exc)
+        multi_line_rows = []
+
+    return parameters, loaded_from, multi_line_rows
+
+
 def _load_recording_parameter_sets(
     recording: dict[str, Any],
     file_key: str,
 ) -> tuple[list[dict[str, Any]], str | None]:
     explicit_file = str(recording.get("parameters_file") or "").strip()
-    candidates = []
     if explicit_file:
-        candidates.append(explicit_file)
-    candidates.extend(_derive_parameters_file_candidates(file_key))
+        try:
+            return _load_parameter_sets_from_file(explicit_file), explicit_file
+        except Exception as exc:
+            errors = [(explicit_file, exc)]
+            details = "; ".join(f"{candidate}: {error}" for candidate, error in errors)
+            raise RuntimeError(f"Failed to load parameters file. {details}")
 
+    candidates = _derive_parameters_file_candidates(file_key)
     seen: set[str] = set()
     errors: list[tuple[str, Exception]] = []
     for candidate in candidates:
@@ -820,43 +889,6 @@ def _load_recording_parameter_sets(
         except Exception as exc:
             errors.append((candidate, exc))
 
-    if explicit_file:
-        details = "; ".join(f"{candidate}: {exc}" for candidate, exc in errors)
-        raise RuntimeError(f"Failed to load parameters file. {details}")
-
-    return [], None
-
-
-def _load_recording_flow_context_specs(
-    recording: dict[str, Any],
-    file_key: str,
-) -> tuple[list[dict[str, Any]], str | None]:
-    explicit_file = str(
-        recording.get("flow_context_file")
-        or recording.get("parameters_file_key")
-        or recording.get("parameters_file")
-        or ""
-    ).strip()
-    candidates: list[str] = []
-    if explicit_file:
-        candidates.append(explicit_file)
-    candidates.extend(
-        candidate
-        for candidate in _derive_parameters_file_candidates(file_key)
-        if candidate.lower().endswith((".xlsx", ".xls"))
-    )
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        try:
-            specs = _load_flow_context_specs_from_file(candidate)
-            if specs:
-                return specs, candidate
-        except Exception as exc:
-            logger.warning("Failed to load flow context specs from %s: %s", candidate, exc)
     return [], None
 
 
@@ -888,6 +920,23 @@ def _expand_recordings_for_parameter_rows_data(
 
         base_name = str(recording.get("name") or file_key or "recording").strip() or "recording"
         base_parameters = recording.get("parameters") if isinstance(recording.get("parameters"), dict) else {}
+        repeatable_blocks = _repeatable_blocks_from_recording_config(_load_recording_config(file_key))
+        primary_repeatable = repeatable_blocks[0] if repeatable_blocks else None
+        grouped_multi_line_rows: dict[str, list[dict[str, str]]] = {}
+        match_key = ""
+        if isinstance(primary_repeatable, dict):
+            match_key = _normalize_repeatable_block_match_key(primary_repeatable.get("match_key"))
+            if match_key:
+                try:
+                    _unused_params, _unused_loaded_from, multi_line_rows = _load_recording_runtime_inputs(recording, file_key)
+                except Exception as exc:
+                    logger.warning("Failed to load multi-line rows for %s during pre-expansion: %s", file_key, exc)
+                    multi_line_rows = []
+                for line_row in multi_line_rows:
+                    line_match_value = _extract_match_value(line_row, match_key)
+                    if not line_match_value:
+                        continue
+                    grouped_multi_line_rows.setdefault(line_match_value, []).append(dict(line_row))
 
         for set_index, parameter_set in enumerate(parameter_sets, start=1):
             row_index = int(parameter_set.get("row_index") or set_index)
@@ -903,6 +952,11 @@ def _expand_recordings_for_parameter_rows_data(
             expanded_recording["parameter_set_index"] = set_index
             expanded_recording["parameter_row_index"] = row_index
             expanded_recording["skip_parameters_file_load"] = True
+            if match_key:
+                header_match_value = _extract_match_value(row_values, match_key)
+                matched_rows = grouped_multi_line_rows.get(header_match_value, [])
+                if matched_rows:
+                    expanded_recording[_DEFAULT_MULTI_LINE_SHEET_NAME] = list(matched_rows)
             expanded_recordings.append(expanded_recording)
 
     return expanded_recordings
@@ -911,12 +965,32 @@ def _expand_recordings_for_parameter_rows_data(
 def _normalize_parameter_values(parameters: dict[str, Any] | None) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for raw_key, raw_value in (parameters or {}).items():
+        if _normalize_multi_line_sheet_name(raw_key) == _DEFAULT_MULTI_LINE_SHEET_NAME:
+            continue
         param_name = _normalize_param_name(str(raw_key or ""))
         param_value = str(raw_value).strip() if raw_value is not None else ""
         if not param_name or not param_value:
             continue
         normalized[param_name] = param_value
     return normalized
+
+
+def _normalize_inline_multi_line_rows(payload: Any) -> list[dict[str, str]]:
+    if isinstance(payload, dict) and _DEFAULT_MULTI_LINE_SHEET_NAME in payload:
+        raw_rows = payload.get(_DEFAULT_MULTI_LINE_SHEET_NAME) or []
+    elif isinstance(payload, list):
+        raw_rows = payload
+    else:
+        return []
+
+    rows: list[dict[str, str]] = []
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            continue
+        normalized_row = _normalize_parameter_values(raw_row)
+        if normalized_row:
+            rows.append(normalized_row)
+    return rows
 
 
 def _parameters_to_json_object(parameters: dict[str, Any] | None) -> dict[str, str]:
@@ -954,802 +1028,6 @@ def _collect_unresolved_execution_parameters(parameters: dict[str, Any] | None) 
             continue
         unresolved[str(name)] = list(dict.fromkeys(placeholders))
     return unresolved
-
-
-def _normalize_flow_context_specs(specs: Any) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    allowed_sources = {
-        "auto",
-        "page_semantics",
-        "page_text",
-        "page_url",
-        "page_title",
-        "stdout",
-        "stderr",
-        "oracle_table",
-        "ai",
-    }
-    allowed_kinds = {"input", "output"}
-
-    for item in specs or []:
-        if not isinstance(item, dict):
-            continue
-        kind = str(item.get("kind") or "output").strip().lower() or "output"
-        if kind not in allowed_kinds:
-            continue
-        name = _normalize_param_name(str(item.get("name") or ""))
-        label = str(item.get("label") or "").strip()
-        if not name and label:
-            name = _normalize_param_name(label)
-        if not name:
-            continue
-        source = str(item.get("source") or "auto").strip().lower() or "auto"
-        if source not in allowed_sources:
-            source = "auto"
-        normalized.append(
-            {
-                "row_index": _coerce_flow_context_int(item.get("row_index"), default=None),
-                "kind": kind,
-                "name": name,
-                "label": label,
-                "aliases": _parse_flow_context_aliases(item.get("aliases")),
-                "source": source,
-                "pattern": str(item.get("pattern") or "").strip(),
-                "group": _coerce_flow_context_int(item.get("group"), default=1),
-                "column": str(item.get("column") or "").strip(),
-                "row": _coerce_flow_context_int(item.get("row"), default=None),
-                "table_index": _coerce_flow_context_int(item.get("table_index"), default=None),
-                "required": _coerce_flow_context_bool(item.get("required"), default=(kind == "output")),
-                "prompt": str(item.get("prompt") or "").strip(),
-                "value_type": str(item.get("value_type") or "text").strip().lower() or "text",
-                "use_ai": _coerce_flow_context_bool(item.get("use_ai"), default=True),
-            }
-        )
-    return normalized
-
-
-def _validate_flow_context_inputs(
-    execution_parameters: dict[str, str],
-    flow_context_specs: list[dict[str, Any]],
-) -> tuple[list[str], dict[str, Any]]:
-    input_specs = [spec for spec in flow_context_specs if spec.get("kind") == "input"]
-    input_status: dict[str, Any] = {}
-    missing: list[str] = []
-
-    for spec in input_specs:
-        name = spec["name"]
-        value = str(execution_parameters.get(name) or "").strip()
-        unresolved = _find_unresolved_placeholders(value)
-        status = "available"
-        error = ""
-        if spec.get("required") and (not value or unresolved):
-            status = "missing"
-            error = f'Input "{name}" was not resolved before execution'
-            missing.append(name)
-        elif unresolved:
-            status = "unresolved"
-            error = f'Input "{name}" still contains unresolved placeholders'
-
-        input_status[name] = {
-            "name": name,
-            "label": spec.get("label") or name,
-            "required": bool(spec.get("required")),
-            "status": status,
-            "value": value if value and not unresolved else "",
-            "error": error,
-        }
-
-    return missing, input_status
-
-
-def _normalize_output_specs(outputs: Any) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    allowed_sources = {"page_text", "page_url", "page_title", "stdout", "stderr", "oracle_table"}
-
-    for item in outputs or []:
-        if not isinstance(item, dict):
-            continue
-        name = _normalize_param_name(str(item.get("name") or ""))
-        source = str(item.get("source") or "page_text").strip().lower()
-        pattern = str(item.get("pattern") or "").strip()
-        group = item.get("group", 1)
-        if not name or source not in allowed_sources:
-            continue
-        normalized.append(
-            {
-                "name": name,
-                "source": source,
-                "pattern": pattern,
-                "group": group,
-                "column": str(item.get("column") or "").strip(),
-                "row": item.get("row", 0),
-                "table_index": item.get("table_index", 0),
-            }
-        )
-    return normalized
-
-
-def _normalize_output_label(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
-
-
-_FLOW_CONTEXT_STRONG_LABEL_SCORE = 250
-
-
-def _flow_context_display_name(name: str) -> str:
-    return re.sub(r"\s+", " ", str(name or "").replace("_", " ")).strip()
-
-
-def _flow_context_label_candidates(spec: dict[str, Any]) -> list[str]:
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    def _append(value: Any) -> None:
-        cleaned = re.sub(r"\s+", " ", str(value or "").strip())
-        if not cleaned:
-            return
-        normalized = cleaned.lower()
-        if normalized in seen:
-            return
-        seen.add(normalized)
-        candidates.append(cleaned)
-
-    _append(spec.get("label"))
-    for alias in _parse_flow_context_aliases(spec.get("aliases")):
-        _append(alias)
-    _append(spec.get("column"))
-    _append(_flow_context_display_name(str(spec.get("name") or "")))
-    return candidates
-
-
-def _flow_context_label_match_score(candidate: str, target: str) -> int:
-    left = _normalize_output_label(candidate)
-    right = _normalize_output_label(target)
-    if not left or not right:
-        return 0
-    if left == right:
-        return 400
-    if left in right or right in left:
-        return 300 - abs(len(left) - len(right))
-    left_tokens = set(left.split())
-    right_tokens = set(right.split())
-    overlap = left_tokens & right_tokens
-    if not overlap:
-        return 0
-    return len(overlap) * 10
-
-
-def _flow_context_best_header_match(headers: list[Any], spec: dict[str, Any]) -> tuple[int | None, str]:
-    candidates = _flow_context_label_candidates(spec)
-    best_index: int | None = None
-    best_header = ""
-    best_score = 0
-    for index, header in enumerate(headers):
-        header_text = str(header or "").strip()
-        if not header_text:
-            continue
-        for candidate in candidates:
-            score = _flow_context_label_match_score(header_text, candidate)
-            if score <= best_score:
-                continue
-            best_index = index
-            best_header = header_text
-            best_score = score
-    if best_score < _FLOW_CONTEXT_STRONG_LABEL_SCORE:
-        return None, ""
-    return best_index, best_header
-
-
-def _extract_oracle_table_output(result: dict[str, Any], spec: dict[str, Any]) -> tuple[str | None, str | None]:
-    tables = result.get("oracle_tables")
-    if not isinstance(tables, list) or not tables:
-        return None, f'{spec["name"]}: source "oracle_table" had no captured tables'
-
-    try:
-        table_index = max(0, int(spec.get("table_index", 0)))
-    except Exception:
-        table_index = 0
-    if table_index >= len(tables):
-        return None, f'{spec["name"]}: table index {table_index} was out of range'
-
-    table = tables[table_index] if isinstance(tables[table_index], dict) else {}
-    headers = table.get("headers") if isinstance(table.get("headers"), list) else []
-    rows = table.get("rows") if isinstance(table.get("rows"), list) else []
-    if not headers or not rows:
-        return None, f'{spec["name"]}: selected table did not include headers and rows'
-
-    target_column = _normalize_output_label(spec.get("column"))
-    if not target_column:
-        return None, f'{spec["name"]}: oracle_table output requires "column"'
-
-    column_index = next(
-        (index for index, header in enumerate(headers) if _normalize_output_label(header) == target_column),
-        None,
-    )
-    if column_index is None:
-        return None, f'{spec["name"]}: column "{spec.get("column")}" was not found in oracle table headers'
-
-    try:
-        row_index = max(0, int(spec.get("row", 0)))
-    except Exception:
-        row_index = 0
-    if row_index >= len(rows):
-        return None, f'{spec["name"]}: row index {row_index} was out of range'
-
-    row = rows[row_index] if isinstance(rows[row_index], list) else []
-    value = str(row[column_index] or "").strip() if column_index < len(row) else ""
-    if not value:
-        return None, f'{spec["name"]}: oracle table cell was empty at row {row_index}, column "{spec.get("column")}"'
-    return value, None
-
-
-def _extract_recording_outputs(
-    result: dict[str, Any],
-    outputs: Any,
-) -> tuple[dict[str, str], list[str]]:
-    extracted: dict[str, str] = {}
-    errors: list[str] = []
-
-    for spec in _normalize_output_specs(outputs):
-        if spec["source"] == "oracle_table":
-            extracted_value, error = _extract_oracle_table_output(result, spec)
-            if error:
-                errors.append(error)
-                continue
-            extracted[spec["name"]] = str(extracted_value or "").strip()
-            continue
-
-        source_value = str(result.get(spec["source"]) or "").strip()
-        if not source_value:
-            errors.append(f'{spec["name"]}: source "{spec["source"]}" was empty')
-            continue
-
-        pattern = str(spec.get("pattern") or "").strip()
-        if not pattern:
-            extracted_value = source_value
-        else:
-            try:
-                match = re.search(pattern, source_value, flags=re.IGNORECASE | re.MULTILINE)
-            except re.error as exc:
-                errors.append(f'{spec["name"]}: invalid regex "{pattern}": {exc}')
-                continue
-            if not match:
-                errors.append(f'{spec["name"]}: pattern "{pattern}" not found in {spec["source"]}')
-                continue
-
-            group = spec.get("group", 1)
-            try:
-                extracted_value = match.group(group)
-            except Exception as exc:
-                errors.append(f'{spec["name"]}: could not read regex group {group}: {exc}')
-                continue
-
-        value = str(extracted_value or "").strip()
-        if not value:
-            errors.append(f'{spec["name"]}: extracted value was empty')
-            continue
-        extracted[spec["name"]] = value
-
-    return extracted, errors
-
-
-def _flow_context_source_candidates(spec: dict[str, Any]) -> list[str]:
-    source = str(spec.get("source") or "auto").strip().lower() or "auto"
-    if source == "auto":
-        return ["oracle_table", "page_semantics", "page_text", "page_title", "page_url", "stdout", "stderr"]
-    if source == "ai":
-        return []
-    return [source]
-
-
-def _flow_context_effective_label(spec: dict[str, Any]) -> str:
-    candidates = _flow_context_label_candidates(spec)
-    return candidates[0] if candidates else ""
-
-
-def _flow_context_value_patterns(spec: dict[str, Any]) -> list[str]:
-    value_type = str(spec.get("value_type") or "text").strip().lower()
-    patterns: list[str] = []
-    seen: set[str] = set()
-
-    def _append(pattern: str) -> None:
-        if not pattern or pattern in seen:
-            return
-        seen.add(pattern)
-        patterns.append(pattern)
-
-    explicit_pattern = str(spec.get("pattern") or "").strip()
-    if explicit_pattern:
-        _append(explicit_pattern)
-
-    for label in _flow_context_label_candidates(spec):
-        escaped = re.escape(label)
-        if value_type in {"number", "integer", "id"}:
-            _append(rf"{escaped}\s*(?:[:#-]\s*|\s+)(\d+)")
-        else:
-            _append(rf"{escaped}\s*[:#-]?\s*([^\n\r]+)")
-
-    return patterns
-
-
-def _normalize_flow_context_extracted_value(value: Any, spec: dict[str, Any]) -> str:
-    text = re.sub(r"\s+", " ", str(value or "").strip())
-    if not text:
-        return ""
-
-    explicit_pattern = str(spec.get("pattern") or "").strip()
-    if explicit_pattern:
-        try:
-            match = re.search(explicit_pattern, text, flags=re.IGNORECASE | re.MULTILINE)
-        except re.error:
-            match = None
-        if match:
-            group = spec.get("group")
-            if not isinstance(group, int):
-                group = 1
-            try:
-                return str(match.group(group) or "").strip()
-            except Exception:
-                return ""
-
-    value_type = str(spec.get("value_type") or "text").strip().lower()
-    if value_type in {"number", "integer"}:
-        match = re.search(r"\d+(?:\.\d+)?", text)
-        return str(match.group(0) or "").strip() if match else ""
-    if value_type == "id":
-        match = re.search(r"[A-Za-z]+-\d+|\d+", text)
-        return str(match.group(0) or "").strip() if match else ""
-    return text
-
-
-def _extract_flow_context_from_oracle_tables(
-    result: dict[str, Any],
-    spec: dict[str, Any],
-) -> tuple[str | None, dict[str, Any]]:
-    tables = result.get("oracle_tables")
-    if not isinstance(tables, list) or not tables:
-        return None, {"source": "oracle_table", "status": "miss", "detail": "No captured oracle tables"}
-
-    if not _flow_context_label_candidates(spec):
-        return None, {"source": "oracle_table", "status": "miss", "detail": "No output label or aliases were provided"}
-
-    table_indexes: list[int]
-    explicit_index = spec.get("table_index")
-    if isinstance(explicit_index, int):
-        table_indexes = [explicit_index]
-    else:
-        table_indexes = list(range(len(tables)))
-
-    explicit_row_index = spec.get("row")
-    row_index = explicit_row_index if isinstance(explicit_row_index, int) and explicit_row_index >= 0 else None
-
-    for table_index in table_indexes:
-        if table_index < 0 or table_index >= len(tables):
-            continue
-        table = tables[table_index] if isinstance(tables[table_index], dict) else {}
-        headers = table.get("headers") if isinstance(table.get("headers"), list) else []
-        rows = table.get("rows") if isinstance(table.get("rows"), list) else []
-        if not headers or not rows:
-            continue
-        column_index, matched_header = _flow_context_best_header_match(headers, spec)
-        if column_index is None:
-            continue
-        candidate_rows = [row_index] if row_index is not None else list(range(len(rows)))
-        for candidate_row_index in candidate_rows:
-            if candidate_row_index < 0 or candidate_row_index >= len(rows):
-                continue
-            row = rows[candidate_row_index] if isinstance(rows[candidate_row_index], list) else []
-            value = str(row[column_index] or "").strip() if column_index < len(row) else ""
-            if not value:
-                continue
-            detail = (
-                f'table {table_index}, row {candidate_row_index}, column "{matched_header}"'
-                if row_index is not None
-                else f'table {table_index}, first non-empty row {candidate_row_index}, column "{matched_header}"'
-            )
-            return value, {
-                "source": "oracle_table",
-                "status": "matched",
-                "detail": detail,
-            }
-
-    return None, {
-        "source": "oracle_table",
-        "status": "miss",
-        "detail": f'No matching labelled value was found in captured oracle tables for "{_flow_context_effective_label(spec)}"',
-    }
-
-
-def _extract_flow_context_from_page_semantics(
-    result: dict[str, Any],
-    spec: dict[str, Any],
-) -> tuple[str | None, dict[str, Any]]:
-    semantics = result.get("page_semantics")
-    if not isinstance(semantics, dict):
-        return None, {"source": "page_semantics", "status": "miss", "detail": "No semantic snapshot captured"}
-
-    label_values = semantics.get("label_values") if isinstance(semantics.get("label_values"), list) else []
-    best_value = ""
-    best_detail = ""
-    best_score = 0
-
-    for candidate in label_values:
-        if not isinstance(candidate, dict):
-            continue
-        candidate_labels = [
-            candidate.get("label"),
-            candidate.get("title"),
-            candidate.get("aria_label"),
-            candidate.get("data_oj_field"),
-        ]
-        label_score = 0
-        matched_label = ""
-        for candidate_label in candidate_labels:
-            candidate_text = str(candidate_label or "").strip()
-            if not candidate_text:
-                continue
-            for requested_label in _flow_context_label_candidates(spec):
-                score = _flow_context_label_match_score(candidate_text, requested_label)
-                if score <= label_score:
-                    continue
-                label_score = score
-                matched_label = candidate_text
-        if label_score < _FLOW_CONTEXT_STRONG_LABEL_SCORE:
-            continue
-        normalized_value = _normalize_flow_context_extracted_value(candidate.get("value"), spec)
-        if not normalized_value:
-            continue
-        if label_score <= best_score:
-            continue
-        best_score = label_score
-        best_value = normalized_value
-        best_detail = (
-            f'label "{matched_label}" matched semantic field "{candidate.get("value")}"'
-            if matched_label
-            else "semantic label/value match"
-        )
-
-    if best_value:
-        return best_value, {
-            "source": "page_semantics",
-            "status": "matched",
-            "detail": best_detail,
-        }
-
-    dialogs = semantics.get("dialogs") if isinstance(semantics.get("dialogs"), list) else []
-    for dialog in dialogs:
-        if not isinstance(dialog, dict):
-            continue
-        dialog_text = "\n".join(
-            part for part in (str(dialog.get("title") or "").strip(), str(dialog.get("text") or "").strip()) if part
-        ).strip()
-        if not dialog_text:
-            continue
-        value, attempt = _extract_flow_context_from_text_source(
-            dialog_text,
-            spec,
-            source_name="page_semantics",
-        )
-        if value:
-            attempt["detail"] = f'dialog {dialog.get("index", 0)}: {attempt.get("detail") or "matched"}'
-            return value, attempt
-
-    text_candidates = semantics.get("text_candidates") if isinstance(semantics.get("text_candidates"), list) else []
-    for candidate in text_candidates:
-        if not isinstance(candidate, dict):
-            continue
-        candidate_text = "\n".join(
-            part
-            for part in (
-                str(candidate.get("text") or "").strip(),
-                str(candidate.get("title") or "").strip(),
-                str(candidate.get("aria_label") or "").strip(),
-            )
-            if part
-        ).strip()
-        if not candidate_text:
-            continue
-        value, attempt = _extract_flow_context_from_text_source(
-            candidate_text,
-            spec,
-            source_name="page_semantics",
-        )
-        if value:
-            attempt["detail"] = (
-                f'{candidate.get("tag") or "element"}: {attempt.get("detail") or "matched"}'
-            )
-            return value, attempt
-
-    return None, {
-        "source": "page_semantics",
-        "status": "miss",
-        "detail": f'No matching labelled value was found in semantic snapshot for "{_flow_context_effective_label(spec)}"',
-    }
-
-
-def _extract_flow_context_from_text_source(
-    text: str,
-    spec: dict[str, Any],
-    *,
-    source_name: str,
-) -> tuple[str | None, dict[str, Any]]:
-    content = str(text or "").strip()
-    if not content:
-        return None, {"source": source_name, "status": "miss", "detail": f"{source_name} was empty"}
-
-    patterns = _flow_context_value_patterns(spec)
-    if not patterns:
-        return None, {"source": source_name, "status": "miss", "detail": "No pattern or label available"}
-
-    group = spec.get("group")
-    if not isinstance(group, int):
-        group = 1
-    last_error = ""
-    for pattern in patterns:
-        try:
-            match = re.search(pattern, content, flags=re.IGNORECASE | re.MULTILINE)
-        except re.error as exc:
-            last_error = f"Invalid regex {pattern}: {exc}"
-            continue
-        if not match:
-            last_error = f'Pattern "{pattern}" not found'
-            continue
-
-        try:
-            value = match.group(group)
-        except Exception as exc:
-            last_error = f"Could not read group {group}: {exc}"
-            continue
-
-        cleaned = str(value or "").strip()
-        if not cleaned:
-            last_error = "Matched value was empty"
-            continue
-        return cleaned, {"source": source_name, "status": "matched", "detail": f'Pattern "{pattern}" matched'}
-
-    status = "error" if last_error.startswith("Invalid regex") else "miss"
-    return None, {"source": source_name, "status": status, "detail": last_error or "No pattern matched"}
-
-
-def _is_flow_context_ai_enabled() -> bool:
-    raw = str(os.getenv("PTR_FLOW_CONTEXT_AI_EXTRACTION_ENABLED", "true")).strip().lower()
-    return raw not in {"0", "false", "no", "off"}
-
-
-def _get_flow_context_ai_model() -> str:
-    return os.getenv("PTR_FLOW_CONTEXT_AI_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
-
-
-def _build_flow_context_ai_request_payload(
-    result: dict[str, Any],
-    spec: dict[str, Any],
-    *,
-    model: str,
-) -> tuple[dict[str, Any], str, str]:
-    system_prompt = (
-        "You extract a single business field from Playwright run diagnostics. "
-        "Return concise JSON only."
-    )
-    user_prompt = textwrap.dedent(
-        f"""
-        Extract exactly one field from this Playwright execution snapshot and return JSON only.
-
-        Return exactly:
-        {{
-          "value": string or null,
-          "reason": string,
-          "source": string,
-          "confidence": "low" | "medium" | "high"
-        }}
-
-        Rules:
-        - Extract only the requested field.
-        - Prefer the most recent/current value visible in the provided snapshot.
-        - If the value is missing or ambiguous, return "value": null and explain why.
-        - Do not invent values.
-
-        Requested field name: {spec.get("name")}
-        Requested field label: {_flow_context_effective_label(spec)}
-        Accepted labels and aliases: {json.dumps(_flow_context_label_candidates(spec), ensure_ascii=False)}
-        Value type: {spec.get("value_type") or "text"}
-        Additional hint: {spec.get("prompt") or "None"}
-
-        Page title: {result.get("page_title") or ""}
-        Page URL: {result.get("page_url") or ""}
-
-        Oracle tables JSON:
-        {json.dumps(result.get("oracle_tables") or [], ensure_ascii=False)}
-
-        Semantic snapshot JSON:
-        {json.dumps(result.get("page_semantics") or {}, ensure_ascii=False)}
-
-        Page text:
-        {_truncate_text(result.get("page_text"), max_chars=_MAX_FLOW_CONTEXT_PAGE_TEXT_CHARS) or "No page text captured."}
-        """
-    ).strip()
-
-    request_payload = {
-        "model": model,
-        "input": [
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            },
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": user_prompt}],
-            },
-        ],
-        "text": {"format": {"type": "json_object"}},
-        "max_output_tokens": 300,
-    }
-    return request_payload, system_prompt, user_prompt
-
-
-def _call_openai_flow_context_extraction(
-    result: dict[str, Any],
-    spec: dict[str, Any],
-) -> dict[str, Any]:
-    api_key = get_runner_env_value("OPENAI_API_KEY")
-    model = _get_flow_context_ai_model()
-    if not _is_flow_context_ai_enabled():
-        return {
-            "status": "skipped",
-            "model": model,
-            "reason": "Flow context AI extraction is disabled by PTR_FLOW_CONTEXT_AI_EXTRACTION_ENABLED.",
-        }
-    if not _is_valid_openai_api_key(api_key):
-        return {
-            "status": "skipped",
-            "model": model,
-            "reason": "OPENAI_API_KEY is not configured with a valid runtime key.",
-        }
-
-    request_payload, system_prompt, user_prompt = _build_flow_context_ai_request_payload(
-        result,
-        spec,
-        model=model,
-    )
-    request = Request(
-        f"{_get_openai_base_url()}/responses",
-        data=json.dumps(request_payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urlopen(request, timeout=45) as response:
-            response_payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        return {
-            "status": "error",
-            "model": model,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "reason": f"OpenAI request failed ({exc.code}): {_summarize_openai_error(details)}",
-        }
-    except URLError as exc:
-        return {
-            "status": "error",
-            "model": model,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "reason": f"Unable to reach OpenAI API: {exc.reason}",
-        }
-    except Exception as exc:  # pragma: no cover - network/runtime path
-        return {
-            "status": "error",
-            "model": model,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "reason": f"Unexpected OpenAI failure: {exc}",
-        }
-
-    output_text = ""
-    parsed: dict[str, Any] = {}
-    try:
-        output_text = _extract_response_output_text(response_payload)
-        parsed = _parse_json_response(output_text)
-    except Exception as exc:
-        return {
-            "status": "error",
-            "model": model,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "reason": f"Failed to parse OpenAI response: {exc}",
-            "response_text": output_text,
-        }
-
-    usage = response_payload.get("usage") if isinstance(response_payload.get("usage"), dict) else {}
-    return {
-        "status": "success",
-        "feature": "flow_context_extraction",
-        "model": model,
-        "system_prompt": system_prompt,
-        "user_prompt": user_prompt,
-        "response_text": output_text,
-        "parsed_response": parsed,
-        "usage": usage,
-    }
-
-
-def _extract_flow_context_outputs(
-    result: dict[str, Any],
-    flow_context_specs: list[dict[str, Any]],
-) -> tuple[dict[str, str], list[dict[str, Any]], list[str]]:
-    extracted: dict[str, str] = {}
-    details: list[dict[str, Any]] = []
-    errors: list[str] = []
-
-    for spec in flow_context_specs:
-        if spec.get("kind") != "output":
-            continue
-
-        attempts: list[dict[str, Any]] = []
-        value: str | None = None
-        matched_source = ""
-
-        for source_name in _flow_context_source_candidates(spec):
-            if source_name == "oracle_table":
-                extracted_value, attempt = _extract_flow_context_from_oracle_tables(result, spec)
-            elif source_name == "page_semantics":
-                extracted_value, attempt = _extract_flow_context_from_page_semantics(result, spec)
-            else:
-                extracted_value, attempt = _extract_flow_context_from_text_source(
-                    result.get(source_name),
-                    spec,
-                    source_name=source_name,
-                )
-            attempts.append(attempt)
-            if extracted_value:
-                value = extracted_value
-                matched_source = source_name
-                break
-
-        ai_interaction: dict[str, Any] | None = None
-        if value is None and spec.get("use_ai"):
-            ai_interaction = _call_openai_flow_context_extraction(result, spec)
-            ai_status = str(ai_interaction.get("status") or "unknown")
-            ai_parsed = ai_interaction.get("parsed_response") if isinstance(ai_interaction.get("parsed_response"), dict) else {}
-            ai_value = str(ai_parsed.get("value") or "").strip()
-            attempts.append(
-                {
-                    "source": "ai",
-                    "status": "matched" if ai_status == "success" and ai_value else ai_status,
-                    "detail": ai_parsed.get("reason") or ai_interaction.get("reason") or "",
-                }
-            )
-            if ai_status == "success" and ai_value:
-                value = ai_value
-                matched_source = "ai"
-
-        status = "extracted" if value else "failed"
-        error = ""
-        if value:
-            extracted[spec["name"]] = value
-        elif spec.get("required"):
-            error = f'Failed to extract required output "{spec["name"]}"'
-            errors.append(error)
-
-        details.append(
-            {
-                "name": spec["name"],
-                "label": _flow_context_effective_label(spec),
-                "required": bool(spec.get("required")),
-                "status": status,
-                "value": value or "",
-                "source": matched_source,
-                "attempts": attempts,
-                "error": error,
-                "ai_interaction": ai_interaction,
-            }
-        )
-
-    return extracted, details, errors
 
 
 def _truncate_text(value: Any, *, max_chars: int) -> str:
@@ -2046,7 +1324,7 @@ def _classify_recording_script(script_text: str) -> str:
     if any(marker in trimmed for marker in _OBVIOUS_JS_RECORDING_MARKERS):
         raise ValueError(
             "Recording is not a Python Playwright script. "
-            "test_runner currently supports Python recordings only."
+            "ACT Agent currently supports Python recordings only."
         )
 
     if any(marker in trimmed for marker in _PLAYWRIGHT_PYTHON_MARKERS):
@@ -2082,10 +1360,10 @@ def _inject_runtime_helpers_v2(script_text: str) -> str:
 
 
         def ai_extract(name, prompt):
-            current_page = _PTR_LAST_PAGE
+            current_page = _ACT_LAST_PAGE
             if current_page is None:
                 raise RuntimeError("ai_extract requires a registered page before extraction.")
-            return _ptr_ai_extract(current_page, name, prompt)
+            return _act_ai_extract(current_page, name, prompt)
         """
     ).strip()
     return _insert_after_future_imports(script_text, helper_block)
@@ -2094,7 +1372,7 @@ def _inject_runtime_helpers_v2(script_text: str) -> str:
 def _wrap_runtime_placeholder_literals(script_text: str) -> str:
     """Resolve runtime ``{{name}}`` placeholders in raw-script fallback mode."""
     return _RUNTIME_PLACEHOLDER_LITERAL_RE.sub(
-        lambda match: f"_ptr_resolve({match.group(0)})",
+        lambda match: f"_act_resolve({match.group(0)})",
         script_text,
     )
 
@@ -2204,7 +1482,7 @@ def _prepare_script_for_execution(script_text: str, parameters: dict[str, Any] |
     Uses the AST pipeline to:
       1. AST parse → structured action list (catches ALL locator patterns)
       2. Optimize → detect compound patterns (combobox+option, fill+enter, etc.)
-      3. Generate → produce script where supported actions route through _ptr_* helpers
+      3. Generate → produce script where supported actions route through _act_* helpers
          and unsupported parsed actions get one inline raw-step fallback
       4. Import the clean runtime helper module used by prepared recordings
 
@@ -2242,7 +1520,7 @@ def _run_python_script(
     run_env = dict(env)
     run_env.setdefault("PYTHONUNBUFFERED", "1")
     python_bin = str(run_env.get("PLAYWRIGHT_TEST_PYTHON_BIN") or "python3").strip() or "python3"
-    use_xvfb = _env_flag(run_env.get("PTR_USE_XVFB"), True)
+    use_xvfb = _env_flag(run_env.get("ACT_USE_XVFB"), True)
     xvfb_bin = shutil.which("xvfb-run")
     command = [python_bin, str(script_path)]
     if use_xvfb and xvfb_bin:
@@ -2320,10 +1598,6 @@ def _base_recording_result(recording: dict[str, Any]) -> dict[str, Any]:
         "parameters_file_key": None,
         "resolved_parameter_count": 0,
         "resolved_parameter_keys": [],
-        "flow_context_file_key": None,
-        "flow_context_specs": [],
-        "flow_input_status": {},
-        "flow_output_results": [],
         "extracted_outputs": {},
         "output_errors": [],
     }
@@ -2442,33 +1716,44 @@ async def execute_recording_script(
         # Merge order: script defaults → Excel file overrides → inline overrides.
         parameters: dict[str, str] = _normalize_parameter_values(default_params)
         parameters_file_key = str(recording.get("parameters_file_key") or "").strip() or None
+        multi_line_rows: list[dict[str, str]] = []
         if not bool(recording.get("skip_parameters_file_load")):
             try:
-                file_params, loaded_from = await asyncio.to_thread(_load_recording_parameters, recording, file_key)
+                file_params, loaded_from, multi_line_rows = await asyncio.to_thread(
+                    _load_recording_runtime_inputs,
+                    recording,
+                    file_key,
+                )
                 if file_params:
                     parameters.update(_normalize_parameter_values(file_params))
                     parameters_file_key = loaded_from
                     logger.info("Loaded %d parameter(s) from %s", len(file_params), loaded_from)
                 elif loaded_from:
                     parameters_file_key = loaded_from
+                if multi_line_rows:
+                    logger.info("Loaded %d multi-line row(s) from %s", len(multi_line_rows), loaded_from)
             except Exception as exc:
                 parameters_file = str(recording.get("parameters_file") or "").strip()
                 logger.warning("Failed to load parameters file %s: %s", parameters_file or file_key, exc)
+        inline_multi_line_rows = _normalize_inline_multi_line_rows(recording.get(_DEFAULT_MULTI_LINE_SHEET_NAME))
+        if not inline_multi_line_rows:
+            inline_multi_line_rows = _normalize_inline_multi_line_rows(recording.get("parameters") or {})
         inline = _normalize_parameter_values(recording.get("parameters") or {})
         parameters.update(inline)
+        if inline_multi_line_rows:
+            multi_line_rows = inline_multi_line_rows
+            logger.info(
+                "Using %d inline multi-line row(s) for %s",
+                len(multi_line_rows),
+                file_key,
+            )
 
-        flow_context_specs, flow_context_file_key = await asyncio.to_thread(
-            _load_recording_flow_context_specs,
-            recording,
-            file_key,
-        )
-        normalized_flow_context_specs = _normalize_flow_context_specs(flow_context_specs)
-        execution_parameters = _parameters_to_json_object(parameters)
+        execution_parameters: dict[str, Any] = _parameters_to_json_object(parameters)
+        if multi_line_rows:
+            execution_parameters[_DEFAULT_MULTI_LINE_SHEET_NAME] = multi_line_rows
         result["parameters_file_key"] = parameters_file_key
         result["resolved_parameter_count"] = len(execution_parameters)
         result["resolved_parameter_keys"] = sorted(execution_parameters)
-        result["flow_context_file_key"] = flow_context_file_key
-        result["flow_context_specs"] = normalized_flow_context_specs
         logger.info(
             "Resolved %d execution parameter(s) for %s: %s",
             len(execution_parameters),
@@ -2476,37 +1761,16 @@ async def execute_recording_script(
             ", ".join(sorted(execution_parameters)),
         )
 
-        missing_inputs, flow_input_status = _validate_flow_context_inputs(
-            execution_parameters,
-            normalized_flow_context_specs,
-        )
+        # Fail fast (CLAUDE.md) if any execution parameter still carries an unresolved
+        # {{placeholder}} — e.g. a downstream value an upstream recording never produced.
         unresolved_parameters = _collect_unresolved_execution_parameters(execution_parameters)
-        for name, placeholders in unresolved_parameters.items():
-            existing = flow_input_status.get(name) if isinstance(flow_input_status, dict) else None
-            flow_input_status[name] = {
-                "name": name,
-                "label": (existing or {}).get("label") or name,
-                "required": bool((existing or {}).get("required")),
-                "status": "unresolved",
-                "value": "",
-                "error": f'Parameter "{name}" still contains unresolved placeholders: {", ".join(placeholders)}',
-            }
-        result["flow_input_status"] = flow_input_status
-        if missing_inputs or unresolved_parameters:
-            error_parts: list[str] = []
-            if missing_inputs:
-                error_parts.append("required inputs: " + ", ".join(sorted(set(missing_inputs))))
-            if unresolved_parameters:
-                error_parts.append(
-                    "unresolved parameters: "
-                    + "; ".join(
-                        f'{name} -> {", ".join(placeholders)}'
-                        for name, placeholders in sorted(unresolved_parameters.items())
-                    )
-                )
+        if unresolved_parameters:
             raise RuntimeError(
-                "Required flow context values were not resolved before execution: "
-                + " | ".join(error_parts)
+                "Execution parameters still contain unresolved placeholders before execution: "
+                + "; ".join(
+                    f'{name} -> {", ".join(placeholders)}'
+                    for name, placeholders in sorted(unresolved_parameters.items())
+                )
             )
 
         executable_script, execution_mode, preparation_warning = _resolve_executable_script(
@@ -2545,34 +1809,34 @@ async def execute_recording_script(
         video_dir = working_dir / "video"
 
         env = _ensure_runner_pythonpath(_merge_runner_env_defaults(os.environ.copy()))
-        env["PTR_DIAGNOSTICS_PATH"] = str(diagnostics_path)
-        env["PTR_FAILURE_SCREENSHOT_PATH"] = str(failure_screenshot_path)
-        env["PTR_SCRIPT_STEP_OUTPUT_PATH"] = str(script_step_output_path)
-        env["PTR_EXECUTION_PARAMETERS_JSON"] = json.dumps(execution_parameters, sort_keys=True)
+        env["ACT_DIAGNOSTICS_PATH"] = str(diagnostics_path)
+        env["ACT_FAILURE_SCREENSHOT_PATH"] = str(failure_screenshot_path)
+        env["ACT_SCRIPT_STEP_OUTPUT_PATH"] = str(script_step_output_path)
+        env["ACT_EXECUTION_PARAMETERS_JSON"] = json.dumps(execution_parameters, sort_keys=True)
         experience_store_path = _default_experience_store_path()
         experience_store_path.parent.mkdir(parents=True, exist_ok=True)
-        env["PTR_EXPERIENCE_STORE_PATH"] = str(experience_store_path)
-        env.setdefault("PTR_EXPERIENCE_ENABLED", "true")
-        env.setdefault("PTR_RUNNER_VERSION", "ptr-v2")
+        env["ACT_EXPERIENCE_STORE_PATH"] = str(experience_store_path)
+        env.setdefault("ACT_EXPERIENCE_ENABLED", "true")
+        env.setdefault("ACT_RUNNER_VERSION", "act-v2")
         env = _apply_recording_debug_env_overrides(env, recording)
         after_action_wait_ms = _resolve_after_action_wait_ms(recording)
         if after_action_wait_ms is not None:
-            env["PTR_AFTER_ACTION_WAIT_MS"] = str(after_action_wait_ms)
+            env["ACT_AFTER_ACTION_WAIT_MS"] = str(after_action_wait_ms)
             logger.info(
                 "Using per-recording after-action wait of %d ms for %s",
                 after_action_wait_ms,
                 file_key,
             )
-        if _env_flag(env.get("PTR_CAPTURE_STEPS"), True):
+        if _env_flag(env.get("ACT_CAPTURE_STEPS"), True):
             step_artifacts_dir.mkdir(parents=True, exist_ok=True)
-            env["PTR_STEP_ARTIFACTS_DIR"] = str(step_artifacts_dir)
+            env["ACT_STEP_ARTIFACTS_DIR"] = str(step_artifacts_dir)
         else:
-            env.pop("PTR_STEP_ARTIFACTS_DIR", None)
-        if _env_flag(env.get("PTR_RECORD_VIDEO"), False):
+            env.pop("ACT_STEP_ARTIFACTS_DIR", None)
+        if _env_flag(env.get("ACT_RECORD_VIDEO"), False):
             video_dir.mkdir(parents=True, exist_ok=True)
-            env["PTR_VIDEO_DIR"] = str(video_dir)
+            env["ACT_VIDEO_DIR"] = str(video_dir)
         else:
-            env.pop("PTR_VIDEO_DIR", None)
+            env.pop("ACT_VIDEO_DIR", None)
         result["debug_settings"] = _effective_debug_settings(env)
 
         python_bin = str(env.get("PLAYWRIGHT_TEST_PYTHON_BIN") or "python3").strip() or "python3"
@@ -2689,18 +1953,12 @@ async def execute_recording_script(
                 step_image_paths=step_image_paths,
             )
 
-        workbook_outputs, flow_output_results, flow_output_errors = _extract_flow_context_outputs(
-            result,
-            result.get("flow_context_specs") or [],
-        )
-        explicit_outputs, explicit_output_errors = _extract_recording_outputs(result, recording.get("outputs"))
+        # Outputs are produced explicitly by the recording via ai_extract() / api_helpers.extract(),
+        # written to ACT_SCRIPT_STEP_OUTPUT_PATH and read back here. They flow into Flow Context /
+        # downstream {{placeholders}} through extracted_outputs (see agent.py suite-context merge).
         script_step_outputs, script_step_output_errors = _read_script_step_output(script_step_output_path)
-        extracted_outputs = dict(workbook_outputs)
-        extracted_outputs.update(explicit_outputs)
-        extracted_outputs.update(script_step_outputs)
-        result["flow_output_results"] = flow_output_results
-        result["extracted_outputs"] = extracted_outputs
-        result["output_errors"] = [*flow_output_errors, *explicit_output_errors, *script_step_output_errors]
+        result["extracted_outputs"] = script_step_outputs
+        result["output_errors"] = script_step_output_errors
 
     logger.info(
         "Finished recording %s with status=%s exit_code=%s duration=%ss",

@@ -160,12 +160,12 @@ def _build_agent_command(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the local test_runner agent and download the generated HTML report from MinIO."
+        description="Run the local ACT Agent and download the generated HTML report from MinIO."
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--payload-json", help="Inline JSON payload to send to the agent.")
     source_group.add_argument("--payload-file", help="Path to a JSON file containing the agent payload.")
-    parser.add_argument("--agent-name", default="test_runner", help="Agent name to execute. Default: test_runner")
+    parser.add_argument("--agent-name", default="ACT Agent", help="Agent name to execute. Default: ACT Agent")
     parser.add_argument(
         "--aetherion-bin",
         default=str(PROJECT_ROOT / ".venv" / "bin" / "aetherion"),

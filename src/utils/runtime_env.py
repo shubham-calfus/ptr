@@ -7,7 +7,7 @@ from pathlib import Path
 _RUNNER_ENV_LINE_RE = re.compile(
     r"^\s*(?:export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.*?)\s*$"
 )
-_RUNNER_ENV_OVERRIDE_PREFIXES = ("OPENAI_", "PTR_AI_")
+_RUNNER_ENV_OVERRIDE_PREFIXES = ("OPENAI_", "ACT_AI_")
 _RUNNER_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _RUNNER_DOTENV_PATH = _RUNNER_PROJECT_ROOT / ".env"
 

@@ -1,1 +1,1 @@
-"""Shared helpers for test_runner."""
+"""Shared helpers for ACT Agent."""

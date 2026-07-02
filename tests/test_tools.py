@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import types
@@ -17,25 +18,23 @@ from src.tools.tools import (
     _effective_debug_settings,
     _extract_table_parameter_sets,
     _load_resume_state_from_run_data,
-    _extract_flow_context_outputs,
-    _extract_recording_outputs,
     _expand_recordings_for_parameter_rows_data,
     _manifest_key_for_recording,
     _load_runner_env_defaults,
     _merge_runner_env_defaults,
+    _normalize_inline_multi_line_rows,
     _parameterise_script,
-    _parse_flow_context_aliases,
-    _parse_excel_flow_context_specs,
     _parameters_to_json_object,
     _parse_excel_parameter_sets,
+    _parse_excel_multi_line_rows,
     _parse_excel_parameters,
+    _load_recording_runtime_inputs,
     _prepare_script_for_execution,
     _read_script_step_output,
     _resolve_executable_script,
     _run_python_script,
     _split_storage_object_ref,
     _store_executed_script_artifact,
-    _validate_flow_context_inputs,
 )
 
 
@@ -59,15 +58,15 @@ with sync_playwright() as playwright:
     prepared = _prepare_script_for_execution(script)
 
     assert (
-        "_ptr_tracked_action('search_and_select', 'Search for people to add as', "
-        "_ptr_select_search_trigger_option, page.get_by_role('textbox', "
+        "_act_tracked_action('search_and_select', 'Search for people to add as', "
+        "_act_select_search_trigger_option, page.get_by_role('textbox', "
         "name='Search for people to add as'), page.get_by_text('Fu Jiang'), "
         "page, 'Search for people to add as', 'Fu Jiang', option_kind='text', fill_value='Fu Jiang')"
         in prepared
     )
-    assert "_ptr_set_script_data({'tracked_action': 'search_and_select'" in prepared
-    assert "_ptr_tracked_action('fill_textbox', 'Search for people to add as'" not in prepared
-    assert "_ptr_tracked_action('click_text', 'Fu Jiang'" not in prepared
+    assert "_act_set_script_data({'tracked_action': 'search_and_select'" in prepared
+    assert "_act_tracked_action('fill_textbox', 'Search for people to add as'" not in prepared
+    assert "_act_tracked_action('click_text', 'Fu Jiang'" not in prepared
 
 
 def test_prepare_script_for_execution_preserves_exact_search_result_clicks() -> None:
@@ -90,8 +89,8 @@ with sync_playwright() as playwright:
     prepared = _prepare_script_for_execution(script)
 
     assert (
-        "_ptr_tracked_action('search_and_select', 'Search for people to add as', "
-        "_ptr_select_search_trigger_option, page.get_by_role('textbox', "
+        "_act_tracked_action('search_and_select', 'Search for people to add as', "
+        "_act_select_search_trigger_option, page.get_by_role('textbox', "
         "name='Search for people to add as'), page.get_by_text('Wan Fu', exact=True), "
         "page, 'Search for people to add as', 'Wan Fu', option_kind='text', "
         "option_exact=True, fill_value='Fu')"
@@ -246,7 +245,7 @@ with sync_playwright() as playwright:
 
     prepared = _prepare_script_for_execution(script)
 
-    assert "_ptr_ai_extract, page, 'order_number', 'extract order number only'" in prepared
+    assert "_act_ai_extract, page, 'order_number', 'extract order number only'" in prepared
     assert "stale runtime parser rejected ai_extract" not in prepared
 
 
@@ -286,7 +285,7 @@ with sync_playwright() as playwright:
     assert preparation_warning is not None
     assert "from src.runtime.helpers_v2 import *" in executable_script
     assert "def ai_extract(name, prompt):" in executable_script
-    assert 'page.get_by_role("link", name=_ptr_resolve("{{transaction_number}}")).click()' in executable_script
+    assert 'page.get_by_role("link", name=_act_resolve("{{transaction_number}}")).click()' in executable_script
 
 
 def test_classify_recording_script_treats_non_playwright_python_as_script_step() -> None:
@@ -352,9 +351,9 @@ extract("order_number", f"PO-{p['suffix']}")
         timeout_seconds=30,
         env=_ensure_runner_pythonpath(
             {
-                "PTR_USE_XVFB": "false",
-                "PTR_EXECUTION_PARAMETERS_JSON": '{"suffix":"1009"}',
-                "PTR_SCRIPT_STEP_OUTPUT_PATH": str(output_path),
+                "ACT_USE_XVFB": "false",
+                "ACT_EXECUTION_PARAMETERS_JSON": '{"suffix":"1009"}',
+                "ACT_SCRIPT_STEP_OUTPUT_PATH": str(output_path),
             }
         ),
     )
@@ -363,6 +362,56 @@ extract("order_number", f"PO-{p['suffix']}")
 
     assert completed.returncode == 0
     assert extracted == {"order_number": "PO-1009"}
+    assert errors == []
+
+
+def test_script_step_can_loop_over_multi_line_runtime_rows(tmp_path: Path) -> None:
+    script_path = tmp_path / "create_credit_memo.py"
+    output_path = tmp_path / "script_step_output.json"
+
+    script_path.write_text(
+        """
+from src.runtime.api_helpers import extract, get_runtime_params
+
+p = get_runtime_params()
+rows = p["multi_line"]
+extract("line_count", len(rows))
+extract("first_description", rows[0]["description"])
+extract("total_unit_price", sum(int(row["unit_price"]) for row in rows))
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_python_script(
+        script_path,
+        tmp_path,
+        timeout_seconds=30,
+        env=_ensure_runner_pythonpath(
+            {
+                "ACT_USE_XVFB": "false",
+                "ACT_EXECUTION_PARAMETERS_JSON": json.dumps(
+                    {
+                        "username": "svc",
+                        "multi_line": [
+                            {"description": "Line 1", "quantity": "-1", "unit_price": "10"},
+                            {"description": "Line 2", "quantity": "-2", "unit_price": "20"},
+                        ],
+                    }
+                ),
+                "ACT_SCRIPT_STEP_OUTPUT_PATH": str(output_path),
+            }
+        ),
+    )
+
+    extracted, errors = _read_script_step_output(output_path)
+
+    assert completed.returncode == 0
+    assert extracted == {
+        "line_count": "2",
+        "first_description": "Line 1",
+        "total_unit_price": "30",
+    }
     assert errors == []
 
 
@@ -527,22 +576,22 @@ with sync_playwright() as playwright:
     prepared = _prepare_script_for_execution(script)
 
     assert (
-        "_ptr_tracked_action('search_and_select', 'Search for people to add as', "
-        "_ptr_select_search_trigger_option, page.get_by_role('textbox', "
+        "_act_tracked_action('search_and_select', 'Search for people to add as', "
+        "_act_select_search_trigger_option, page.get_by_role('textbox', "
         "name='Search for people to add as'), page.get_by_text('Wan Fu'), "
         "page, 'Search for people to add as', 'Wan Fu', option_kind='text', fill_value='Fu')"
         in prepared
     )
     assert (
-        "_ptr_tracked_action('select_combobox', 'Reporting Relationship', "
-        "_ptr_select_combobox_option, page.get_by_role('combobox', "
+        "_act_tracked_action('select_combobox', 'Reporting Relationship', "
+        "_act_select_combobox_option, page.get_by_role('combobox', "
         "name='Reporting Relationship'), page.get_by_role('option', "
         "name='Project Manager'), page, 'Reporting Relationship', "
         "'Project Manager')"
         in prepared
     )
-    assert "_ptr_tracked_action('click_combobox', 'Search for people to add as'" not in prepared
-    assert "_ptr_tracked_action('navigation_button', 'Continue'" not in prepared
+    assert "_act_tracked_action('click_combobox', 'Search for people to add as'" not in prepared
+    assert "_act_tracked_action('navigation_button', 'Continue'" not in prepared
 
 
 def test_parameterise_script_does_not_reuse_stale_textbox_context_for_calendar_gridcell() -> None:
@@ -637,70 +686,15 @@ def test_parameters_to_json_object_resolves_references_between_parameters() -> N
     assert resolved["approval_lookup"] == "Request REQ-10025"
 
 
-def test_extract_recording_outputs_reads_regex_from_page_text() -> None:
-    extracted, errors = _extract_recording_outputs(
-        {
-            "page_text": "Requisition REQ-10025 was created successfully.",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-        },
-        [
-            {
-                "name": "requisition_id",
-                "source": "page_text",
-                "pattern": r"Requisition\s+(REQ-\d+)",
-            }
-        ],
-    )
-
-    assert extracted == {"requisition_id": "REQ-10025"}
-    assert errors == []
-
-
-def test_extract_recording_outputs_reads_oracle_table_first_row_cell() -> None:
-    extracted, errors = _extract_recording_outputs(
-        {
-            "page_text": "",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-            "oracle_tables": [
-                {
-                    "headers": ["Requisition Title", "Requisition Number", "Requisition Status"],
-                    "rows": [
-                        ["Analyst", "1003", "Approval - Pending"],
-                        ["Analyst", "1002", "Approval - Pending"],
-                    ],
-                }
-            ],
-        },
-        [
-            {
-                "name": "requisition_id",
-                "source": "oracle_table",
-                "column": "Requisition Number",
-                "row": 0,
-                "table_index": 0,
-            }
-        ],
-    )
-
-    assert extracted == {"requisition_id": "1003"}
-    assert errors == []
-
-
 def test_load_runner_env_defaults_parses_exported_values(tmp_path) -> None:
     config_path = tmp_path / "configs.txt"
     config_path.write_text(
         "\n".join(
             [
                 "# comment",
-                "export PTR_CAPTURE_STEPS=true",
-                "PTR_POST_CLICK_WAIT_MS=250",
-                'export PTR_GREETING="hello world"',
+                "export ACT_CAPTURE_STEPS=true",
+                "ACT_POST_CLICK_WAIT_MS=250",
+                'export ACT_GREETING="hello world"',
                 "invalid line",
             ]
         ),
@@ -710,9 +704,9 @@ def test_load_runner_env_defaults_parses_exported_values(tmp_path) -> None:
     defaults = _load_runner_env_defaults(config_path)
 
     assert defaults == {
-        "PTR_CAPTURE_STEPS": "true",
-        "PTR_POST_CLICK_WAIT_MS": "250",
-        "PTR_GREETING": "hello world",
+        "ACT_CAPTURE_STEPS": "true",
+        "ACT_POST_CLICK_WAIT_MS": "250",
+        "ACT_GREETING": "hello world",
     }
 
 
@@ -721,8 +715,8 @@ def test_merge_runner_env_defaults_keeps_explicit_env_values(tmp_path) -> None:
     config_path.write_text(
         "\n".join(
             [
-                "export PTR_RECORD_VIDEO=false",
-                "export PTR_POST_CLICK_WAIT_MS=250",
+                "export ACT_RECORD_VIDEO=false",
+                "export ACT_POST_CLICK_WAIT_MS=250",
             ]
         ),
         encoding="utf-8",
@@ -730,25 +724,25 @@ def test_merge_runner_env_defaults_keeps_explicit_env_values(tmp_path) -> None:
 
     merged = _merge_runner_env_defaults(
         {
-            "PTR_POST_CLICK_WAIT_MS": "900",
+            "ACT_POST_CLICK_WAIT_MS": "900",
             "CUSTOM_VALUE": "present",
         },
         config_path=config_path,
     )
 
-    assert merged["PTR_RECORD_VIDEO"] == "false"
-    assert merged["PTR_POST_CLICK_WAIT_MS"] == "900"
+    assert merged["ACT_RECORD_VIDEO"] == "false"
+    assert merged["ACT_POST_CLICK_WAIT_MS"] == "900"
     assert merged["CUSTOM_VALUE"] == "present"
 
 
 def test_apply_recording_debug_env_overrides_and_collect_effective_debug_settings() -> None:
     env = {
-        "PTR_CAPTURE_STEPS": "true",
-        "PTR_RECORD_VIDEO": "false",
-        "PTR_STEP_SCREENSHOT_FULL_PAGE": "false",
-        "PTR_AFTER_ACTION_WAIT_MS": "10000",
-        "PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS": "12000",
-        "PTR_DEBUG_TRACE": "false",
+        "ACT_CAPTURE_STEPS": "true",
+        "ACT_RECORD_VIDEO": "false",
+        "ACT_STEP_SCREENSHOT_FULL_PAGE": "false",
+        "ACT_AFTER_ACTION_WAIT_MS": "0",
+        "ACT_PAGE_TEXT_SNAPSHOT_MAX_CHARS": "12000",
+        "ACT_DEBUG_TRACE": "false",
     }
 
     merged = _apply_recording_debug_env_overrides(
@@ -762,12 +756,12 @@ def test_apply_recording_debug_env_overrides_and_collect_effective_debug_setting
         },
     )
 
-    assert merged["PTR_DEBUG_TRACE"] == "true"
-    assert merged["PTR_RECORD_VIDEO"] == "true"
-    assert merged["PTR_STEP_SCREENSHOT_FULL_PAGE"] == "true"
-    assert merged["PTR_PAGE_TEXT_SNAPSHOT_MAX_CHARS"] == "24000"
+    assert merged["ACT_DEBUG_TRACE"] == "true"
+    assert merged["ACT_RECORD_VIDEO"] == "true"
+    assert merged["ACT_STEP_SCREENSHOT_FULL_PAGE"] == "true"
+    assert merged["ACT_PAGE_TEXT_SNAPSHOT_MAX_CHARS"] == "24000"
     assert _effective_debug_settings(merged) == {
-        "after_action_wait_ms": 10000,
+        "after_action_wait_ms": 0,
         "capture_steps": True,
         "record_video": True,
         "step_screenshot_full_page": True,
@@ -826,7 +820,7 @@ def test_run_python_script_skips_xvfb_when_disabled(monkeypatch, tmp_path: Path)
         script_path,
         tmp_path,
         timeout_seconds=30,
-        env={"PTR_USE_XVFB": "false"},
+        env={"ACT_USE_XVFB": "false"},
     )
 
     assert captured["args"][0] == ["python3", str(script_path)]
@@ -1021,85 +1015,68 @@ def test_parse_excel_parameter_sets_prefers_parameter_value_sheet_over_horizonta
     ]
 
 
-def test_parse_excel_flow_context_specs_reads_second_sheet_configuration() -> None:
+def test_parse_excel_multi_line_rows_reads_dedicated_sheet() -> None:
     from io import BytesIO
 
     from openpyxl import Workbook
 
     wb = Workbook()
-    params = wb.active
-    params.title = "Params"
-    params.append(["Parameter", "Value"])
-    params.append(["url", "https://example.com"])
+    ws = wb.active
+    ws.title = "params"
+    ws.append(["username"])
+    ws.append(["svc"])
 
-    flow_context = wb.create_sheet("Flow Context")
-    flow_context.append(
-        ["kind", "name", "label", "aliases", "source", "required", "use_ai", "prompt", "value_type"]
-    )
-    flow_context.append(
-        [
-            "output",
-            "requisition_id",
-            "Requisition Number",
-            "Req Number|Job Requisition Number",
-            "auto",
-            "yes",
-            "yes",
-            "Extract the created requisition number",
-            "number",
-        ]
-    )
-    flow_context.append(["input", "search_value", "Search Value", "", "", "yes", "no", "", ""])
+    multi_line = wb.create_sheet("multi_line")
+    multi_line.append(["Description", "Quantity", "Unit Price"])
+    multi_line.append(["Line 1", "-1", "10"])
+    multi_line.append(["Line 2", "-2", "20"])
 
     buffer = BytesIO()
     wb.save(buffer)
     wb.close()
 
-    specs = _parse_excel_flow_context_specs(buffer.getvalue())
+    rows = _parse_excel_multi_line_rows(buffer.getvalue())
 
-    assert specs == [
-        {
-            "row_index": 2,
-            "kind": "output",
-            "name": "requisition_id",
-            "label": "Requisition Number",
-            "aliases": ["Req Number", "Job Requisition Number"],
-            "source": "auto",
-            "pattern": "",
-            "group": 1,
-            "column": "",
-            "row": None,
-            "table_index": None,
-            "required": True,
-            "prompt": "Extract the created requisition number",
-            "value_type": "number",
-            "use_ai": True,
-        },
-        {
-            "row_index": 3,
-            "kind": "input",
-            "name": "search_value",
-            "label": "Search Value",
-            "aliases": [],
-            "source": "auto",
-            "pattern": "",
-            "group": 1,
-            "column": "",
-            "row": None,
-            "table_index": None,
-            "required": True,
-            "prompt": "",
-            "value_type": "text",
-            "use_ai": False,
-        },
+    assert rows == [
+        {"description": "Line 1", "quantity": "-1", "unit_price": "10"},
+        {"description": "Line 2", "quantity": "-2", "unit_price": "20"},
     ]
 
 
-def test_parse_flow_context_aliases_accepts_existing_lists_without_stringifying() -> None:
-    assert _parse_flow_context_aliases(["Req Number", "Job Requisition Number"]) == [
-        "Req Number",
-        "Job Requisition Number",
-    ]
+def test_load_recording_runtime_inputs_reads_multi_line_using_recording_config(monkeypatch) -> None:
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "params"
+    ws.append(["username", "password", "account_number"])
+    ws.append(["svc", "secret", "111133"])
+    lines = wb.create_sheet("multi_line")
+    lines.append(["Description", "Quantity", "Unit Price"])
+    lines.append(["First", "-1", "10"])
+    buffer = BytesIO()
+    wb.save(buffer)
+    wb.close()
+
+    def _fake_storage_get_bytes(key: str) -> bytes:
+        if key.endswith("_recording_config.json"):
+            return b'{"repeatable_blocks":[{"enabled":true,"sheet_name":"multi_line","prompt":"repeat rows"}]}'
+        if key.endswith("_params.xlsx"):
+            return buffer.getvalue()
+        raise AssertionError(f"unexpected key {key}")
+
+    monkeypatch.setattr("src.tools.tools._storage_get_bytes", _fake_storage_get_bytes)
+
+    params, loaded_from, multi_line_rows = _load_recording_runtime_inputs(
+        {"parameters_file": "recordings/demo/demo_params.xlsx"},
+        "recordings/demo/demo.py",
+    )
+
+    assert loaded_from == "recordings/demo/demo_params.xlsx"
+    assert params == {"username": "svc", "password": "secret", "account_number": "111133"}
+    assert multi_line_rows == [{"description": "First", "quantity": "-1", "unit_price": "10"}]
 
 
 def test_extract_table_parameter_sets_keeps_headerless_vertical_credentials_sheet() -> None:
@@ -1232,6 +1209,52 @@ def test_expand_recordings_for_parameter_rows_data_fans_out_multiple_excel_rows(
     assert expanded[1]["skip_parameters_file_load"] is True
 
 
+def test_expand_recordings_for_parameter_rows_data_attaches_grouped_multi_line_rows(monkeypatch) -> None:
+    def _fake_load_recording_parameter_sets(recording, file_key):
+        return (
+            [
+                {"row_index": 2, "values": {"header_id": "INV1", "customer_name": "Customer 1"}},
+                {"row_index": 3, "values": {"header_id": "INV2", "customer_name": "Customer 2"}},
+            ],
+            "recordings/demo_params.xlsx",
+        )
+
+    monkeypatch.setattr(
+        "src.tools.tools._load_recording_parameter_sets",
+        _fake_load_recording_parameter_sets,
+    )
+    monkeypatch.setattr(
+        "src.tools.tools._load_recording_config",
+        lambda file_key: {
+            "repeatable_blocks": [
+                {"enabled": True, "sheet_name": "multi_line", "match_key": "header_id", "prompt": "repeat rows"}
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "src.tools.tools._load_recording_runtime_inputs",
+        lambda recording, file_key: (
+            {"header_id": "INV1"},
+            "recordings/demo_params.xlsx",
+            [
+                {"header_id": "INV1", "line_description": "Line 1", "quantity": "1"},
+                {"header_id": "INV2", "line_description": "Line 2", "quantity": "2"},
+            ],
+        ),
+    )
+
+    expanded = _expand_recordings_for_parameter_rows_data(
+        [{"id": "rec-1", "name": "demo", "file": "recordings/demo.py"}]
+    )
+
+    assert expanded[0]["multi_line"] == [
+        {"header_id": "INV1", "line_description": "Line 1", "quantity": "1"}
+    ]
+    assert expanded[1]["multi_line"] == [
+        {"header_id": "INV2", "line_description": "Line 2", "quantity": "2"}
+    ]
+
+
 def test_parameters_to_json_object_normalizes_inline_parameter_keys() -> None:
     params = _parameters_to_json_object(
         {
@@ -1248,6 +1271,33 @@ def test_parameters_to_json_object_normalizes_inline_parameter_keys() -> None:
         "username": "svc",
         "receipt_number": "RN-465346",
     }
+
+
+def test_normalize_parameter_values_ignores_inline_multi_line_block() -> None:
+    params = _parameters_to_json_object(
+        {
+            "invoice_number": "INV-100",
+            "multi_line": [{"line_amount": "100"}],
+        }
+    )
+
+    assert params == {"invoice_number": "INV-100"}
+
+
+def test_normalize_inline_multi_line_rows_reads_recording_payload() -> None:
+    rows = _normalize_inline_multi_line_rows(
+        {
+            "multi_line": [
+                {"Line Amount": "100", "Distribution Combination ID": "850"},
+                {"Line Amount": "200", "Distribution Combination ID": "851"},
+            ]
+        }
+    )
+
+    assert rows == [
+        {"line_amount": "100", "distribution_combination_id": "850"},
+        {"line_amount": "200", "distribution_combination_id": "851"},
+    ]
 
 
 def test_split_storage_object_ref_strips_current_bucket_prefix(monkeypatch) -> None:
@@ -1276,23 +1326,6 @@ def test_derive_parameters_file_candidates_uses_sibling_params_file(monkeypatch)
     ]
 
 
-def test_validate_flow_context_inputs_flags_missing_required_values() -> None:
-    missing, status = _validate_flow_context_inputs(
-        {"search_value": ""},
-        [
-            {
-                "kind": "input",
-                "name": "search_value",
-                "label": "Search Value",
-                "required": True,
-            }
-        ],
-    )
-
-    assert missing == ["search_value"]
-    assert status["search_value"]["status"] == "missing"
-
-
 def test_collect_unresolved_execution_parameters_detects_raw_placeholders() -> None:
     unresolved = _collect_unresolved_execution_parameters(
         {
@@ -1308,203 +1341,6 @@ def test_collect_unresolved_execution_parameters_detects_raw_placeholders() -> N
     }
 
 
-def test_extract_flow_context_outputs_reads_first_matching_table_value_without_row_or_column_hints() -> None:
-    extracted, details, errors = _extract_flow_context_outputs(
-        {
-            "page_text": "",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-            "oracle_tables": [
-                {
-                    "headers": ["Requisition Title", "Requisition Number", "Requisition Status"],
-                    "rows": [["Analyst", "1003", "Approval - Pending"], ["Senior Analyst", "1002", "Draft"]],
-                }
-            ],
-        },
-        [
-            {
-                "kind": "output",
-                "name": "requisition_id",
-                "label": "Requisition Number",
-                "aliases": ["Req Number"],
-                "source": "auto",
-                "required": True,
-                "use_ai": True,
-                "value_type": "number",
-            }
-        ],
-    )
-
-    assert extracted == {"requisition_id": "1003"}
-    assert errors == []
-    assert details[0]["status"] == "extracted"
-    assert details[0]["source"] == "oracle_table"
-    assert details[0]["attempts"][0]["status"] == "matched"
-    assert details[0]["attempts"][0]["detail"] == 'table 0, first non-empty row 0, column "Requisition Number"'
-
-
-def test_extract_flow_context_outputs_reads_labelled_value_from_page_text_without_location_hint() -> None:
-    extracted, details, errors = _extract_flow_context_outputs(
-        {
-            "page_text": "Review complete. Requisition Number 1007 was created for Analyst.",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-            "oracle_tables": [],
-        },
-        [
-            {
-                "kind": "output",
-                "name": "requisition_id",
-                "label": "Requisition Number",
-                "source": "auto",
-                "required": True,
-                "use_ai": True,
-                "value_type": "number",
-            }
-        ],
-    )
-
-    assert extracted == {"requisition_id": "1007"}
-    assert errors == []
-    assert details[0]["source"] == "page_text"
-    assert details[0]["attempts"][1]["source"] == "page_semantics"
-    assert details[0]["attempts"][1]["status"] == "miss"
-    assert details[0]["attempts"][2]["source"] == "page_text"
-    assert details[0]["attempts"][2]["status"] == "matched"
-
-
-def test_extract_flow_context_outputs_reads_labelled_value_from_page_semantics_before_page_text() -> None:
-    extracted, details, errors = _extract_flow_context_outputs(
-        {
-            "page_text": "Review complete. Requisition Number 1007 was created for Analyst.",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-            "oracle_tables": [],
-            "page_semantics": {
-                "label_values": [
-                    {
-                        "label": "Requisition Number",
-                        "value": "1008",
-                        "tag": "span",
-                        "role": "",
-                        "id": "req-number",
-                        "title": "",
-                        "aria_label": "",
-                        "data_oj_field": "",
-                    }
-                ],
-                "text_candidates": [],
-                "dialogs": [],
-            },
-        },
-        [
-            {
-                "kind": "output",
-                "name": "requisition_id",
-                "label": "Requisition Number",
-                "aliases": ["Req Number"],
-                "source": "auto",
-                "required": True,
-                "use_ai": True,
-                "value_type": "number",
-            }
-        ],
-    )
-
-    assert extracted == {"requisition_id": "1008"}
-    assert errors == []
-    assert details[0]["source"] == "page_semantics"
-    assert details[0]["attempts"][1]["source"] == "page_semantics"
-    assert details[0]["attempts"][1]["status"] == "matched"
-
-
-def test_extract_flow_context_outputs_ignores_weak_semantic_label_overlap() -> None:
-    extracted, details, errors = _extract_flow_context_outputs(
-        {
-            "page_text": "",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-            "oracle_tables": [],
-            "page_semantics": {
-                "label_values": [
-                    {
-                        "label": "Automatically Fill Requisition",
-                        "value": "N",
-                        "tag": "oj-select-single",
-                        "role": "",
-                        "id": "auto-fill",
-                        "title": "",
-                        "aria_label": "",
-                        "data_oj_field": "AutomaticFillCode",
-                    }
-                ],
-                "text_candidates": [],
-                "dialogs": [],
-            },
-        },
-        [
-            {
-                "kind": "output",
-                "name": "requisition_title",
-                "label": "Requisition Title",
-                "source": "auto",
-                "required": True,
-                "use_ai": False,
-                "value_type": "text",
-            }
-        ],
-    )
-
-    assert extracted == {}
-    assert errors == ['Failed to extract required output "requisition_title"']
-    assert details[0]["status"] == "failed"
-    assert details[0]["attempts"][1]["source"] == "page_semantics"
-    assert details[0]["attempts"][1]["status"] == "miss"
-
-
-def test_extract_flow_context_outputs_ignores_weak_oracle_table_header_overlap() -> None:
-    extracted, details, errors = _extract_flow_context_outputs(
-        {
-            "page_text": "",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-            "oracle_tables": [
-                {
-                    "headers": ["Automatically Fill Requisition", "Status"],
-                    "rows": [["N", "Draft"]],
-                }
-            ],
-        },
-        [
-            {
-                "kind": "output",
-                "name": "requisition_title",
-                "label": "Requisition Title",
-                "source": "auto",
-                "required": True,
-                "use_ai": False,
-                "value_type": "text",
-            }
-        ],
-    )
-
-    assert extracted == {}
-    assert errors == ['Failed to extract required output "requisition_title"']
-    assert details[0]["status"] == "failed"
-    assert details[0]["attempts"][0]["source"] == "oracle_table"
-    assert details[0]["attempts"][0]["status"] == "miss"
-
-
 def test_call_openai_failure_summary_skips_placeholder_openai_key(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "##OPENAI_API_KEY##")
     monkeypatch.setenv("OPENAI_FAILURE_SUMMARY_ENABLED", "true")
@@ -1517,51 +1353,3 @@ def test_call_openai_failure_summary_skips_placeholder_openai_key(monkeypatch) -
 
     assert result["status"] == "skipped"
     assert "valid runtime key" in result["reason"]
-
-
-def test_extract_flow_context_outputs_falls_back_to_ai_when_needed(monkeypatch) -> None:
-    def _fake_ai_extract(result, spec):
-        return {
-            "status": "success",
-            "feature": "flow_context_extraction",
-            "model": "gpt-5.4-mini",
-            "system_prompt": "system",
-            "user_prompt": "user",
-            "response_text": '{"value":"1004","reason":"Found in confirmation banner","source":"page_text","confidence":"high"}',
-            "parsed_response": {
-                "value": "1004",
-                "reason": "Found in confirmation banner",
-                "source": "page_text",
-                "confidence": "high",
-            },
-            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
-        }
-
-    monkeypatch.setattr("src.tools.tools._call_openai_flow_context_extraction", _fake_ai_extract)
-
-    extracted, details, errors = _extract_flow_context_outputs(
-        {
-            "page_text": "",
-            "page_url": "",
-            "page_title": "",
-            "stdout": "",
-            "stderr": "",
-            "oracle_tables": [],
-        },
-        [
-            {
-                "kind": "output",
-                "name": "requisition_id",
-                "label": "Requisition Number",
-                "source": "auto",
-                "required": True,
-                "use_ai": True,
-            }
-        ],
-    )
-
-    assert extracted == {"requisition_id": "1004"}
-    assert errors == []
-    assert details[0]["source"] == "ai"
-    assert details[0]["attempts"][-1]["source"] == "ai"
-    assert details[0]["ai_interaction"]["model"] == "gpt-5.4-mini"

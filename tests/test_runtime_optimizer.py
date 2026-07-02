@@ -1,5 +1,5 @@
 from src.runtime.optimizer import optimize
-from src.runtime.parser import parse_script
+from src.runtime.parser import MultiLineLoop, parse_script
 
 
 def test_optimize_drops_non_login_textbox_click_before_navigation_button() -> None:
@@ -184,3 +184,66 @@ def run(playwright):
         "close_browser",
     ]
     assert optimized[3].url == "https://example.test/login"
+
+
+def test_optimize_merges_lov_textbox_trigger_with_following_gridcell_click() -> None:
+    """An Oracle ADF LOV input is exposed as role="textbox"; [click the LOV input] +
+    [click the value gridcell] must merge into a single select_combobox so it gets the
+    value-equality postcondition instead of a flaky standalone gridcell click."""
+    script = """
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("textbox", name="Business Unit").click()
+    page.get_by_role("gridcell", name="850 Miter Shared Services BU").click()
+    browser.close()
+"""
+
+    optimized = optimize(parse_script(script))
+
+    merged = [a for a in optimized if a.type == "select_combobox"]
+    assert len(merged) == 1
+    assert merged[0].name == "Business Unit"  # LOV field label (trigger)
+    assert merged[0].value == "850 Miter Shared Services BU"  # picked value
+    assert merged[0].action_kwargs.get("option_name") == "850 Miter Shared Services BU"
+    # the standalone gridcell click must be gone (consumed by the merge)
+    assert not any(a.type == "click" and a.role == "gridcell" for a in optimized)
+
+
+def test_optimize_does_not_merge_textbox_click_followed_by_fill() -> None:
+    """Guard against over-merging: an ordinary textbox click + fill (e.g. a login field)
+    must NOT become select_combobox -- only a NAMED option/cell/gridcell click triggers it."""
+    script = """
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("textbox", name="Username").click()
+    page.get_by_role("textbox", name="Username").fill("FUSDEV.CNV")
+    browser.close()
+"""
+
+    optimized = optimize(parse_script(script))
+
+    assert not any(a.type == "select_combobox" for a in optimized)
+
+
+def test_optimize_supports_header_action_followed_by_multi_line_loop() -> None:
+    script = """
+import re
+
+def run(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.get_by_role("textbox", name="Accounting Date").fill("12/31/25")
+    for index, line in enumerate(multi_line, start=1):
+        page.get_by_role("row", name=re.compile(rf"^{index}\\b")).get_by_label("Description").fill(line["line_description"])
+    browser.close()
+"""
+
+    optimized = optimize(parse_script(script))
+
+    assert any(isinstance(action, MultiLineLoop) for action in optimized)
+    assert any(getattr(action, "type", None) == "fill" for action in optimized)

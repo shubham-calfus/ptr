@@ -197,76 +197,10 @@ def test_generate_html_report_content_is_suite_aware_and_keeps_parameters_per_re
     assert "Run ID: run-2 · 2 recordings · 4 logged actions" in html
     assert "HCM_Create_Requisition" in html
     assert "HCM_Approve_Job_Requisition" in html
-    assert "Resolved parameter keys used for this recording run." in html
-    assert html.count("Resolved parameter keys used for this recording run.") == 2
+    assert html.count('<div class="trace-title">Parameters</div>') == 2
     assert "business_unit" in html
     assert "search_value" in html
     assert '<div class="rail-title">Parameters</div>' not in html
-
-
-def test_generate_html_report_content_renders_flow_context_inputs_outputs_and_ai_extractors() -> None:
-    html = generate_html_report_content(
-        test_suite_id="HCM_First_3",
-        parent_run_id="run-flow-context",
-        results=[
-            _result(
-                recording_name="HCM_Create_Requisition",
-                status="passed",
-                duration_seconds=88,
-                resolved_parameter_keys=["url", "username", "password"],
-                flow_input_status={
-                    "search_value": {
-                        "name": "search_value",
-                        "label": "Search Value",
-                        "required": True,
-                        "status": "available",
-                        "value": "1003",
-                        "error": "",
-                    }
-                },
-                flow_output_results=[
-                    {
-                        "name": "requisition_id",
-                        "label": "Requisition Number",
-                        "required": True,
-                        "status": "extracted",
-                        "value": "1003",
-                        "source": "ai",
-                        "attempts": [
-                            {"source": "oracle_table", "status": "miss", "detail": "No captured oracle tables"},
-                            {"source": "ai", "status": "matched", "detail": "Found requisition number in confirmation text"},
-                        ],
-                        "ai_interaction": {
-                            "status": "success",
-                            "feature": "flow_context_extraction",
-                            "model": "gpt-5.4-mini",
-                            "system_prompt": "Extract one field",
-                            "user_prompt": "Find the requisition number",
-                            "response_text": '{"value":"1003","reason":"Found in confirmation text"}',
-                            "parsed_response": {
-                                "value": "1003",
-                                "reason": "Found in confirmation text",
-                            },
-                            "usage": {"input_tokens": 120, "output_tokens": 32, "total_tokens": 152},
-                        },
-                    }
-                ],
-                action_log=[
-                    _action(step=1, action="goto", label="Oracle", duration_ms=13005),
-                ],
-            )
-        ],
-    )
-
-    assert "Flow Context" in html
-    assert "Resolved parent inputs and extracted outputs for this recording run." in html
-    assert "Inputs" in html
-    assert "Extracted Outputs" in html
-    assert "Search Value" in html
-    assert "Requisition Number" in html
-    assert "Found requisition number in confirmation text" in html
-    assert "Request Sent to AI" in html
-    assert "Model Output" in html
 
 
 def test_generate_html_report_content_renders_script_step_extracted_outputs() -> None:
@@ -284,7 +218,6 @@ def test_generate_html_report_content_renders_script_step_extracted_outputs() ->
         ],
     )
 
-    assert "Flow Context" in html
     assert "Extracted Outputs" in html
     assert "order_number" in html
     assert "PO-1009" in html
@@ -306,7 +239,7 @@ def test_generate_html_report_content_renders_combined_ai_request_and_model_outp
             "Requested action value JSON:\n"
             '{"type":"raw","value":"Notifications"}\n'
             "Recorded script data JSON:\n"
-            '{"tracked_action":"click_text","helper_name":"_ptr_click_text_target"}\n'
+            '{"tracked_action":"click_text","helper_name":"_act_click_text_target"}\n'
             "Recorded target context JSON:\n"
             '{"text":"Notifications (7 unread)","tag":"title"}\n'
             "Relevant DOM candidates JSON:\n"
@@ -658,10 +591,131 @@ def test_generate_html_report_content_renders_executed_script_from_artifact_key(
     )
 
     assert "Executed Script" in html
-    assert 'class="recording-script-block executed-script-details"' in html
+    # Executed Script is a developer-only block: it carries the `dev-only` class so the
+    # report's End User view hides it (the Developer view tab reveals it).
+    assert 'class="recording-script-block executed-script-details dev-only"' in html
     assert "print(&#x27;hello from executed script&#x27;)" in html
 
     report_generator._load_text_object.cache_clear()
+
+
+def test_report_view_tabs_default_to_end_user_and_gate_dev_only_blocks() -> None:
+    """The report ships an End User / Developer view toggle. End User is the default;
+    developer-only diagnostics carry the `dev-only` class and are hidden via CSS in that
+    view, while their data stays embedded so the Developer tab can reveal it."""
+    html = generate_html_report_content(
+        test_suite_id="O2C_SO_Create",
+        parent_run_id="run-view",
+        results=[
+            _result(
+                recording_name="O2C_SO_Create",
+                status="passed",
+                extracted_outputs={"sales_order_number": "1234"},
+                debug_settings={"after_action_wait_ms": 0, "debug_trace": False},
+                action_log=[
+                    _action(
+                        step=1,
+                        action="select_search_trigger_option",
+                        label="Search: Warehouse",
+                        status="success",
+                        debug={"select_search_trigger_option": {"status": "success"}},
+                        script_data={
+                            "raw": 'ai_extract("sales_order_number", "...")',
+                            "parsed_action": {"value": "CN_SJ"},
+                        },
+                        ai_interactions=[
+                            {
+                                "model": "gpt",
+                                "status": "validated",
+                                "user_prompt": "x",
+                                "response_text": '{"value": 1}',
+                            }
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+
+    # Default view is End User, and the toggle + gating CSS/JS are present.
+    assert '<body class="view-user">' in html
+    assert 'class="view-tabs"' in html
+    assert "setView('user')" in html and "setView('dev')" in html
+    assert "function setView(mode)" in html
+    assert "body.view-user .dev-only{display:none!important}" in html
+
+    # Developer-only diagnostics are tagged dev-only (hidden in End User view)...
+    assert "detail-card debug-card dev-only" in html  # Debug Settings + Debug Trace
+    assert "path-ai-inline dev-only" in html  # AI self-repair internals
+    # ...but the data is still embedded so the Developer view can show it.
+    assert "Debug Trace" in html
+    # The per-step recorded script is NOT dev-only: visible in the End User view too.
+    assert '<div class="detail-card"><div class="dc-title">Recorded Script</div>' in html
+
+    # End-user content (Extracted Outputs) is NOT gated behind dev-only.
+    assert "Extracted Outputs" in html
+    assert 'class="ctx-section"' in html
+
+
+def test_report_header_is_consolidated_and_sidebar_stats_not_duplicated() -> None:
+    """Suite name shows once (in the nav header, humanized), the duplicate hero title is
+    gone, and the sidebar no longer repeats the suite-level stat rows (kept in main content)."""
+    html = generate_html_report_content(
+        test_suite_id="O2C_SO_Create_YeuTest",
+        parent_run_id="run-1",
+        results=[_result(recording_name="O2C_SO_Create_YeuTest", status="passed")],
+    )
+    # Suite name in the nav header (humanized), not duplicated as a big hero title.
+    assert '<span class="nav-run-name">O2C SO Create YeuTest</span>' in html
+    assert 'class="hero-title"' not in html
+    # Sidebar no longer repeats the suite stats (Status/Recordings/Passed/... rc-rows).
+    assert ">Run Details<" not in html
+    assert 'class="rc-row"' not in html
+    # The Runs navigation stays in the sidebar.
+    assert '<div class="rail-title">Runs</div>' in html
+
+
+def test_recording_cards_get_status_shadow_and_passed_has_no_banner() -> None:
+    """Suite-run cards get a small green/red status shadow (no banner, no top border).
+    Passed runs render no banner; failed runs keep the red detail callout."""
+    passed = generate_html_report_content(
+        test_suite_id="Pass_Suite",
+        parent_run_id="run-pass",
+        results=[
+            _result(
+                recording_name="Pass_Rec",
+                status="passed",
+                action_log=[
+                    _action(step=1, action="click_button", label="Submit", status="success")
+                ],
+            )
+        ],
+    )
+    # Passed card carries the green status-shadow hook; no banner is rendered.
+    assert 'data-failed="false"' in passed
+    assert '.recording-item[data-failed="false"]{box-shadow:0 6px 18px rgba(14,159,110,.12)}' in passed
+    assert "success-card" not in passed  # the old green banner is gone entirely
+    assert "failure-card recording-callout" not in passed  # passed shows no banner
+
+    failed = generate_html_report_content(
+        test_suite_id="Fail_Suite",
+        parent_run_id="run-fail",
+        results=[
+            _result(
+                recording_name="Fail_Rec",
+                status="failed",
+                error="boom",
+                action_log=[
+                    _action(
+                        step=1, action="click_button", label="Submit", status="failed", error="boom"
+                    )
+                ],
+            )
+        ],
+    )
+    assert 'data-failed="true"' in failed
+    assert '.recording-item[data-failed="true"]{box-shadow:0 6px 18px rgba(224,60,75,.14)}' in failed
+    assert "failure-card recording-callout" in failed  # failed keeps the red detail banner
 
 
 def test_generate_html_report_content_marks_raw_script_fallback_runs(monkeypatch) -> None:
@@ -809,3 +863,61 @@ def test_generate_html_report_content_masks_password_literals_in_execution_trace
     assert "Abc&amp;123!" not in html
 
     report_generator._load_text_object.cache_clear()
+
+
+def test_execution_path_shows_control_type_and_failure_context_is_dev_only() -> None:
+    """Control type is surfaced visibly in the Execution Path stats (not only in the debug
+    JSON), and the Failure Context detail is developer-only."""
+    html = generate_html_report_content(
+        test_suite_id="Ctl_Suite",
+        parent_run_id="run-ctl",
+        results=[
+            _result(
+                recording_name="Ctl_Rec",
+                status="failed",
+                error="boom",
+                action_log=[
+                    _action(
+                        step=1,
+                        action="select_search_trigger_option",
+                        label="Search: Warehouse",
+                        status="failed",
+                        error="boom",
+                        debug={
+                            "select_search_trigger_option": {
+                                "active_element": {
+                                    "tag": "input",
+                                    "control_type": "oj-c-select-single (Redwood Core Pack)",
+                                }
+                            }
+                        },
+                        failure_context={"active_element": {"tag": "input", "role": "combobox"}},
+                    )
+                ],
+            )
+        ],
+    )
+    assert '<span class="kk">Control</span>' in html
+    assert "oj-c-select-single (Redwood Core Pack)" in html
+    assert "failure-context-card dev-only" in html
+
+
+def test_low_value_subtitles_are_removed() -> None:
+    """The two no-value subtitles are gone; the section titles themselves remain."""
+    html = generate_html_report_content(
+        test_suite_id="Sub_Suite",
+        parent_run_id="run-sub",
+        results=[
+            _result(
+                recording_name="Sub_Rec",
+                status="passed",
+                resolved_parameter_keys=["username"],
+                extracted_outputs={"order": "1"},
+                action_log=[_action(step=1, action="click_button", label="Go", status="success")],
+            )
+        ],
+    )
+    assert "Resolved parameter keys used for this recording run." not in html
+    assert "Values captured via ai_extract() / api_helpers.extract()" not in html
+    assert ">Parameters</div>" in html
+    assert ">Extracted Outputs</div>" in html

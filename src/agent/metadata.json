@@ -1,7 +1,7 @@
 {
-  "name": "test_runner",
+  "name": "ACT Agent",
   "version": "0.0.8",
-  "description": "Executes Playwright-generated Python scripts as a test suite and returns an HTML report.",
+  "description": "Executes recorded UI automation scripts as a test suite and returns an HTML report.",
   "component": "agent",
   "config": {
     "has_test_suite": true,
@@ -32,7 +32,7 @@
             "name": "files",
             "type": "file",
             "required": false,
-            "description": "Optional replacement Playwright script files.",
+            "description": "Optional replacement recording script files.",
             "friendly_name": "Upload Script Files",
             "accepts": ".py"
           },
@@ -62,7 +62,7 @@
             "name": "debug_record_video",
             "type": "boolean",
             "required": false,
-            "description": "Record Playwright video for the run and include it in the manifest when available.",
+            "description": "Record a video of the run and include it in the manifest when available.",
             "friendly_name": "Debug record video"
           },
           {

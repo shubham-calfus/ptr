@@ -61,7 +61,7 @@ def test_default_output_path_uses_wrapped_suite_payload() -> None:
 def test_build_agent_command_uses_wait_and_optional_id() -> None:
     command = _build_agent_command(
         aetherion_bin="./.venv/bin/aetherion",
-        agent_name="test_runner",
+        agent_name="ACT Agent",
         payload={"test_suite_id": "suite"},
         run_id="run-123",
         task_queue=None,
@@ -70,7 +70,7 @@ def test_build_agent_command_uses_wait_and_optional_id() -> None:
     assert command == [
         "./.venv/bin/aetherion",
         "agent",
-        "test_runner",
+        "ACT Agent",
         '{"test_suite_id": "suite"}',
         "--wait",
         "--id",

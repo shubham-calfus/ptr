@@ -2,13 +2,13 @@
 Script generator for Playwright recordings.
 
 Takes an optimized action list and generates a Python script where supported
-actions are routed through the appropriate _ptr_* helper function. If a parsed
+actions are routed through the appropriate _act_* helper function. If a parsed
 action still falls outside resilient helper coverage, the generator emits one
 explicit inline raw-step fallback for that action instead of dropping the whole
 recording out of the AST path.
 
 The generated script is executed by subprocess.run() just like the old pipeline.
-The _ptr_* runtime helpers are imported by tools.py from the dedicated
+The _act_* runtime helpers are imported by tools.py from the dedicated
 runtime module, and the AST generator emits the full execution wrapper directly.
 Preparation no longer embeds a giant helper blob into each generated script.
 """
@@ -19,9 +19,9 @@ import re
 from typing import Any
 
 try:
-    from .parser import Action, LocatorStep
+    from .parser import Action, LocatorStep, MultiLineLoop, ParsedItem, SourceExpr
 except ImportError:  # pragma: no cover - published/runtime fallback
-    from src.runtime.parser import Action, LocatorStep
+    from src.runtime.parser import Action, LocatorStep, MultiLineLoop, ParsedItem, SourceExpr
 
 
 # Placeholders left after param substitution are runtime values (produced by
@@ -57,6 +57,8 @@ def _is_login_field(name: str | None) -> bool:
 
 def _escape(value: Any) -> str:
     """Escape a value for embedding in generated Python source."""
+    if isinstance(value, SourceExpr):
+        return value.source
     if value is None:
         return "None"
     if isinstance(value, bool):
@@ -77,11 +79,28 @@ def _escape(value: Any) -> str:
 
 def _escape_resolved(value: Any) -> str:
     """Like _escape, but wraps strings holding a runtime ``{{placeholder}}`` in a
-    ``_ptr_resolve(...)`` call so the value is substituted at execution time from
+    ``_act_resolve(...)`` call so the value is substituted at execution time from
     ai_extract() results, instead of being baked in as a literal."""
+    if isinstance(value, SourceExpr):
+        return value.source
     if isinstance(value, str) and _RUNTIME_PLACEHOLDER_RE.search(value):
-        return f"_ptr_resolve({_escape(value)})"
+        return f"_act_resolve({_escape(value)})"
     return _escape(value)
+
+
+def _serialize_source_value(value: Any) -> Any:
+    if isinstance(value, SourceExpr):
+        return value.source
+    if isinstance(value, list):
+        return [_serialize_source_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_serialize_source_value(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _serialize_source_value(key): _serialize_source_value(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _build_locator_expr(page_var: str, steps: list[LocatorStep]) -> str:
@@ -105,8 +124,8 @@ def _serialize_locator_steps(steps: list[LocatorStep]) -> list[dict[str, Any]]:
     return [
         {
             "method": step.method,
-            **({"args": step.args} if step.args else {}),
-            **({"kwargs": step.kwargs} if step.kwargs else {}),
+            **({"args": _serialize_source_value(step.args)} if step.args else {}),
+            **({"kwargs": _serialize_source_value(step.kwargs)} if step.kwargs else {}),
             **({"is_property": True} if step.is_property else {}),
         }
         for step in steps
@@ -138,7 +157,7 @@ def _build_script_data(
     if action.locator_steps:
         payload["primary_locator_steps"] = _serialize_locator_steps(action.locator_steps)
     if extra:
-        payload.update(extra)
+        payload.update(_serialize_source_value(extra))
     return payload
 
 
@@ -164,8 +183,8 @@ def _tracked_action_lines(
         extra=extra,
     )
     return [
-        f"    _ptr_set_script_data({_escape(script_data)})",
-        f"    _ptr_tracked_action({_escape(tracked_action)}, {_escape(label)}, {helper_name}, {', '.join(call_args)})",
+        f"    _act_set_script_data({_escape(script_data)})",
+        f"    _act_tracked_action({_escape(tracked_action)}, {_escape(label)}, {helper_name}, {', '.join(call_args)})",
     ]
 
 
@@ -184,7 +203,7 @@ def _tracked_raw_action_lines(
     script_data = _build_script_data(
         action,
         f"raw_inline_{action.type}",
-        "_ptr_tracked_raw_action",
+        "_act_tracked_raw_action",
         page_var,
         primary_locator_expr=primary_locator_expr,
         extra={
@@ -206,8 +225,8 @@ def _tracked_raw_action_lines(
         call_args.append(f"locator={primary_locator_expr}")
 
     return [
-        f"    _ptr_set_script_data({_escape(script_data)})",
-        f"    _ptr_tracked_raw_action({', '.join(call_args)})",
+        f"    _act_set_script_data({_escape(script_data)})",
+        f"    _act_tracked_raw_action({', '.join(call_args)})",
     ]
 
 
@@ -294,9 +313,9 @@ def _raise_coverage_error(action: Action, reason: str) -> None:
 
 def _gen_setup_browser(action: Action, page_var: str) -> list[str]:
     # Generate headless=False here — the runtime launcher decides the actual
-    # headless mode based on PTR_HEADLESS (default: false). This preserves the
+    # headless mode based on ACT_HEADLESS (default: false). This preserves the
     # same external behavior while keeping browser policy inside the runtime.
-    return [f"    browser = _ptr_launch_chromium(playwright, headless=False)"]
+    return [f"    browser = _act_launch_chromium(playwright, headless=False)"]
 
 
 def _gen_setup_context(action: Action, page_var: str) -> list[str]:
@@ -310,7 +329,7 @@ def _gen_setup_context(action: Action, page_var: str) -> list[str]:
 
 def _gen_setup_page(action: Action, page_var: str) -> list[str]:
     page_source_var = action.page_source_var or "context"
-    return [f"    {page_var} = _ptr_register_page({page_source_var}.new_page())"]
+    return [f"    {page_var} = _act_register_page({page_source_var}.new_page())"]
 
 
 def _gen_goto(action: Action, page_var: str) -> list[str]:
@@ -324,7 +343,7 @@ def _gen_goto(action: Action, page_var: str) -> list[str]:
         action,
         "goto",
         label,
-        "_ptr_goto_page",
+        "_act_goto_page",
         call_args,
         page_var,
         extra={"goto_kwargs": action.goto_kwargs},
@@ -380,7 +399,7 @@ def _is_row_label_click(action: Action) -> bool:
 
 
 def _gen_fill(action: Action, page_var: str) -> list[str]:
-    """Generate fill call — routes through _ptr_fill_textbox for non-login fields."""
+    """Generate fill call — routes through _act_fill_textbox for non-login fields."""
     if not action.locator_steps:
         _raise_coverage_error(action, "Fill action is missing locator steps.")
 
@@ -393,7 +412,7 @@ def _gen_fill(action: Action, page_var: str) -> list[str]:
             action,
             "fill_textbox",
             label,
-            "_ptr_raw_fill",
+            "_act_raw_fill",
             [locator_expr, page_var, _escape(label), _escape_resolved(action.value)],
             page_var,
             primary_locator_expr=locator_expr,
@@ -405,7 +424,7 @@ def _gen_fill(action: Action, page_var: str) -> list[str]:
         action,
         "fill_textbox",
         label,
-        "_ptr_fill_textbox",
+        "_act_fill_textbox",
         [locator_expr, page_var, _escape(label), _escape_resolved(action.value)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -424,7 +443,7 @@ def _gen_press(action: Action, page_var: str) -> list[str]:
         action,
         "press_key",
         label,
-        "_ptr_raw_press",
+        "_act_raw_press",
         [locator_expr, page_var, _escape(label), _escape(action.key)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -442,14 +461,14 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
     label = action.name or ""
     method = action.locator_method
 
-    # Textbox/spinbutton click → _ptr_click_textbox
+    # Textbox/spinbutton click → _act_click_textbox
     if role in ("textbox", "spinbutton"):
         if _is_login_field(label):
             return _tracked_action_lines(
                 action,
                 "click_textbox",
                 label,
-                "_ptr_raw_click",
+                "_act_raw_click",
                 [locator_expr, page_var, _escape(label)],
                 page_var,
                 primary_locator_expr=locator_expr,
@@ -458,32 +477,32 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
             action,
             "click_textbox",
             label,
-            "_ptr_click_textbox",
+            "_act_click_textbox",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # Combobox click (standalone, not part of select_combobox) → _ptr_click_combobox
+    # Combobox click (standalone, not part of select_combobox) → _act_click_combobox
     if role == "combobox":
         return _tracked_action_lines(
             action,
             "click_combobox",
             label,
-            "_ptr_click_combobox",
+            "_act_click_combobox",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # Button click → _ptr_click_button_target
+    # Button click → _act_click_button_target
     if role == "button":
         if label and label.strip().isdigit():
             return _tracked_action_lines(
                 action,
                 "click_numeric_button",
                 label,
-                "_ptr_click_numeric_button_target",
+                "_act_click_numeric_button_target",
                 [locator_expr, page_var, _escape(label)],
                 page_var,
                 primary_locator_expr=locator_expr,
@@ -492,19 +511,19 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
             action,
             "click_button",
             label,
-            "_ptr_click_button_target",
+            "_act_click_button_target",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # get_by_text click → _ptr_click_text_target
+    # get_by_text click → _act_click_text_target
     if method == "get_by_text":
         return _tracked_action_lines(
             action,
             "click_text",
             label,
-            "_ptr_click_text_target",
+            "_act_click_text_target",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
@@ -516,57 +535,57 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
             action,
             "click_title",
             label,
-            "_ptr_click_text_target",
+            "_act_click_text_target",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # Link, option, cell, gridcell, tab, menuitem → _ptr_click_text_target
+    # Link, option, cell, gridcell, tab, menuitem → _act_click_text_target
     if role in ("link", "option", "cell", "gridcell", "tab", "menuitem"):
         return _tracked_action_lines(
             action,
             f"click_{role}",
             label,
-            "_ptr_click_text_target",
+            "_act_click_text_target",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # Row-scoped label click → _ptr_click_table_field
+    # Row-scoped label click → _act_click_table_field
     if _is_row_label_click(action):
         label = _specific_locator_label(action)
         return _tracked_action_lines(
             action,
             "click_table_field",
             label,
-            "_ptr_click_table_field",
+            "_act_click_table_field",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # Row click → _ptr_click_table_row
+    # Row click → _act_click_table_row
     if role == "row":
         return _tracked_action_lines(
             action,
             "click_row",
             label,
-            "_ptr_click_table_row",
+            "_act_click_table_row",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # Table-scoped label click → _ptr_click_table_field
+    # Table-scoped label click → _act_click_table_field
     if _is_table_label_click(action):
         label = _specific_locator_label(action)
         return _tracked_action_lines(
             action,
             "click_table_field",
             label,
-            "_ptr_click_table_field",
+            "_act_click_table_field",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
@@ -578,19 +597,19 @@ def _gen_click(action: Action, page_var: str) -> list[str]:
             action,
             f"click_{method}",
             label,
-            "_ptr_click_text_target",
+            "_act_click_text_target",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
         )
 
-    # Listbox with locator("li") → _ptr_click_listbox_option
+    # Listbox with locator("li") → _act_click_listbox_option
     if role == "listbox" and len(action.locator_steps) > 1:
         return _tracked_action_lines(
             action,
             "click_listbox",
             label,
-            "_ptr_click_listbox_option",
+            "_act_click_listbox_option",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
@@ -621,7 +640,7 @@ def _gen_select_option(action: Action, page_var: str) -> list[str]:
         action,
         "select_option",
         label,
-        "_ptr_select_option_target",
+        "_act_select_option_target",
         [
             locator_expr,
             page_var,
@@ -648,7 +667,7 @@ def _gen_check(action: Action, page_var: str) -> list[str]:
         action,
         "check",
         label,
-        "_ptr_check_target",
+        "_act_check_target",
         [locator_expr, page_var, _escape(label)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -665,7 +684,7 @@ def _gen_uncheck(action: Action, page_var: str) -> list[str]:
         action,
         "uncheck",
         label,
-        "_ptr_uncheck_target",
+        "_act_uncheck_target",
         [locator_expr, page_var, _escape(label)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -700,7 +719,7 @@ def _gen_dblclick(action: Action, page_var: str) -> list[str]:
             action,
             "dblclick_text",
             label,
-            "_ptr_dblclick_text_target",
+            "_act_dblclick_text_target",
             [locator_expr, page_var, _escape(label)],
             page_var,
             primary_locator_expr=locator_expr,
@@ -716,14 +735,14 @@ def _gen_dblclick(action: Action, page_var: str) -> list[str]:
 # --- Compound action generators ---
 
 def _gen_fill_and_submit(action: Action, page_var: str) -> list[str]:
-    """fill + Enter → _ptr_fill_textbox then _ptr_submit_textbox_enter."""
+    """fill + Enter → _act_fill_textbox then _act_submit_textbox_enter."""
     locator_expr = _build_locator_expr(page_var, action.locator_steps)
     label = _specific_locator_label(action)
     fill_lines = _tracked_action_lines(
         action,
         "fill_textbox",
         label,
-        "_ptr_fill_textbox",
+        "_act_fill_textbox",
         [locator_expr, page_var, _escape(label), _escape_resolved(action.value)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -733,7 +752,7 @@ def _gen_fill_and_submit(action: Action, page_var: str) -> list[str]:
         action,
         "submit_textbox_enter",
         label,
-        "_ptr_submit_textbox_enter",
+        "_act_submit_textbox_enter",
         [locator_expr, page_var, _escape(label)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -743,7 +762,7 @@ def _gen_fill_and_submit(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_select_combobox(action: Action, page_var: str) -> list[str]:
-    """combobox click + option click → _ptr_select_combobox_option."""
+    """combobox click + option click → _act_select_combobox_option."""
     trigger_expr = _build_locator_expr(page_var, action.locator_steps)
     label = action.name or ""
     option_name = (action.action_kwargs or {}).get("option_name", action.value or "")
@@ -775,7 +794,7 @@ def _gen_select_combobox(action: Action, page_var: str) -> list[str]:
         action,
         "select_combobox",
         label,
-        "_ptr_select_combobox_option",
+        "_act_select_combobox_option",
         [trigger_expr, option_expr, page_var, _escape(label), _escape(option_name)],
         page_var,
         primary_locator_expr=trigger_expr,
@@ -789,7 +808,7 @@ def _gen_select_combobox(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_search_and_select(action: Action, page_var: str) -> list[str]:
-    """Search trigger + result click → _ptr_select_search_trigger_option."""
+    """Search trigger + result click → _act_select_search_trigger_option."""
     trigger_expr = _build_locator_expr(page_var, action.locator_steps)
     title = action.name or ""
     option_name = (action.action_kwargs or {}).get("option_name", action.value or "")
@@ -824,7 +843,7 @@ def _gen_search_and_select(action: Action, page_var: str) -> list[str]:
         action,
         "search_and_select",
         title,
-        "_ptr_select_search_trigger_option",
+        "_act_select_search_trigger_option",
         helper_args,
         page_var,
         primary_locator_expr=trigger_expr,
@@ -840,7 +859,7 @@ def _gen_search_and_select(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_adf_menu_select(action: Action, page_var: str) -> list[str]:
-    """ADF menu trigger + option → _ptr_select_adf_menu_panel_option."""
+    """ADF menu trigger + option → _act_select_adf_menu_panel_option."""
     trigger_expr = _build_locator_expr(page_var, action.locator_steps)
     trigger_label = action.name or ""
     option_name = (action.action_kwargs or {}).get("option_name", action.value or "")
@@ -852,7 +871,7 @@ def _gen_adf_menu_select(action: Action, page_var: str) -> list[str]:
         action,
         "adf_menu_select",
         trigger_label,
-        "_ptr_select_adf_menu_panel_option",
+        "_act_select_adf_menu_panel_option",
         [trigger_expr, option_expr, page_var, _escape(trigger_label), _escape(option_name), f"trigger_kind={_escape(trigger_kind)}"],
         page_var,
         primary_locator_expr=trigger_expr,
@@ -865,7 +884,7 @@ def _gen_adf_menu_select(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_date_pick(action: Action, page_var: str) -> list[str]:
-    """Date icon + day click → _ptr_pick_date_via_icon."""
+    """Date icon + day click → _act_pick_date_via_icon."""
     icon_expr = _build_locator_expr(page_var, action.locator_steps)
     title = action.name or ""
     day_label = (action.action_kwargs or {}).get("day_label", action.value or "")
@@ -882,7 +901,7 @@ def _gen_date_pick(action: Action, page_var: str) -> list[str]:
         action,
         "date_pick",
         title,
-        "_ptr_pick_date_via_icon",
+        "_act_pick_date_via_icon",
         [icon_expr, day_expr, page_var, _escape(title), _escape(day_label)],
         page_var,
         primary_locator_expr=icon_expr,
@@ -896,14 +915,14 @@ def _gen_date_pick(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_navigation_button(action: Action, page_var: str) -> list[str]:
-    """Continue/Submit/Next/etc → _ptr_click_navigation_button."""
+    """Continue/Submit/Next/etc → _act_click_navigation_button."""
     locator_expr = _build_locator_expr(page_var, action.locator_steps)
     label = action.name or ""
     return _tracked_action_lines(
         action,
         "navigation_button",
         label,
-        "_ptr_click_navigation_button",
+        "_act_click_navigation_button",
         [locator_expr, page_var, _escape(label)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -911,14 +930,14 @@ def _gen_navigation_button(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_numeric_button(action: Action, page_var: str) -> list[str]:
-    """Numeric button (date picker day) → _ptr_click_numeric_button_target."""
+    """Numeric button (date picker day) → _act_click_numeric_button_target."""
     locator_expr = _build_locator_expr(page_var, action.locator_steps)
     label = action.name or ""
     return _tracked_action_lines(
         action,
         "click_numeric_button",
         label,
-        "_ptr_click_numeric_button_target",
+        "_act_click_numeric_button_target",
         [locator_expr, page_var, _escape(label)],
         page_var,
         primary_locator_expr=locator_expr,
@@ -926,14 +945,14 @@ def _gen_numeric_button(action: Action, page_var: str) -> list[str]:
 
 
 def _gen_login_and_redirect(action: Action, page_var: str) -> list[str]:
-    """Password Enter + goto → press Enter then _ptr_wait_for_post_login_redirect."""
+    """Password Enter + goto → press Enter then _act_wait_for_post_login_redirect."""
     locator_expr = _build_locator_expr(page_var, action.locator_steps)
     label = action.name or "Submit login"
     return _tracked_action_lines(
         action,
         "submit_login",
         label,
-        "_ptr_login_submit_and_redirect",
+        "_act_login_submit_and_redirect",
         [locator_expr, page_var, _escape(label), _escape(action.url or "")],
         page_var,
         primary_locator_expr=locator_expr,
@@ -946,7 +965,7 @@ def _gen_wait(action: Action, page_var: str) -> list[str]:
         # Replace networkidle with a fallback wait (Oracle never settles)
         if action.wait_state == "networkidle":
             return [
-                f'    {page_var}.wait_for_timeout(_ptr_wait_ms("PTR_NETWORK_IDLE_FALLBACK_WAIT_MS", 1000))'
+                f'    {page_var}.wait_for_timeout(_act_wait_ms("ACT_NETWORK_IDLE_FALLBACK_WAIT_MS", 1000))'
             ]
         return [f"    {page_var}.wait_for_load_state({_escape(action.wait_state)})"]
     if action.wait_ms is not None:
@@ -987,7 +1006,7 @@ def _gen_ai_extract(action: Action, page_var: str) -> list[str]:
         action,
         "ai_extract",
         name,
-        "_ptr_ai_extract",
+        "_act_ai_extract",
         [page_var, _escape(name), _escape(prompt)],
         page_var,
         extra={"ai_extract_name": name, "ai_extract_prompt": prompt},
@@ -1044,16 +1063,119 @@ def _gen_post_click_wait(action: Action, next_action: Action | None, page_var: s
     if next_action.locator_steps and action.locator_steps:
         if action.locator_steps != next_action.locator_steps:
             return [
-                f'    {page_var}.wait_for_timeout(_ptr_wait_ms("PTR_POST_CLICK_WAIT_MS", 250))'
+                f'    {page_var}.wait_for_timeout(_act_wait_ms("ACT_POST_CLICK_WAIT_MS", 250))'
             ]
     return []
+
+
+def _indent_generated_lines(lines: list[str], indent_level: int) -> list[str]:
+    if indent_level <= 1:
+        return list(lines)
+    prefix = "    " * (indent_level - 1)
+    return [f"{prefix}{line}" if line else line for line in lines]
+
+
+def _generate_steps(
+    steps: list[ParsedItem],
+    *,
+    page_var: str,
+    indent_level: int,
+) -> tuple[list[str], str]:
+    lines: list[str] = []
+    current_page_var = page_var
+
+    for i, step in enumerate(steps):
+        next_step = steps[i + 1] if i + 1 < len(steps) else None
+
+        if isinstance(step, MultiLineLoop):
+            loop_lines, current_page_var = _gen_multi_line_loop(
+                step,
+                page_var=current_page_var,
+                indent_level=indent_level,
+            )
+            lines.extend(loop_lines)
+            continue
+
+        action = step
+        next_action = next_step if isinstance(next_step, Action) else None
+
+        if action.page_var and action.type not in (
+            "setup_browser", "setup_context", "close_context", "close_browser",
+        ):
+            current_page_var = action.page_var
+
+        reason = _unsupported_action_reason(action)
+        if reason is not None:
+            locator_expr = (
+                _build_locator_expr(current_page_var, action.locator_steps)
+                if action.locator_steps else None
+            )
+            lines.extend(
+                _indent_generated_lines(
+                    _tracked_raw_action_lines(
+                        action,
+                        _raw_fallback_label(action),
+                        current_page_var,
+                        reason=reason,
+                        primary_locator_expr=locator_expr,
+                    ),
+                    indent_level,
+                )
+            )
+            lines.extend(
+                _indent_generated_lines(
+                    _gen_post_click_wait(action, next_action, current_page_var),
+                    indent_level,
+                )
+            )
+            continue
+
+        generator = _GENERATORS.get(action.type)
+        if generator is None:
+            _raise_coverage_error(action, f'Unhandled action type "{action.type}".')
+
+        lines.extend(_indent_generated_lines(generator(action, current_page_var), indent_level))
+        lines.extend(
+            _indent_generated_lines(
+                _gen_post_click_wait(action, next_action, current_page_var),
+                indent_level,
+            )
+        )
+
+    return lines, current_page_var
+
+
+def _gen_multi_line_loop(
+    loop: MultiLineLoop,
+    *,
+    page_var: str,
+    indent_level: int,
+) -> tuple[list[str], str]:
+    loop_indent = "    " * indent_level
+    rows_var = f"_act_multi_line_rows_{indent_level}"
+    lines = [
+        f"{loop_indent}{rows_var} = _act_get_multi_line_rows()",
+        f"{loop_indent}for {loop.index_var}, {loop.row_var} in enumerate({rows_var}, start=1):",
+        f"{loop_indent}    _act_set_multi_line_context({loop.index_var}, {loop.row_var}, len({rows_var}))",
+    ]
+    body_lines, body_page_var = _generate_steps(
+        loop.body,
+        page_var=page_var,
+        indent_level=indent_level + 1,
+    )
+    if body_lines:
+        lines.extend(body_lines)
+    else:
+        lines.append(f"{loop_indent}    pass")
+    lines.append(f"{loop_indent}_act_set_multi_line_context(None, None, len({rows_var}))")
+    return lines, body_page_var
 
 
 # ---------------------------------------------------------------------------
 # Main generator
 # ---------------------------------------------------------------------------
 
-def generate_run_body(actions: list[Action]) -> str:
+def generate_run_body(actions: list[ParsedItem]) -> str:
     """Generate the body of the run(playwright) function.
 
     This produces the Python code that goes inside:
@@ -1062,49 +1184,11 @@ def generate_run_body(actions: list[Action]) -> str:
 
     The output is indented with 4 spaces (function body level).
     """
-    lines: list[str] = []
-    page_var = "page"
-
-    for i, action in enumerate(actions):
-        next_action = actions[i + 1] if i + 1 < len(actions) else None
-
-        # Track the page variable
-        if action.page_var and action.type not in (
-            "setup_browser", "setup_context", "close_context", "close_browser",
-        ):
-            page_var = action.page_var
-
-        reason = _unsupported_action_reason(action)
-        if reason is not None:
-            locator_expr = _build_locator_expr(page_var, action.locator_steps) if action.locator_steps else None
-            lines.extend(
-                _tracked_raw_action_lines(
-                    action,
-                    _raw_fallback_label(action),
-                    page_var,
-                    reason=reason,
-                    primary_locator_expr=locator_expr,
-                )
-            )
-            wait_lines = _gen_post_click_wait(action, next_action, page_var)
-            lines.extend(wait_lines)
-            continue
-
-        generator = _GENERATORS.get(action.type)
-        if generator is None:
-            _raise_coverage_error(action, f'Unhandled action type "{action.type}".')
-
-        action_lines = generator(action, page_var)
-        lines.extend(action_lines)
-
-        # Post-click waits
-        wait_lines = _gen_post_click_wait(action, next_action, page_var)
-        lines.extend(wait_lines)
-
+    lines, _ = _generate_steps(actions, page_var="page", indent_level=1)
     return "\n".join(lines)
 
 
-def generate_full_script(actions: list[Action]) -> str:
+def generate_full_script(actions: list[ParsedItem]) -> str:
     """Generate a complete, executable Playwright script from an action list.
 
     The output is a complete Python script with:
@@ -1112,7 +1196,7 @@ def generate_full_script(actions: list[Action]) -> str:
     - run() function with all actions
     - sync_playwright runner with error handling
 
-    NOTE: The _ptr_* helper functions are NOT included here — tools.py injects
+    NOTE: The _act_* helper functions are NOT included here — tools.py injects
     a runtime module import after generation. This function emits the final
     run/playwright wrapper directly so preparation does not need to rewrite
     script source with embedded helper code.
@@ -1121,6 +1205,7 @@ def generate_full_script(actions: list[Action]) -> str:
 
     return f"""from __future__ import annotations
 
+import re
 from playwright.sync_api import Playwright, sync_playwright, expect
 
 
@@ -1132,8 +1217,8 @@ with sync_playwright() as playwright:
     try:
         run(playwright)
     except Exception as exc:
-        _ptr_capture_failure(exc)
+        _act_capture_failure(exc)
         raise
     finally:
-        _ptr_write_diagnostics()
+        _act_write_diagnostics()
 """

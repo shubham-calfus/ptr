@@ -1,3 +1,3 @@
-from .agent import TestRunnerAgent, TestRunnerChild
+from .agent import ACTAgent, ACTAgentChild
 
-__all__ = ["TestRunnerAgent", "TestRunnerChild"]
+__all__ = ["ACTAgent", "ACTAgentChild"]

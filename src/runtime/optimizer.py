@@ -22,12 +22,13 @@ Also classifies single actions:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 try:
-    from .parser import Action
+    from .parser import Action, MultiLineLoop, ParsedItem
 except ImportError:  # pragma: no cover - published/runtime fallback
-    from src.runtime.parser import Action
+    from src.runtime.parser import Action, MultiLineLoop, ParsedItem
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +89,9 @@ def _is_search_like_label(name: str | None) -> bool:
     return any(kw in normalized for kw in _SEARCH_KEYWORDS)
 
 
-def _is_menu_like_link(action: Action | None) -> bool:
+def _is_menu_like_link(action: ParsedItem | None) -> bool:
+    if not isinstance(action, Action):
+        return False
     if not (
         action
         and action.type == "click"
@@ -101,7 +104,9 @@ def _is_menu_like_link(action: Action | None) -> bool:
     return any(keyword in normalized for keyword in _MENU_TRIGGER_LINK_KEYWORDS)
 
 
-def _is_menu_like_text_trigger(action: Action | None) -> bool:
+def _is_menu_like_text_trigger(action: ParsedItem | None) -> bool:
+    if not isinstance(action, Action):
+        return False
     if not (
         action
         and action.type == "click"
@@ -120,7 +125,9 @@ def _is_menu_like_text_trigger(action: Action | None) -> bool:
     return False
 
 
-def _is_navigation_button_click(action: Action | None) -> bool:
+def _is_navigation_button_click(action: ParsedItem | None) -> bool:
+    if not isinstance(action, Action):
+        return False
     return bool(
         action
         and action.type == "click"
@@ -129,7 +136,9 @@ def _is_navigation_button_click(action: Action | None) -> bool:
     )
 
 
-def _is_reporting_relationship_combobox(action: Action | None) -> bool:
+def _is_reporting_relationship_combobox(action: ParsedItem | None) -> bool:
+    if not isinstance(action, Action):
+        return False
     return bool(
         action
         and action.type == "click"
@@ -138,20 +147,33 @@ def _is_reporting_relationship_combobox(action: Action | None) -> bool:
     )
 
 
-def _is_close_action(action: Action | None) -> bool:
+def _is_close_action(action: ParsedItem | None) -> bool:
+    if not isinstance(action, Action):
+        return False
     return bool(action and action.type in _CLOSE_ACTION_TYPES)
 
 
-def _is_setup_action(action: Action | None) -> bool:
+def _is_setup_action(action: ParsedItem | None) -> bool:
+    if not isinstance(action, Action):
+        return False
     return bool(action and action.type in _SETUP_ACTION_TYPES)
 
 
-def _next_non_setup_action(actions: list[Action], start_index: int) -> Action | None:
+def _next_non_setup_action(actions: list[ParsedItem], start_index: int) -> Action | None:
     for idx in range(start_index, len(actions)):
         candidate = actions[idx]
+        if not isinstance(candidate, Action):
+            return None
         if not _is_setup_action(candidate):
             return candidate
     return None
+
+
+def _action_at(actions: list[ParsedItem], index: int) -> Action | None:
+    if index < 0 or index >= len(actions):
+        return None
+    candidate = actions[index]
+    return candidate if isinstance(candidate, Action) else None
 
 
 def _same_locator(a: Action, b: Action) -> bool:
@@ -173,7 +195,7 @@ def _is_oracle_select_locator(action: Action) -> bool:
     """Check if a locator targets an Oracle single-select widget."""
     if not action.selector:
         return False
-    lower = action.selector.lower()
+    lower = _normalize(action.selector)
     return any(token in lower for token in (
         "singleselect", "oj-select-single", "searchselect", "select-single",
     ))
@@ -210,19 +232,26 @@ def _same_search_field(open_action: Action | None, fill_action: Action | None) -
 # Pattern detection
 # ---------------------------------------------------------------------------
 
-def optimize(actions: list[Action]) -> list[Action]:
+def optimize(actions: list[ParsedItem]) -> list[ParsedItem]:
     """Detect compound patterns and merge/annotate actions.
 
     Returns a new list of Actions. Compound actions get a new type
     (e.g., "select_combobox") and carry the data from both constituent actions.
     """
-    result: list[Action] = []
+    result: list[ParsedItem] = []
     i = 0
     n = len(actions)
 
     while i < n:
         action = actions[i]
-        next_action = actions[i + 1] if i + 1 < n else None
+        if isinstance(action, MultiLineLoop):
+            result.append(replace(action, body=optimize(action.body)))
+            i += 1
+            continue
+
+        next_step = actions[i + 1] if i + 1 < n else None
+        next_action = next_step if isinstance(next_step, Action) else None
+        next_next_action = _action_at(actions, i + 2)
 
         # --- Pattern: top-level recorded idle before first navigation on a fresh page ---
         if (
@@ -260,12 +289,12 @@ def optimize(actions: list[Action]) -> list[Action]:
             action.type == "fill"
             and action.role in ("textbox", "spinbutton")
             and not _is_login_field(action.name)
-            and i + 1 < n
-            and actions[i + 1].type == "press"
-            and actions[i + 1].key == "Tab"
-            and _same_locator(action, actions[i + 1])
-            and i + 2 < n
-            and not _same_locator(action, actions[i + 2])
+            and next_action is not None
+            and next_action.type == "press"
+            and next_action.key == "Tab"
+            and _same_locator(action, next_action)
+            and next_next_action is not None
+            and not _same_locator(action, next_next_action)
         ):
             result.append(action)  # keep the fill
             i += 2  # skip fill + Tab, Tab is dropped
@@ -276,15 +305,15 @@ def optimize(actions: list[Action]) -> list[Action]:
             action.type == "fill"
             and action.role in ("textbox", "spinbutton")
             and not _is_login_field(action.name)
-            and i + 1 < n
-            and actions[i + 1].type == "press"
-            and actions[i + 1].key == "Enter"
-            and _same_locator(action, actions[i + 1])
+            and next_action is not None
+            and next_action.type == "press"
+            and next_action.key == "Enter"
+            and _same_locator(action, next_action)
         ):
             merged = Action(
                 type="fill_and_submit",
                 line=action.line,
-                raw=f"{action.raw}\n{actions[i + 1].raw}",
+                raw=f"{action.raw}\n{next_action.raw}",
                 page_var=action.page_var,
                 locator_steps=action.locator_steps,
                 value=action.value,
@@ -304,17 +333,17 @@ def optimize(actions: list[Action]) -> list[Action]:
             and action.key == "Enter"
             and action.name
             and _normalize(action.name) == "password"
-            and i + 1 < n
-            and actions[i + 1].type == "goto"
+            and next_action is not None
+            and next_action.type == "goto"
         ):
             merged = Action(
                 type="login_and_redirect",
                 line=action.line,
-                raw=f"{action.raw}\n{actions[i + 1].raw}",
+                raw=f"{action.raw}\n{next_action.raw}",
                 page_var=action.page_var,
                 locator_steps=action.locator_steps,
                 key="Enter",
-                url=actions[i + 1].url,
+                url=next_action.url,
                 locator_method=action.locator_method,
                 role=action.role,
                 name=action.name,
@@ -327,11 +356,11 @@ def optimize(actions: list[Action]) -> list[Action]:
         if (
             action.type == "click"
             and action.role == "combobox"
-            and i + 1 < n
-            and actions[i + 1].type == "click"
-            and actions[i + 1].role in ("option", "cell", "gridcell")
+            and next_action is not None
+            and next_action.type == "click"
+            and next_action.role in ("option", "cell", "gridcell")
         ):
-            option_action = actions[i + 1]
+            option_action = next_action
             merged = Action(
                 type="select_combobox",
                 line=action.line,
@@ -365,14 +394,14 @@ def optimize(actions: list[Action]) -> list[Action]:
         if (
             action.type == "click"
             and _is_oracle_select_locator(action)
-            and i + 1 < n
-            and actions[i + 1].type == "click"
+            and next_action is not None
+            and next_action.type == "click"
             and (
-                actions[i + 1].role in ("option", "cell", "gridcell")
-                or actions[i + 1].locator_method == "get_by_text"
+                next_action.role in ("option", "cell", "gridcell")
+                or next_action.locator_method == "get_by_text"
             )
         ):
-            option_action = actions[i + 1]
+            option_action = next_action
             merged = Action(
                 type="select_combobox",
                 line=action.line,
@@ -393,22 +422,71 @@ def optimize(actions: list[Action]) -> list[Action]:
             i += 2
             continue
 
+        # --- Pattern: LOV/textbox trigger click + option/cell/gridcell click → select_combobox ---
+        # Oracle ADF LOV inputs are exposed as role="textbox" (not "combobox"); the recorder
+        # captures [click the LOV input] then [click the value gridcell/cell] as two steps. A
+        # plain textbox click is always followed by fill/press (dropped above) or navigation,
+        # never by a NAMED option/cell/gridcell click -- so requiring a named option click here
+        # is a safe discriminator that won't merge ordinary textbox interactions. Routing it to
+        # select_combobox gives the value-equality postcondition (does the field now hold the
+        # picked value?), which is deterministic even when the field already holds that value.
+        if (
+            action.type == "click"
+            and action.role == "textbox"
+            and action.name
+            and not _is_login_field(action.name)
+            and next_action is not None
+            and next_action.type == "click"
+            and next_action.role in ("option", "cell", "gridcell")
+            and next_action.name
+        ):
+            option_action = next_action
+            merged = Action(
+                type="select_combobox",
+                line=action.line,
+                raw=f"{action.raw}\n{option_action.raw}",
+                page_var=action.page_var,
+                locator_steps=action.locator_steps,
+                value=option_action.name,  # the picked value
+                locator_method=action.locator_method,
+                role=action.role,
+                name=action.name,  # LOV field label (e.g. "Business Unit")
+                exact=action.exact,
+                action_kwargs={
+                    "option_role": option_action.role,
+                    "option_name": option_action.name,
+                    "option_exact": option_action.exact,
+                    "option_locator_steps": [
+                        {
+                            "method": s.method,
+                            **({"args": s.args} if s.args else {}),
+                            **({"kwargs": s.kwargs} if s.kwargs else {}),
+                        }
+                        for s in option_action.locator_steps
+                    ],
+                },
+            )
+            result.append(merged)
+            i += 2
+            continue
+
         # --- Pattern: combobox click + fill search field + result click → search_and_select ---
         if (
             action.type == "click"
             and action.role == "combobox"
-            and i + 2 < n
-            and _same_search_field(action, actions[i + 1])
-            and actions[i + 2].type == "click"
-            and actions[i + 2].locator_method in ("get_by_text", "get_by_role")
-            and actions[i + 2].role in (None, "option", "cell", "gridcell")
+            and next_action is not None
+            and _same_search_field(action, next_action)
+            and next_next_action is not None
+            and next_next_action.type == "click"
+            and next_next_action.locator_method in ("get_by_text", "get_by_role")
+            and next_next_action.role in (None, "option", "cell", "gridcell")
             and (
-                _values_match(actions[i + 1].value, actions[i + 2].name)
-                or _is_search_like_label(actions[i + 1].name)
+                _values_match(next_action.value, next_next_action.name)
+                or _is_search_like_label(next_action.name)
             )
         ):
-            fill_action = actions[i + 1]
-            option_action = actions[i + 2]
+            fill_action = next_action
+            option_action = next_next_action
             merged = Action(
                 type="search_and_select",
                 line=action.line,
@@ -439,13 +517,13 @@ def optimize(actions: list[Action]) -> list[Action]:
             action.type == "click"
             and action.locator_method == "get_by_title"
             and action.name
-            and action.name.lower().startswith("search:")
-            and "select date" not in (action.name or "").lower()
-            and i + 1 < n
-            and actions[i + 1].type == "click"
-            and actions[i + 1].locator_method in ("get_by_text", "get_by_role")
+            and _normalize(action.name).startswith("search:")
+            and "select date" not in _normalize(action.name)
+            and next_action is not None
+            and next_action.type == "click"
+            and next_action.locator_method in ("get_by_text", "get_by_role")
         ):
-            option_action = actions[i + 1]
+            option_action = next_action
             merged = Action(
                 type="search_and_select",
                 line=action.line,
@@ -472,16 +550,16 @@ def optimize(actions: list[Action]) -> list[Action]:
         if (
             action.type == "fill"
             and action.role in ("textbox", "combobox")
-            and i + 1 < n
-            and actions[i + 1].type == "click"
-            and actions[i + 1].locator_method in ("get_by_text", "get_by_role")
-            and actions[i + 1].role in (None, "option", "cell", "gridcell")
+            and next_action is not None
+            and next_action.type == "click"
+            and next_action.locator_method in ("get_by_text", "get_by_role")
+            and next_action.role in (None, "option", "cell", "gridcell")
             and (
-                _values_match(action.value, actions[i + 1].name)
+                _values_match(action.value, next_action.name)
                 or _is_search_like_label(action.name)
             )
         ):
-            option_action = actions[i + 1]
+            option_action = next_action
             merged = Action(
                 type="search_and_select",
                 line=action.line,
@@ -511,18 +589,18 @@ def optimize(actions: list[Action]) -> list[Action]:
             action.type == "click"
             and action.locator_method in ("get_by_title", "get_by_role", "get_by_text")
             and action.name
-            and not (action.name or "").lower().startswith("search:")
-            and "select date" not in (action.name or "").lower()
+            and not _normalize(action.name).startswith("search:")
+            and "select date" not in _normalize(action.name)
             and (
                 action.locator_method == "get_by_title"
                 or _is_menu_like_link(action)
                 or _is_menu_like_text_trigger(action)
             )
-            and i + 1 < n
-            and actions[i + 1].type == "click"
-            and actions[i + 1].locator_method == "get_by_text"
+            and next_action is not None
+            and next_action.type == "click"
+            and next_action.locator_method == "get_by_text"
         ):
-            option_action = actions[i + 1]
+            option_action = next_action
             trigger_kind = "title" if action.locator_method == "get_by_title" else "link"
             if action.locator_method == "get_by_text":
                 trigger_kind = "text"
@@ -550,14 +628,14 @@ def optimize(actions: list[Action]) -> list[Action]:
             action.type == "click"
             and action.locator_method == "get_by_title"
             and action.name
-            and "select date" in (action.name or "").lower()
-            and i + 1 < n
-            and actions[i + 1].type == "click"
-            and actions[i + 1].role in ("button", "cell", "gridcell")
-            and actions[i + 1].name
-            and actions[i + 1].name.strip().isdigit()
+            and "select date" in _normalize(action.name)
+            and next_action is not None
+            and next_action.type == "click"
+            and next_action.role in ("button", "cell", "gridcell")
+            and next_action.name
+            and next_action.name.strip().isdigit()
         ):
-            day_action = actions[i + 1]
+            day_action = next_action
             merged = Action(
                 type="date_pick",
                 line=action.line,

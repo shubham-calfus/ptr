@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Generate + upload a test_runner recording (script .py + params workbook) to MinIO/S3.
+"""Generate + upload an ACT Agent recording (script .py + params workbook) to MinIO/S3.
 
 Given a recorded Playwright ``.py`` and a params JSON, this:
   1. builds the sibling params file (``.xlsx`` by default, ``.csv`` optional) in the exact
-     layout the runner reads (active sheet ``params``: header row + one data row per set;
-     an optional ``flow_context`` sheet when ``context`` is provided),
+     layout the runner reads (active sheet ``params``: header row + one data row per set),
   2. uploads both to ``recordings/<name>/<name>.py`` and ``recordings/<name>/<name>_params.<ext>``
      in the storage bucket (``TENANT_ID`` if set, else ``STORAGE_ACTIVITIES_BUCKET``), and
-  3. prints the ``aetherion agent test_runner`` command to run it.
+  3. prints the ``aetherion agent 'ACT Agent'`` command to run it.
 
 Params JSON accepts any of:
-  - ``{"params": [ {..} ], "context": [ {..} ]}``   (the workbook-style payload)
+  - ``{"params": [ {..} ]}``                         (the workbook-style payload)
   - ``[ {..}, {..} ]``                               (list of param sets -> multiple data rows)
   - ``{..}``                                         (a single param set)
 
@@ -53,18 +52,6 @@ def normalize_param_sets(payload: Any) -> list[dict[str, str]]:
     return sets
 
 
-def extract_context(payload: Any) -> list[dict[str, str]]:
-    """Return flow-context spec rows (only meaningful when the payload carries 'context')."""
-    if not isinstance(payload, dict):
-        return []
-    rows = payload.get("context") or []
-    out: list[dict[str, str]] = []
-    for entry in rows:
-        if isinstance(entry, dict):
-            out.append({str(k): _cell(v) for k, v in entry.items()})
-    return out
-
-
 def _cell(value: Any) -> str:
     """Render a value as the runner reads it (every cell becomes a trimmed string)."""
     if value is None:
@@ -99,7 +86,7 @@ def build_params_csv(param_sets: list[dict[str, str]]) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def build_params_xlsx(param_sets: list[dict[str, str]], context: list[dict[str, str]]) -> bytes:
+def build_params_xlsx(param_sets: list[dict[str, str]]) -> bytes:
     import openpyxl  # lazy: only needed for xlsx output
 
     wb = openpyxl.Workbook()
@@ -109,13 +96,6 @@ def build_params_xlsx(param_sets: list[dict[str, str]], context: list[dict[str, 
     ws.append(headers)
     for row in param_sets:
         ws.append([row.get(h, "") for h in headers])
-
-    if context:
-        fc = wb.create_sheet("flow_context")
-        fc_headers = _ordered_headers(context)
-        fc.append(fc_headers)
-        for row in context:
-            fc.append([row.get(h, "") for h in fc_headers])
 
     out = io.BytesIO()
     wb.save(out)
@@ -166,12 +146,12 @@ def run_command(name: str, file_key: str, execution_mode: str) -> str:
         "recordings": [{"id": name, "name": name, "file": file_key}],
         "execution_mode": execution_mode,
     }
-    return "./.venv/bin/aetherion agent test_runner '" + json.dumps(payload, separators=(",", ":")) + "'"
+    return "./.venv/bin/aetherion agent 'ACT Agent' '" + json.dumps(payload, separators=(",", ":")) + "'"
 
 
 # --------------------------------------------------------------------------- main
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate + upload a test_runner recording to MinIO/S3.")
+    parser = argparse.ArgumentParser(description="Generate + upload an ACT Agent recording to MinIO/S3.")
     parser.add_argument("--py", required=True, help="Path to the recorded Playwright .py")
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--params", help="Path to a params JSON file")
@@ -195,14 +175,10 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(Path(args.params).expanduser().read_text())
 
     param_sets = normalize_param_sets(payload)
-    context = extract_context(payload)
-
-    if args.format == "csv" and context:
-        raise SystemExit("ERROR: flow context needs a second sheet — use --format xlsx when 'context' is non-empty.")
 
     py_bytes = py_path.read_bytes()
     if args.format == "xlsx":
-        params_bytes = build_params_xlsx(param_sets, context)
+        params_bytes = build_params_xlsx(param_sets)
         params_ext = "_params.xlsx"
         params_ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else:
@@ -222,8 +198,6 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"recording name : {name}")
     print(f"param sets     : {len(param_sets)} row(s); keys: {', '.join(_ordered_headers(param_sets))}")
-    if context:
-        print(f"flow context   : {len(context)} spec row(s)")
     print(f"placeholders   : {', '.join(placeholders) or '(none)'}")
     if missing:
         print(f"WARNING: placeholders with no param value: {', '.join(missing)} -> the run will fail the placeholder gate.")
@@ -253,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     if not ok:
         return 1
 
-    print("\nrun command (from act-v2/test_runner):\n" + run_command(name, py_key, args.execution_mode))
+    print("\nrun command (from act-v2/act_agent):\n" + run_command(name, py_key, args.execution_mode))
     return 0
 
 

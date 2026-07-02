@@ -1,4 +1,4 @@
-# test_runner
+# ACT Agent
 
 Runs Playwright-generated Python scripts as a test suite and produces an HTML report.
 
@@ -94,10 +94,10 @@ Troubleshooting:
 
 ## Design docs
 
-- [`RUNNER_EXPERIENCE_SYSTEM.md`](/Users/shubhammore/Documents/act-v2/test_runner/RUNNER_EXPERIENCE_SYSTEM.md)
+- [`RUNNER_EXPERIENCE_SYSTEM.md`](/Users/shubhammore/Documents/act-v2/act_agent/RUNNER_EXPERIENCE_SYSTEM.md)
   defines the planned experience-driven recovery system for the Oracle-focused
   runner.
-- [`CODEX_CUSTOM_INSTRUCTIONS.md`](/Users/shubhammore/Documents/act-v2/test_runner/CODEX_CUSTOM_INSTRUCTIONS.md)
+- [`CODEX_CUSTOM_INSTRUCTIONS.md`](/Users/shubhammore/Documents/act-v2/act_agent/CODEX_CUSTOM_INSTRUCTIONS.md)
   contains a paste-ready Codex custom-instructions block aligned with the new
   runner direction.
 # ptr

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.agent.agent import (
-    TestRunnerAgent,
+    ACTAgent,
     _apply_suite_after_action_wait,
     _apply_suite_debug_options,
     _build_suite_context_from_previous_results,
@@ -258,7 +258,7 @@ async def test_sequential_suite_stops_after_first_failed_recording_and_blocks_de
         raise AssertionError(f"Unexpected tool call: {tool_name}")
 
     async def _fake_agent_execute(agent_name, payload, **kwargs):
-        assert agent_name == "TestRunnerChild"
+        assert agent_name == "ACTAgentChild"
         child_calls.append(payload["recording"]["id"])
         if payload["recording"]["id"] == "create":
             return {
@@ -274,10 +274,10 @@ async def test_sequential_suite_stops_after_first_failed_recording_and_blocks_de
     monkeypatch.setattr("src.agent.agent.agentExecutor.execute", _fake_agent_execute)
     monkeypatch.setattr(
         "src.agent.agent.workflow.info",
-        lambda: SimpleNamespace(run_id="parent-run-1", task_queue="ptr-task-queue"),
+        lambda: SimpleNamespace(run_id="parent-run-1", task_queue="act-task-queue"),
     )
 
-    response = await TestRunnerAgent.fn(
+    response = await ACTAgent.fn(
         {
             "test_suite_id": "suite-1",
             "execution_mode": "sequential",
@@ -335,17 +335,17 @@ async def test_sequential_suite_persists_failure_manifest_when_child_workflow_ra
         raise AssertionError(f"Unexpected tool call: {tool_name}")
 
     async def _fake_agent_execute(agent_name, payload, **kwargs):
-        assert agent_name == "TestRunnerChild"
+        assert agent_name == "ACTAgentChild"
         raise TimeoutError("Timed out waiting for recording execution to complete.")
 
     monkeypatch.setattr("src.agent.agent.toolExecutor.execute", _fake_tool_execute)
     monkeypatch.setattr("src.agent.agent.agentExecutor.execute", _fake_agent_execute)
     monkeypatch.setattr(
         "src.agent.agent.workflow.info",
-        lambda: SimpleNamespace(run_id="parent-run-2", task_queue="ptr-task-queue"),
+        lambda: SimpleNamespace(run_id="parent-run-2", task_queue="act-task-queue"),
     )
 
-    response = await TestRunnerAgent.fn(
+    response = await ACTAgent.fn(
         {
             "test_suite_id": "suite-2",
             "execution_mode": "sequential",
@@ -390,7 +390,7 @@ async def test_parallel_suite_persists_failure_manifest_when_child_workflow_rais
         raise AssertionError(f"Unexpected tool call: {tool_name}")
 
     async def _fake_agent_execute(agent_name, payload, **kwargs):
-        assert agent_name == "TestRunnerChild"
+        assert agent_name == "ACTAgentChild"
         if payload["recording"]["id"] == "create":
             return {
                 "recording_name": "HCM_Create_Requisition",
@@ -404,10 +404,10 @@ async def test_parallel_suite_persists_failure_manifest_when_child_workflow_rais
     monkeypatch.setattr("src.agent.agent.agentExecutor.execute", _fake_agent_execute)
     monkeypatch.setattr(
         "src.agent.agent.workflow.info",
-        lambda: SimpleNamespace(run_id="parent-run-3", task_queue="ptr-task-queue"),
+        lambda: SimpleNamespace(run_id="parent-run-3", task_queue="act-task-queue"),
     )
 
-    response = await TestRunnerAgent.fn(
+    response = await ACTAgent.fn(
         {
             "test_suite_id": "suite-3",
             "execution_mode": "parallel",

@@ -1,19 +1,20 @@
 [project]
-name = "test-runner"
-version = "4.0.16"
-description = "Aetherion agent for executing Playwright-generated Python scripts as test suites"
+name = "act-agent"
+version = "4.0.23"
+description = "ACT Agent — executes recorded UI automation scripts as a test suite and returns an HTML report"
 authors = [{ name = "Calfus Inc.", email = "cloudops@calfus.com" }]
 requires-python = ">=3.12.10,<3.13"
-
+#this is v2
 dependencies = [
-    "aetherion-sdk==0.0.35",
+    "aetherion-sdk==0.0.39",
     "boto3>=1.34.0",
     "openpyxl>=3.1.0",
     "playwright>=1.58.0",
 ]
-# Note: do NOT pin steel-sdk here. aetherion-sdk 0.0.35 -> draco==0.0.46 pins
-# steel-sdk==0.15.0 transitively (on Linux), which provides `from steel import Steel`
-# for the gated Steel-browser path. An explicit steel-sdk>=0.17.0 conflicts with draco.
+# Note: do NOT pin steel-sdk here. aetherion-sdk -> draco transitively pins steel-sdk on Linux
+# (under 0.0.35 that was draco==0.0.46 -> steel-sdk==0.15.0), which provides `from steel import
+# Steel` for the gated Steel-browser path. An explicit steel-sdk>=0.17.0 conflicts with draco.
+# Re-verify the exact draco/steel-sdk transitive pins with `uv lock` after each SDK version bump.
 
 [dependency-groups]
 dev = [
@@ -53,6 +54,13 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# helpers_v2.py is a re-export facade: it star-imports the .helpers package into a
+# single namespace (so monkeypatching helpers_v2.X and shared _PTR_* state behave as
+# in the original single module) and keeps urllib/experience imports that submodules
+# consume via h-routing. F401/F403/F405 are inherent to that pattern, not dead code.
+"src/runtime/helpers_v2.py" = ["F401", "F403", "F405"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -6,9 +6,10 @@ from datetime import timedelta
 from typing import Any
 
 from aetherion_sdk import agent, agentExecutor, toolExecutor
-from common_lib.utils.logger import setup_logger
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+
+from common_lib.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -32,8 +33,10 @@ def _optional_trigger_value(payload: dict[str, Any], key: str) -> Any:
 def _child_workflow_id(recording: dict[str, Any], parent_run_id: str, index: int) -> str:
     # Ensure uniqueness even when client sends duplicate recording IDs.
     recording_id = _safe_segment(recording.get("id") or f"idx-{index}")
-    recording_file = _safe_segment(recording.get("file") or recording.get("name") or f"recording-{index}")
-    return f"ptr-child-{recording_id}-{recording_file}-{index}-{parent_run_id}"
+    recording_file = _safe_segment(
+        recording.get("file") or recording.get("name") or f"recording-{index}"
+    )
+    return f"act-child-{recording_id}-{recording_file}-{index}-{parent_run_id}"
 
 
 def _normalize_suite_context(values: dict[str, Any] | None) -> dict[str, str]:
@@ -47,7 +50,9 @@ def _normalize_suite_context(values: dict[str, Any] | None) -> dict[str, str]:
     return normalized
 
 
-def _merge_suite_context_into_recording(recording: dict[str, Any], suite_context: dict[str, str]) -> dict[str, Any]:
+def _merge_suite_context_into_recording(
+    recording: dict[str, Any], suite_context: dict[str, str]
+) -> dict[str, Any]:
     merged = dict(recording)
     merged_parameters = dict(_normalize_suite_context(suite_context))
     if isinstance(recording.get("parameters"), dict):
@@ -103,7 +108,9 @@ def _merge_recording_outputs_into_suite_context(
     if not normalized_outputs:
         return updated
 
-    namespace = _safe_segment(recording.get("id") or recording.get("name") or recording.get("file") or "recording")
+    namespace = _safe_segment(
+        recording.get("id") or recording.get("name") or recording.get("file") or "recording"
+    )
     for key, value in normalized_outputs.items():
         updated[f"{namespace}_{key}"] = value
         existing = updated.get(key)
@@ -138,7 +145,10 @@ def _blocked_dependency_reason(
     failed_result: dict[str, Any] | Exception,
 ) -> str:
     failed_name = str(
-        failed_recording.get("name") or failed_recording.get("id") or failed_recording.get("file") or "upstream recording"
+        failed_recording.get("name")
+        or failed_recording.get("id")
+        or failed_recording.get("file")
+        or "upstream recording"
     ).strip()
     if isinstance(failed_result, Exception):
         detail = str(failed_result).strip() or "Child workflow raised before producing a manifest."
@@ -185,7 +195,14 @@ def _extract_trigger_payload(
         )
         if (value := _optional_trigger_value(trigger_data, key)) is not None
     }
-    return test_suite_id, recordings, execution_mode, resume_from_run_id, after_action_wait_ms, suite_debug_options
+    return (
+        test_suite_id,
+        recordings,
+        execution_mode,
+        resume_from_run_id,
+        after_action_wait_ms,
+        suite_debug_options,
+    )
 
 
 async def _expand_recordings_for_parameter_rows(
@@ -207,8 +224,8 @@ async def _expand_recordings_for_parameter_rows(
     return expanded_recordings
 
 
-@agent(name="TestRunnerChild")
-async def TestRunnerChild(payload: dict[str, Any]) -> dict[str, Any]:
+@agent(name="ACTAgentChild")
+async def ACTAgentChild(payload: dict[str, Any]) -> dict[str, Any]:
     recording = payload.get("recording") or {}
     test_suite_id = str(payload.get("test_suite_id", "")).strip()
     parent_run_id = str(payload.get("parent_run_id", "")).strip()
@@ -259,9 +276,9 @@ async def _persist_child_failure_manifest(
         }
 
 
-@agent(name="test_runner")
-async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    logger.info("Starting TestRunnerAgent with payload: %s", payload)
+@agent(name="ACT Agent")
+async def ACTAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    logger.info("Starting ACTAgent with payload: %s", payload)
 
     (
         test_suite_id,
@@ -284,7 +301,9 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
         return [{"type": "error", "message": "No valid recording files were provided."}]
 
     if resume_from_run_id and execution_mode != "sequential":
-        return [{"type": "error", "message": "resume_from_run_id is supported only in sequential mode."}]
+        return [
+            {"type": "error", "message": "resume_from_run_id is supported only in sequential mode."}
+        ]
 
     logger.info(
         "Executing %s recording(s) for suite %s in %s mode",
@@ -311,7 +330,14 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 )
             except Exception as exc:
                 logger.error("Failed to load resume state for run %s: %s", resume_from_run_id, exc)
-                return [{"type": "error", "message": f"Failed to load resume state for run {resume_from_run_id}: {exc}"}]
+                return [
+                    {
+                        "type": "error",
+                        "message": (
+                            f"Failed to load resume state for run {resume_from_run_id}: {exc}"
+                        ),
+                    }
+                ]
 
             resume_offset = int(resume_state.get("resume_start_index") or 0)
             previous_results = resume_state.get("previous_results") or []
@@ -330,7 +356,9 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
         for idx, recording in enumerate(ordered_recordings, start=resume_offset):
             child_recording = _merge_suite_context_into_recording(recording, suite_context)
-            child_recording = _apply_suite_after_action_wait(child_recording, suite_after_action_wait_ms)
+            child_recording = _apply_suite_after_action_wait(
+                child_recording, suite_after_action_wait_ms
+            )
             child_recording = _apply_suite_debug_options(child_recording, suite_debug_options)
             child_payload = {
                 "recording": child_recording,
@@ -339,7 +367,7 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
             }
             try:
                 result = await agentExecutor.execute(
-                    "TestRunnerChild",
+                    "ACTAgentChild",
                     child_payload,
                     workflow_id=_child_workflow_id(child_recording, parent_run_id, idx),
                     task_queue=workflow.info().task_queue,
@@ -360,7 +388,9 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 logger.warning(
                     "Stopping sequential suite %s after recording %s returned status=%s",
                     test_suite_id,
-                    child_recording.get("name") or child_recording.get("file") or child_recording.get("id"),
+                    child_recording.get("name")
+                    or child_recording.get("file")
+                    or child_recording.get("id"),
                     result.get("status"),
                 )
                 remaining_recordings = ordered_recordings[(idx - resume_offset + 1) :]
@@ -400,13 +430,16 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         )
                     except Exception as blocked_exc:
                         logger.error(
-                            "Failed to persist blocked manifest for recording %s after upstream failure: %s",
+                            "Failed to persist blocked manifest for recording %s "
+                            "after upstream failure: %s",
                             blocked_recording,
                             blocked_exc,
                         )
                         blocked_result = {
                             "recording_name": str(
-                                blocked_recording.get("name") or blocked_recording.get("file") or "unknown"
+                                blocked_recording.get("name")
+                                or blocked_recording.get("file")
+                                or "unknown"
                             ),
                             "status": "failed",
                             "error": block_reason,
@@ -417,7 +450,7 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         child_tasks = [
             agentExecutor.execute(
-                "TestRunnerChild",
+                "ACTAgentChild",
                 {
                     "recording": _apply_suite_debug_options(
                         _apply_suite_after_action_wait(recording, suite_after_action_wait_ms),
@@ -470,10 +503,15 @@ async def TestRunnerAgent(payload: dict[str, Any]) -> list[dict[str, Any]]:
         retry_policy=RetryPolicy(maximum_attempts=1),
     )
 
+    # The downloaded report filename is the suite name. sombrero builds the saved
+    # filename from this `title` (spaces -> "_", then ".<extension>"), so reuse the same
+    # filesystem-safe sanitizer used for the S3 key segments -> "<suite_name>.html".
+    report_title = _safe_segment(test_suite_id)
+
     return [
         {
             "type": "s3_download_link",
-            "title": "Playwright Test Suite Report",
+            "title": report_title,
             "file_key": report_s3_key,
             "label": "Download HTML Report",
             "extension": "html",

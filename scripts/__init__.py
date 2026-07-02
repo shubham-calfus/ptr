@@ -1,1 +1,1 @@
-"""Local helper scripts for test_runner."""
+"""Local helper scripts for ACT Agent."""

@@ -7,6 +7,43 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "act-agent"
+version = "4.0.17"
+source = { editable = "." }
+dependencies = [
+    { name = "aetherion-sdk" },
+    { name = "boto3" },
+    { name = "openpyxl" },
+    { name = "playwright" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "black" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aetherion-sdk", specifier = "==0.0.35", index = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/" },
+    { name = "boto3", specifier = ">=1.34.0" },
+    { name = "openpyxl", specifier = ">=3.1.0" },
+    { name = "playwright", specifier = ">=1.58.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "black", specifier = "==25.12.0" },
+    { name = "pytest", specifier = "==8.4.2" },
+    { name = "pytest-asyncio", specifier = "==1.3.0" },
+    { name = "pytest-cov", specifier = "==6.3.0" },
+    { name = "ruff", specifier = "==0.12.12" },
+]
+
+[[package]]
 name = "aetherion-sdk"
 version = "0.0.35"
 source = { registry = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/" }
@@ -2587,23 +2624,6 @@ wheels = [
 ]
 
 [[package]]
-name = "steel-sdk"
-version = "0.17.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "anyio" },
-    { name = "distro" },
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "sniffio" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/1e/4a/f46a87ef18771fe59b7df634a7e7ef2599d649fac9f25b3f8ffddc3ec513/steel_sdk-0.17.0.tar.gz", hash = "sha256:42713bd5a50f610dfac2fb60e2355b080cbd15a8772baae2c3f7dc5655a1708d", size = 159145, upload-time = "2026-03-16T06:26:48.689Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a2/65/ed81074d970a9b17688b67b922680344395cd8114c7bd89006389f3f12c5/steel_sdk-0.17.0-py3-none-any.whl", hash = "sha256:39b015569e4d1230babc86371150156a31f5327baee657ee328c222fc31dfc20", size = 141608, upload-time = "2026-03-16T06:26:47.426Z" },
-]
-
-[[package]]
 name = "strawberry-graphql"
 version = "0.287.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2645,45 +2665,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a", size = 49413, upload-time = "2026-02-07T10:45:33.841Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55", size = 28926, upload-time = "2026-02-07T10:45:32.24Z" },
-]
-
-[[package]]
-name = "test-runner"
-version = "1.0.20"
-source = { editable = "." }
-dependencies = [
-    { name = "aetherion-sdk" },
-    { name = "boto3" },
-    { name = "openpyxl" },
-    { name = "playwright" },
-    { name = "steel-sdk" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "black" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aetherion-sdk", specifier = "==0.0.35", index = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/" },
-    { name = "boto3", specifier = ">=1.34.0" },
-    { name = "openpyxl", specifier = ">=3.1.0" },
-    { name = "playwright", specifier = ">=1.58.0" },
-    { name = "steel-sdk", specifier = ">=0.17.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "black", specifier = "==25.12.0" },
-    { name = "pytest", specifier = "==8.4.2" },
-    { name = "pytest-asyncio", specifier = "==1.3.0" },
-    { name = "pytest-cov", specifier = "==6.3.0" },
-    { name = "ruff", specifier = "==0.12.12" },
 ]
 
 [[package]]
@@ -2847,7 +2828,7 @@ wheels = [
 
 [[package]]
 name = "ursa"
-version = "0.0.64+feature.ap.411.1780593417"
+version = "0.0.74"
 source = { registry = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/" }
 dependencies = [
     { name = "arize-phoenix" },
@@ -2882,9 +2863,9 @@ dependencies = [
     { name = "uvicorn" },
     { name = "xlrd" },
 ]
-sdist = { url = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/ursa/0.0.64+feature.ap.411.1780593417/ursa-0.0.64+feature.ap.411.1780593417.tar.gz", hash = "sha256:7dab16974db1ad1a83b3f0d50111a74fb68320f778f1caea7125a87fac9e71c8" }
+sdist = { url = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/ursa/0.0.74/ursa-0.0.74.tar.gz", hash = "sha256:960402e982b594a532948f853cdc4fb6718b037584ae2241968646f6d7279a09", upload-time = "2026-06-25T10:55:07.902Z" }
 wheels = [
-    { url = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/ursa/0.0.64+feature.ap.411.1780593417/ursa-0.0.64+feature.ap.411.1780593417-py3-none-any.whl", hash = "sha256:0d8cc45a4343ecd01cd3389a2c542265097b464e0fbe4b9265aa2ead4883e754" },
+    { url = "https://aetherion-285774563994.d.codeartifact.us-east-1.amazonaws.com/pypi/aetherion/simple/ursa/0.0.74/ursa-0.0.74-py3-none-any.whl", hash = "sha256:3127ae4f7a7778b6dc2687bf3559432d3bb10e7653c13b67f7b84858fe831709", upload-time = "2026-06-25T10:55:07.641Z" },
 ]
 
 [[package]]
